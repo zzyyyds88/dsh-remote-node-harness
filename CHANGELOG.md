@@ -9,6 +9,54 @@
 - 每条都说清「谁受影响」，因为这套东西的读者是「装它的人」，不是写它的人。
 - 与 `docs/ARCHITECTURE.md` 的章节对应，细节不去那边重复。
 
+## [0.6.6] — 2026-11-21
+
+### 修复
+
+- **`release-runtime.yml` 的 `win32-x64` 腿必然失败，`darwin-arm64` 腿打不起来。** 这两条
+  都是第一次真跑才暴露的，静态判读看不出来：
+  - Windows 腿跑在 `shell: bash` 下，`tar` 解析到 Git Bash 的 GNU tar，它把绝对路径
+    `D:\...` 当成**远程主机**（`tar: Cannot connect to D: resolve failed`），把 `D:/...`
+    当成名为 `D:...` 的文件；System32 的 bsdtar 两种都认，所以同一脚本在 PowerShell 下
+    打包正常、只在 CI 里死。`publish-runtime.mjs` 与 `build-fork-runtime.mjs` 改成
+    **`cwd` 落到输出目录 + 相对 `-C`**，这是两种 tar 的交集（两种二进制各测过）。
+  - `macos-14` 已退役，失败信息（`The configuration 'macos-14-arm64-us-default' is not
+    supported`，0 秒取消）看起来像标签写错。实测（run 44908940637）：`macos-15` 与
+    `macos-latest` 都是 arm64，`macos-13` 一直排队。改钉 `macos-15`，不用
+    `macos-latest`，免得 image 滚动时悄悄换掉构建环境。
+  - 顺手修掉打包摘要里的 `NaN`：`${mib(stripped)}` 把 `{bytes, files}` 对象喂给了数字。
+
+### 变更
+
+- **`release-runtime.yml` 不再发布 `v<version>-upstream` 对比树。** 每次四条腿共约 640 MiB
+  资产，而没有任何东西读它：`verify-packed-install` 要的是 `.tgz` 目录，仓库与 fork 里
+  也没有脚本去下那个 tag。打包步骤留着（它回答「钉的这个上游 tag 还能不能干净打包」），
+  publish 作业删掉，权限从 `contents: write` 降到 `read`。
+
+### 文档
+
+- **AGENTS.md §4 与 `ARCHITECTURE.md` 的非目标自相矛盾。** 两处都写「不改上游语义（fork
+  只允许构建侧修复）」，而 build 7 的 0001/0002 就是改上游行为。口径改为：节点的内核就是
+  官方源码的 fork，**改源码是主路径**，要求只剩「每一处改动都能被列举出来」，并按节点会不会
+  读到那段代码分成两类（读到 → 补丁 + 台账；读不到 → `BUILD_SIDE_COMMITS` 一行）。
+  ADR-0007 §五与 ADR-0008 同步。
+- **`node-patches.zh.md` 新增「构建侧源码修复」一节**，记 `057ce8f3`
+  （`verify-packed-install.ts` 在 Windows 上用 Node 跑 npm 的 JS 入口）：它改的是
+  `scripts/`，归档里没有那段代码，所以当不了补丁，但也不能不记。
+
+### 新增
+
+- **`checkForkBase()`：把「fork 只差台账里这几条」从声称变成断言。** 构建前检查 fork 的
+  HEAD 必须就是 `dsh-v<version>`，或它上面每个提交都在 `BUILD_SIDE_COMMITS` 里；工作树
+  只允许在补丁覆盖的文件上有差异，其余按路径报错。未入账的提交报哈希，手工改过的文件报
+  路径 —— 这两种情况是同一个故障的两面：归档不再等于台账。
+- `test/fork-base-unit.mjs` 用临时仓库断言三种触发情形（未入账提交、手改文件、缺 tag）
+  与一路放行（真 fork `057ce8f3 on dsh-v0.2.2-rc.5`），已注册进 offline 层。
+
+### 未变
+
+- `RUNTIME_BUILD` 仍是 **7**，归档字节未变。这一版只动构建工具链与文档，节点不需要重装。
+
 ## [0.6.5] — 2026-11-21
 
 ### 修复
