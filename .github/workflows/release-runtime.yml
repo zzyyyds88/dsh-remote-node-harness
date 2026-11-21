@@ -117,7 +117,8 @@ jobs:
           path: |
             dist/dsh-*.tar.gz
             dist/dsh-*.tar.gz.sha256
-          # The archives are ~165 MiB each; this is the whole point of the job.
+          # The archives are 127-192 MiB each (measured build rc.5: linux-x64 127.4, linux-arm64
+          # 130.1, darwin-arm64 191.6, win32-x64 191.1); this is the whole point of the job.
           retention-days: 7
           if-no-files-found: error
 
