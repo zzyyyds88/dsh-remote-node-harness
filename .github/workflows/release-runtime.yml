@@ -60,8 +60,14 @@ jobs:
             runner: ubuntu-latest
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
+          # `macos-14` is **retired**, and the failure it produces does not say so: the job is
+          # cancelled in 0s with "The configuration 'macos-14-arm64-us-default' is not
+          # supported", which reads like a label typo. Measured 2026-11-21 (run 44908940637):
+          # `macos-14` fails, `macos-15` and `macos-latest` both come up as arm64, `macos-13`
+          # queues forever. `macos-15` is pinned rather than `macos-latest` so a future image
+          # roll does not silently change what an archive was built on.
           - platform: darwin-arm64
-            runner: macos-14
+            runner: macos-15
           - platform: win32-x64
             runner: windows-latest
 
