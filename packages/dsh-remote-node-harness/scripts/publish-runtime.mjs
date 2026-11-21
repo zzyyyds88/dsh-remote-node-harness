@@ -265,7 +265,18 @@ function pack() {
   rmSync(archive, { force: true })
   // A subprocess rather than a library: `tar` is on every platform this ships to, and
   // this script must not add a dependency to the plugin.
-  const tarred = spawnSync('tar', ['-czf', archive, '-C', staging, '.'], { stdio: 'inherit' })
+  //
+  // **Relative argv, with `cwd` at the output directory.** An absolute Windows path in the
+  // argv is not portable between the two `tar` binaries a Windows machine can have: Git Bash's
+  // GNU tar reads `D:\...` as a *remote host* spec (`tar: Cannot connect to D: resolve
+  // failed`) and `D:/...` as a file named `D:...`, while bsdtar in System32 handles both. That
+  // is not hypothetical — the `win32-x64` leg of `release-runtime.yml` runs under
+  // `shell: bash`, so it gets GNU tar and failed deterministically (run 44902426318). Relative
+  // paths with `cwd` are the intersection both accept, measured on both binaries.
+  const tarred = spawnSync('tar', ['-czf', basename(archive), '-C', basename(staging), '.'], {
+    cwd: outDir,
+    stdio: 'inherit',
+  })
   if (tarred.status !== 0) throw new Error(`tar failed with status ${String(tarred.status)}`)
   rmSync(staging, { recursive: true, force: true })
 
@@ -278,7 +289,7 @@ function pack() {
     `wrote ${name}\n`
     + `  archive  ${mib(bytes.length)} MiB\n`
     + `  unpacked ${after.files} files, ${mib(after.bytes)} MiB`
-    + ` (${mib(stripped)} MiB stripped from ${before.files})\n`
+    + ` (${mib(stripped.bytes)} MiB stripped from ${before.files})\n`
     + `  modes    ${String(chmodded)} files marked 0755\n`
     + `  sha256   ${sha256}\n`,
   )

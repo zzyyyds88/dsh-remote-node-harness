@@ -239,6 +239,20 @@ function packageIn(root, name) {
 
 // ---- the archive contract ---------------------------------------------------
 {
+  // `tar` is spawned, not imported, and the argv shape is load-bearing on Windows. Measured on
+  // run 44902426318: the `win32-x64` leg of `release-runtime.yml` runs under `shell: bash`, so
+  // the `tar` it gets is Git Bash's GNU tar, which reads an absolute `D:\...` path as a *remote
+  // host* (`tar: Cannot connect to D: resolve failed`) and `D:/...` as a file named `D:...`.
+  // bsdtar in System32 accepts both, which is why the same script packs fine from PowerShell and
+  // fails only in CI. The portable form is a relative `-C` with `cwd` at the output directory,
+  // verified against both binaries.
+  const relativeTar = /\['-czf', basename\((?:target|archive)\), '-C', [^\]]*\]/u
+  const cwdTar = /cwd: outDir/u
+  const publishTar = readFileSync(new URL('../scripts/publish-runtime.mjs', import.meta.url), 'utf8')
+  check(relativeTar.test(publishTar) && cwdTar.test(publishTar),
+    'publish-runtime packs with a relative -C and cwd, so it survives GNU tar as well as bsdtar')
+  check(!/spawnSync\('tar', \['-czf', (?:archive|target), '-C'/u.test(publishTar),
+    'and no longer puts an absolute path in the tar argv')
   // The residue list has one home. Two copies would drift into two artefact
   // contents at one version, which is what `RUNTIME_BUILD` exists to catch — and it already
   // happened once: `publish-runtime` had its own `strip()` walker, so a rule added to the
@@ -266,6 +280,10 @@ function packageIn(root, name) {
   check(!/entry\.name !== 'spawn-helper'/u.test(publish) && !/entry\.name !== 'spawn-helper'/u.test(build),
     'neither packer still carries the old name-only rule')
   check(/--ignore-scripts/u.test(build), 'the fork build resolves without running install scripts')
+  check(relativeTar.test(build) && cwdTar.test(build),
+    'and the fork build packs the same way, so a Windows CI leg cannot fail on argv shape')
+  check(!/spawnSync\('tar', \['-czf', (?:archive|target), '-C'/u.test(build),
+    'and it too stopped handing an absolute path to tar')
   check(/overrides/u.test(build),
     'the fork build stages by override, so only the imported closure is installed')
   check(/publish-runtime\.mjs/u.test(build), 'the fork build publishes through the one uploader')

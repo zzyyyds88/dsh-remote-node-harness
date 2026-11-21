@@ -48,7 +48,7 @@
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyPatches } from './node-patches.mjs'
 import { ARTEFACT_RESIDUE, ARTEFACT_RESIDUE_KEEP, dropPackages, foreignPlatformResidue, stripResidue } from './trim-fork-runtime.mjs'
@@ -339,7 +339,16 @@ function archive(staging, version) {
   }
   restore(staging)
   rmSync(target, { force: true })
-  const tarred = spawnSync('tar', ['-czf', target, '-C', staging, '.'], { stdio: 'inherit' })
+  // Relative argv with `cwd` at the output directory, for the same reason `publish-runtime.mjs`
+  // does it: on Windows the `tar` on PATH may be Git Bash's GNU tar, which reads `D:\...` as a
+  // remote host (`Cannot connect to D: resolve failed`) and `D:/...` as a file named `D:...`.
+  // bsdtar in System32 accepts absolute Windows paths; relative ones are what both accept.
+  // `staging` is **not** under `outDir` here (it is `<fork>/stage/<platform>`), so this has to
+  // be a real relative path rather than a basename, with forward slashes for the MSYS build.
+  const tarred = spawnSync('tar', ['-czf', basename(target), '-C', relative(outDir, staging).replaceAll('\\', '/'), '.'], {
+    cwd: outDir,
+    stdio: 'inherit',
+  })
   if (tarred.status !== 0) throw new Error(`tar exited with ${String(tarred.status)}`)
   const bytes = readFileSync(target)
   const sha256 = createHash('sha256').update(bytes).digest('hex')
