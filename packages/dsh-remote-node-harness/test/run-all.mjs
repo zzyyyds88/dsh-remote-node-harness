@@ -152,6 +152,14 @@ const SUITES = [
     proves: 'the source-patch chain: every patch follows NNNN-slug.patch, applies through git apply --3way, and has a complete row in the deviation ledger',
   },
   {
+    name: 'fork-base',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'fork-base-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    proves: 'the build refuses a fork whose commits above the pinned tag are unrecorded, and a hand-edited file no patch touches — the two ways an archive stops matching its ledger',
+  },
+  {
     name: 'rnh-lifecycle',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'rnh-lifecycle-unit.mjs'],

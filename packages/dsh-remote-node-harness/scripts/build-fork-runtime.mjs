@@ -50,7 +50,7 @@ import { createHash } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyPatches } from './node-patches.mjs'
+import { applyPatches, checkForkBase } from './node-patches.mjs'
 import { ARTEFACT_RESIDUE, ARTEFACT_RESIDUE_KEEP, dropPackages, foreignPlatformResidue, stripResidue } from './trim-fork-runtime.mjs'
 import { isArtefactExecutable } from '../src/remote/artefact.js'
 
@@ -405,6 +405,16 @@ function checkAgainstDesktop(version) {
 
 const version = forkVersion()
 checkAgainstDesktop(version)
+{
+  // "The fork differs from the tag in exactly the patches we recorded" is either checkable or it
+  // is a claim. This makes it checkable: an unrecorded commit, or a hand-edited file no patch
+  // touches, stops the build with its own name instead of shipping and being discovered later.
+  const base = checkForkBase(pluginRoot, fork, version)
+  process.stdout.write(
+    `fork ${base.head} on ${base.tag} (${base.base})`
+    + `${base.extra.length === 0 ? ', no build-side commits' : `, build-side commits: ${base.extra.join(', ')}`}\n`,
+  )
+}
 prepareFork()
 
 const staging = join(fork, 'stage', platform)

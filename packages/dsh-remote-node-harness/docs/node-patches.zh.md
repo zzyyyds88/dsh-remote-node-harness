@@ -42,3 +42,19 @@
 > （归档文件数 41 846 → 25 038）。build 7 起不再是空集 —— 上面两行是第一批。
 > 剩余候选（`dsh-client-*` 的浏览器半边、`dsh-doc` skill 的 Windows 分支）仍需先过证据
 > 标准，验不过就标「待观察」，不硬改。
+
+## 构建侧源码修复（不进归档，所以不是补丁）
+
+fork 里还有一类改动：改的是**构建/发布工具链**，产出的归档字节里没有它们。它们不能写成
+`patches/node/*.patch`（补丁是给「节点读到的源码」用的），但也**不能不入账** —— 否则
+「fork 上除了台账那几条还有别的改动」就成了一句无法核对的话。
+
+`build-fork-runtime.mjs` 在动手前会跑 `checkForkBase()`：fork 的 HEAD 必须**要么就是**
+`dsh-v<version>` 那个 commit，**要么是**下表里的某个提交，且工作树干净。不在表里的提交
+会让构建停下并报出它的哈希 —— 这就是「改了不记」的闸门。
+
+| 提交 | 改了什么 | 为什么必须改 | 为什么不进归档 |
+|---|---|---|---|
+| `057ce8f3` | `scripts/release/verify-packed-install.ts`：Windows 上改用 Node 跑 npm 的 JS 入口，而不是 spawn `npm.cmd` | `npm.cmd` 是批处理 shim，没有 shell 时 `spawnSync` 直接 ENOENT/EINVAL，装包验证在 Windows 上根本跑不起来 | `scripts/` 不在 `@deepseek-ai/dsh` 的 `files` 里，归档里没有这个文件（已实测：解包归档 `grep verify-packed-install` 无命中） |
+
+> 台账与上表的区别只有一条：**节点会不会读到那段代码**。会 → 必须是补丁；不会 → 记在这里。

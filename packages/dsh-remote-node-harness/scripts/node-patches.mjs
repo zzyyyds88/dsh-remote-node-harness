@@ -210,3 +210,102 @@ function driftError(patch, checkout, result) {
     + 'regenerating the patch against the new tag — do not drop it and do not use --reject.',
   )
 }
+
+/**
+ * Commits in the fork that are ours but do **not** reach a node.
+ *
+ * The ledger above covers source that a node reads. A change to the release toolchain is not
+ * source a node reads — `scripts/` is not in `@deepseek-ai/dsh`'s `files`, so the archive does
+ * not contain it — and it cannot be expressed as a `patches/node/*.patch` either. Leaving it
+ * unrecorded is how "the fork differs from the tag in exactly N places" stops being a checkable
+ * statement, so those commits are listed here and `checkForkBase` accepts a fork HEAD only when
+ * every commit above the tag is in this list.
+ *
+ * Each entry: the abbreviated hash, what it changed, and why it cannot be a patch.
+ */
+export const BUILD_SIDE_COMMITS = Object.freeze([
+  Object.freeze({
+    commit: '057ce8f3',
+    what: 'scripts/release/verify-packed-install.ts drives npm through its JS entry on Windows',
+    why: 'a npm.cmd batch shim cannot be spawned without a shell, so the packed-install check '
+      + 'died with ENOENT/EINVAL before it installed anything; nothing here reaches the archive',
+  }),
+])
+
+/**
+ * Refuse to build from a fork whose state nobody recorded.
+ *
+ * Two things can make a build unreproducible: a commit above the pinned tag that is not in
+ * {@link BUILD_SIDE_COMMITS}, and a working tree that differs from the tree the node patches
+ * were cut from. The first is "改了不记"; the second is "someone edited the fork by hand".
+ *
+ * The working tree is allowed to be dirty **only** on paths a shipped patch touches — that is
+ * exactly the state `applyPatches` leaves behind after a build, and a rebuild must not be
+ * forced to revert first. Anything else fails with its own path named.
+ * @param {string} packageRoot - the plugin package root.
+ * @param {string} checkout - the fork's working tree.
+ * @param {string} version - the DSH version the archive will claim.
+ * @param {{ known?: ReadonlyArray<{ commit: string }> }} [options] - override the allow-list;
+ *   only tests use it, because a scratch repository cannot reproduce the real commit hashes.
+ * @returns {{ tag: string, base: string, head: string, extra: ReadonlyArray<string> }}
+ */
+export function checkForkBase(packageRoot, checkout, version, options = {}) {
+  const git = args => spawnSync('git', ['-C', checkout, ...args], { encoding: 'utf8' })
+  const tag = `dsh-v${version}`
+  const allowed = options.known ?? BUILD_SIDE_COMMITS
+
+  const base = git(['rev-parse', '--verify', `${tag}^{commit}`])
+  if (base.status !== 0) {
+    throw new Error(
+      `the fork at ${checkout} has no tag ${tag}: check that tag out before building, because the `
+      + 'node must run the release this project pinned to',
+    )
+  }
+  const baseSha = String(base.stdout ?? '').trim()
+  const headSha = String(git(['rev-parse', 'HEAD']).stdout ?? '').trim()
+  if (headSha === '') throw new Error(`${checkout} is not a git checkout; cannot verify what is being built`)
+
+  const known = new Set(allowed.map(entry => entry.commit))
+  const extra = []
+  if (headSha !== baseSha) {
+    const listing = git(['rev-list', `${baseSha}..${headSha}`])
+    if (listing.status !== 0) throw new Error(`cannot list the commits above ${tag}: ${String(listing.stderr ?? '')}`)
+    for (const sha of String(listing.stdout ?? '').trim().split('\n').filter(Boolean)) {
+      if (![...known].some(short => sha.startsWith(short))) {
+        throw new Error(
+          `the fork has commit ${sha.slice(0, 8)} above ${tag}, and it is not in BUILD_SIDE_COMMITS.\n`
+          + 'Record it in docs/node-patches.zh.md (and in that list) if a node must run it as a\n'
+          + 'patch, or add it to the list with why it cannot be one. An unrecorded commit is the one\n'
+          + `thing this check exists to stop: nothing downstream can tell it apart from a stray edit.\n`
+          + `  git -C ${checkout} show --stat ${sha}`,
+        )
+      }
+      extra.push(sha.slice(0, 8))
+    }
+  }
+
+  // A dirty tree is fine only where a patch made it dirty. `+++ b/<path>` is the diff's own
+  // spelling of the file, which is why it is read from the patch rather than from `git status`.
+  const patchPaths = new Set()
+  for (const patch of listPatches(packageRoot)) {
+    const text = readFileSync(patch.path, 'utf8')
+    for (const line of text.split('\n')) {
+      const match = /^\+\+\+ b\/(.+)$/u.exec(line)
+      if (match !== null) patchPaths.add(match[1])
+    }
+  }
+  const dirty = git(['status', '--porcelain'])
+  if (dirty.status !== 0) throw new Error(`cannot read the fork's working tree: ${String(dirty.stderr ?? '')}`)
+  for (const line of String(dirty.stdout ?? '').split('\n')) {
+    if (line.trim() === '') continue
+    const path = line.slice(3).trim().replace(/^"(.*)"$/u, '$1')
+    if (patchPaths.has(path)) continue
+    throw new Error(
+      `${checkout} has unrecorded local change: "${path}".\n`
+      + 'Only files a shipped patch touches may differ, because that is the state a previous\n'
+      + 'build leaves behind. Either record the change as a patch or discard it — a stray edit in\n'
+      + 'the fork is the second way an archive stops matching its ledger.',
+    )
+  }
+  return { tag, base: baseSha.slice(0, 8), head: headSha.slice(0, 8), extra }
+}

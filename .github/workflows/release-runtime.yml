@@ -1,13 +1,18 @@
-name: Release node runtime (upstream tree)
+name: Pack the upstream tree (comparison)
 
-# Pack the **upstream release** for one DSH version, per platform, on CI rather than on
-# somebody's laptop.
+# Answers one question: **does the upstream release we pinned to still pack cleanly, on every
+# platform, from a machine that is not this laptop?** It packs the official `@deepseek-ai/dsh`
+# tree for each platform and keeps the archives as CI artifacts for a week.
 #
-# **This is not the route a node takes.** Nodes download the tree this project builds from its
-# own fork (`build-fork-runtime.mjs`, see `docs/adr-0007-fork-node-runtime.zh.md`), and there is
-# no node-side fallback any more. What this workflow still buys is the upstream tree itself, as
-# a comparison point and as the thing `verify-packed-install` can check without a fork
-# checkout: it answers "does the release we pinned to still pack cleanly?".
+# **It does not publish anything, and it is not the route a node takes.** Nodes download the tree
+# this project builds from its own fork (`build-fork-runtime.mjs`, see
+# `docs/adr-0007-fork-node-runtime.zh.md`), and there is no node-side fallback any more. The
+# `v<version>-upstream` comparison release this workflow used to create is **gone** (2026-11-21):
+# four archives of 127-192 MiB each, ~640 MiB per run, and nothing consumed them —
+# `verify-packed-install` reads a directory of `.tgz` tarballs, not these `.tar.gz` trees, and no
+# script in this repository or the fork downloads the tag. Keeping the pack step keeps the
+# smoke signal; dropping the publish step drops 640 MiB of assets per upstream version that
+# nothing read.
 #
 # Measured on the reference node (Linux x86_64, glibc 2.35, Node v22.20.0): the upstream tree is
 # a 165 MiB download; the fork build is 58.2 MiB and 25 167 files (build 7), because it drops the
@@ -19,14 +24,10 @@ name: Release node runtime (upstream tree)
 # makes the natives correct — it is what lets `tar` record the executable bit, which a Windows
 # packer cannot (measured: every entry comes out `-rw-rw-rw-`).
 #
-# The build and the upload are separate jobs on purpose: four matrix legs uploading into one
-# release would race on `gh release create`, and a failure there would look like a packaging
-# bug. The legs only produce artifacts; one job publishes all of them.
-#
-# **Uploading here overwrites the fork archive at the same tag.** A node reads
-# `v<version>/dsh-<version>-<platform>.tar.gz` from CNB, so publishing an upstream tree into that
-# path would replace what every node downloads with a 165 MiB tree that has none of the trimming.
-# Keep `publish` off unless you mean to replace it, and re-run the fork build afterwards.
+# **The tar invocation matters here.** These legs run under `shell: bash`, so on Windows the
+# `tar` on PATH is Git Bash's GNU tar, which reads an absolute `D:\...` argv entry as a remote
+# host. Both scripts pack with a relative `-C` and `cwd` for that reason; run 44902426318 is the
+# failure that established it.
 
 on:
   workflow_dispatch:
@@ -35,24 +36,19 @@ on:
         description: 'Upstream DSH version to pack, e.g. 0.2.2-rc.5'
         required: true
         type: string
-      publish:
-        description: 'Upload to the v<version>-upstream comparison tag (otherwise only build artifacts)'
-        required: false
-        default: true
-        type: boolean
   repository_dispatch:
     types: [upstream-dsh-release]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   pack:
     name: Pack ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     strategy:
-      # One platform failing must not discard the archives the others already built: a node
-      # on any platform that succeeded can then take the fast path.
+      # One platform failing must not discard the archives the others already built: a broken
+      # darwin image and a broken tarball look the same from a single red X otherwise.
       fail-fast: false
       matrix:
         include:
@@ -122,61 +118,15 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  publish:
-    name: Publish to a comparison tag
-    needs: pack
-    if: ${{ github.event_name == 'repository_dispatch' || inputs.publish }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Resolve the version
-        id: wanted
-        shell: bash
-        run: |
-          set -eu
-          version="${{ github.event.inputs.version || github.event.client_payload.version }}"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Collect every platform's archive
-        uses: actions/download-artifact@v4
-        with:
-          pattern: runtime-*
-          path: dist
-          merge-multiple: true
-
-      - name: Publish
-        shell: bash
-        env:
-          # `gh` reads this; `contents: write` is what makes the upload legal.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # **The tag carries `-upstream` on purpose.** The node release is `v<version>`, and its
-        # assets are the fork build; uploading an upstream tree into that tag with `--clobber`
-        # would replace the backup with a runtime no node should run, under the same name and
-        # version. A separate tag keeps both, and makes "which one is this" answerable from the
-        # URL alone.
-        run: |
-          set -eu
-          version="${{ steps.wanted.outputs.version }}"
-          tag="v${version}-upstream"
-          ls -l dist
-          gh release create "$tag" \
-            --title "DSH ${version} upstream runtime (comparison)" \
-            --notes "The **upstream** tree for DSH ${version}, one archive per platform. This is
-          not what a node runs: nodes download the fork build published at \`v${version}\`
-          (\`build-fork-runtime.mjs\`), which drops the browser surface, the Office engine and the
-          experimental bundles. Kept for comparison and for \`verify-packed-install\`.
-          Verified by sha256 next to each archive." \
-            || echo "release ${tag} already exists; uploading into it"
-          gh release upload "$tag" dist/dsh-*.tar.gz dist/dsh-*.tar.gz.sha256 --clobber
-
-  # There used to be a `cnb` job here that uploaded these archives to the CNB release. It is
-  # **removed**, not disabled: CNB is the one place a node downloads from, and the path is
-  # `v<version>/dsh-<version>-<platform>.tar.gz` — the same path the fork build publishes to.
-  # An upstream tree landing there would replace what every node downloads with a 165 MiB tree
-  # that has none of the trimming, and nothing in the download would notice: same name, same
-  # version, valid checksum, different runtime. `build-fork-runtime.mjs --cnb` is the only
-  # thing that may write to that path.
+  # There used to be a `publish` job here, creating `v<version>-upstream` with all four archives.
+  # It is **removed**, not disabled: nothing downloaded it. `verify-packed-install` reads a
+  # directory of `.tgz` tarballs, and no script here or in the fork fetches the tag — so each
+  # upstream version left ~640 MiB of assets on the public repo that only a human ever opened.
+  #
+  # There also used to be a `cnb` job that is **still** correctly absent: CNB is the one place a
+  # node downloads from, at `v<version>/dsh-<version>-<platform>.tar.gz`, the same path the fork
+  # build publishes to. An upstream tree landing there would replace what every node downloads
+  # with a 165 MiB untrimmed tree under an identical name and version.
 
   # One summary job, so a person reading the run knows what this produced without opening four
   # logs — and so the note that this is not the node route is impossible to miss.
@@ -191,7 +141,7 @@ jobs:
           set -eu
           result="${{ needs.pack.result }}"
           echo "pack: $result"
-          echo "::notice::these are upstream trees, for comparison and for verify-packed-install; nodes run the fork build (build-fork-runtime.mjs)"
+          echo "::notice::these are upstream trees kept as artifacts, not releases; nodes run the fork build (build-fork-runtime.mjs)"
           if [ "$result" != "success" ]; then
             echo "::warning::some platforms did not pack — that says nothing about what nodes can install, because nodes do not take this route"
           fi

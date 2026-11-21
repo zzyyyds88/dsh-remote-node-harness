@@ -644,6 +644,13 @@ bump `RUNTIME_BUILD`。戳的格式与它记录的第二个事实（`via`）在�
 两条补丁的改动范围、理由、验证与冲突处置写在
 [`node-patches.zh.md`](../packages/dsh-remote-node-harness/docs/node-patches.zh.md)。
 
+**「fork 只差台账里这几条」是断言，不是声称。** `build-fork-runtime.mjs` 在动手前跑
+`checkForkBase()`：fork 的 HEAD 必须就是 `dsh-v<version>` 那个提交，或者它上面多出来的每一个
+提交都在 `node-patches.mjs` 的 `BUILD_SIDE_COMMITS` 里（构建侧修复，归档里没有那段代码，
+所以当不了补丁）；工作树只允许在**补丁覆盖的文件**上有差异，其余脏文件按路径报错。
+两个方向都是同一次故障：归档不再等于台账。`test/fork-base-unit.mjs` 用临时仓库把三种情形
+（未入账提交、手工改过的文件、没打 tag）各断言一遍，并顺带跑一次真 fork。
+
 **文件级裁掉的四类死字节，每一类都是先量后删。** build 4 的归档 408.2 MiB 里，
 `src/**.ts` 91.9 MiB、`.d.cts` 22.7 MiB、无人读的 `.md` 5.3 MiB、Windows 调试符号与
 跨平台 prebuilds 28.4 MiB。删的依据不是「看起来像垃圾」：
@@ -1095,10 +1102,12 @@ preset 的 `persona` 行只负责把这件事说清楚（拒绝什么、怎么�
 - **不接管 `/api` 或 `/api/remote.mux`**：它们已被 gateway 独占，**本机**的 `registerFallback` 也已被 `frontend-static` 占走（节点上则相反：大脑没有 static，那个座位空着，由 `brain-runtime` 认领）。
 - **不做本地镜像目录**：工作区路径就是节点上的真实路径。这正是工具能用的原因 —— 见下一节。
 - **不碰上游 Loader 行**：插件自己的 `cordis.patch.yml` 只有一条 `insert`。
-- **不改上游语义**。节点运行时来自本项目的 fork，但 fork 上的源码改动**只有构建侧修复**
-  （第一处：`verify-packed-install.ts` 在 Windows 上不能用 `npm.cmd` 起子进程）。裁剪是
-  **打包步骤**，不是改源码；任何要改运行时行为的改动，先在 fork 上单独一个提交、写清理由与
-  验证方式。见 [`adr-0007`](adr-0007-fork-node-runtime.zh.md) §五。
+- **改上游源码必须留台账，不许改了不记**。节点运行时来自本项目的 fork，而 fork 就是**官方 DSH
+  源码**——这个项目不另写节点端，改源码是主路径。要求只有一条：每一处源码改动都要能单独读、
+  单独测、单独弃用，落在 `packages/dsh-remote-node-harness/patches/node/NNNN-*.patch` 并由
+  `docs/node-patches.zh.md` 记一行。改了不记的后果不是「不优雅」，是**上游发版时改动被静默丢掉**——
+  那才是真正的缺陷。删包与删文件是**打包步骤**，不进台账。见
+  [`adr-0008`](adr-0008-node-source-trim.zh.md)。
 - **不发 npm**。节点不经过 registry：拿的是归档。往 npm 发 375 个包只会多一条版本线。
 - **不给 GitHub 留下载源**。GitHub Release 收到同一份字节作灾备与留档，但节点只从 CNB 取。
 - **不做 per-node 组合定制**：所有节点共用同一份 `@local/rnh-brain`，也共用同一份构建产物。某台机器要不同插件集时再讨论，不预留空壳配置。
