@@ -108,7 +108,7 @@ check(walked === 'root' || typeof walked === 'string', 'the parent is either a d
   String(walked))
 const missing = await get(`/browse?path=${encodeURIComponent(`${localPath}/__rnh_no_such_dir__`)}`)
 check(missing.status === 400 && typeof missing.body.error === 'string',
-  'a directory that does not exist is refused with the reason, not an empty list',
+  'a local directory that does not exist is refused with the reason, not an empty list',
   `HTTP ${String(missing.status)} ${missing.body.error ?? ''}`)
 
 // ---- 2. a node, in the same shape -------------------------------------------
@@ -141,9 +141,22 @@ if (localNames.size > 0) {
     `remote ${String(rootNames.length)} names, local ${String(localNames.size)}`)
 }
 const remoteMissing = await get(url(`${String(remoteHome.body.home)}/__rnh_no_such_dir__`))
-check(remoteMissing.status === 400 && typeof remoteMissing.body.error === 'string',
-  'a missing remote directory reports the shell’s reason',
+// A *node* path that is legal but not there yet answers as a confirmable empty level, and
+// says so with `exists: false`. That is the whole reason the phone can create a workspace
+// on a node at all: its endpoint allowlist has no `directoryPicker/createDirectory`, its
+// typed-path row resolves through a listing, and only a level that can be shown can be
+// confirmed. The local case just above still refuses, because on this machine nothing ever
+// needs to be created from a picker the shell already handles.
+check(remoteMissing.status === 200,
+  'a node path that is not there yet answers as a level, so the phone can confirm it',
   `HTTP ${String(remoteMissing.status)} ${remoteMissing.body.error ?? ''}`)
+check(remoteMissing.body.exists === false,
+  'and it says the folder is not there yet', String(remoteMissing.body.exists))
+check(Array.isArray(remoteMissing.body.entries) && remoteMissing.body.entries.length === 0,
+  'with no children offered', JSON.stringify(remoteMissing.body.entries))
+check(String(remoteMissing.body.path ?? '').endsWith('/__rnh_no_such_dir__'),
+  'and the level is the path that was asked for, not a substitute',
+  String(remoteMissing.body.path))
 
 // ---- 3. pick a folder and register it --------------------------------------
 // A directory the node actually has and nobody made for this test: the home directory

@@ -913,8 +913,16 @@ export function decorateDirectoryPickerController(service, router) {
      * One directory level, for a Remote caller's in-app browser.
      *
      * The shape is the upstream `DirectoryListing`: `path`, `home`, `crumbs`,
-     * `entries`, `truncated`. `home` is where the browser's breadcrumb row starts, so a
-     * node listing roots it at the namespace instead of the desktop's home.
+     * `entries`, `truncated`, plus this plugin's `exists`. `home` is where the browser's
+     * breadcrumb row starts, so a node listing roots it at the namespace instead of the
+     * desktop's home.
+     *
+     * A node path that is legal but **not there yet** answers as an empty level with
+     * `exists: false` rather than an error. That is what makes "open a project that does
+     * not exist" reachable from a Remote caller at all: the phone can only confirm a level
+     * it can see, its typed-path row resolves through this method, and
+     * `directoryPicker/createDirectory` is not in its endpoint allowlist. Confirming such a
+     * level runs `workspace/create`, whose decorator makes the directory on the node.
      *
      * A caller that names no path gets the **device layer**, not this machine's home: a
      * phone opens its folder browser with no path at all and can only tap a row, so
@@ -966,6 +974,10 @@ export function decorateDirectoryPickerController(service, router) {
         ],
         entries: listing.entries.map(entry => ({ name: entry.name, path: spell(entry.path), hidden: false })),
         truncated: listing.truncated,
+        // A path on the node that is legal but not there yet answers as an empty level, and
+        // this flag is the only thing that says so. It travels on every answer, so a caller
+        // branches on the field rather than on which machine it happens to be looking at.
+        exists: listing.exists !== false,
       }
     },
 

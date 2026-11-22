@@ -169,18 +169,46 @@ check(decoded?.remotePath === '/root', 'one level down decodes to the node path 
 check((deep?.entries ?? []).every(row => decodePickerPath(row.path)?.remotePath?.startsWith('/root/')),
   'and every child path decodes too', (deep?.entries ?? []).slice(0, 2).map(row => row.path).join(' '))
 
-// A path the node does not have is an error the phone can show, not an empty list.
-// The code is `gateway/internal` because the failure came from the node's own shell and
-// this Host has no better wire code for it; what matters is that the call *fails* rather
-// than answering a plausible empty level.
-let missingError
+// A path the node does not have yet is a **confirmable empty level**, not an error.
+//
+// This is the whole of GOAL §五-1: the phone cannot create a folder (its endpoint allowlist
+// has no `directoryPicker/createDirectory`, and GOAL §七-3 keeps it that way), and its
+// typed-path row resolves through `browse()` — so the only way "create a project on the
+// node" can be reachable is for a legal-but-absent path to answer as a level that can be
+// confirmed. Confirming it runs `workspace/create`, which makes the directory on the node.
+//
+// The old assertion here demanded an error, which was right for a picker and wrong for this
+// goal. What must still be refused is a path that could never be a directory (`..`, `/`),
+// and that is asserted separately below.
+const missingName = `rnh-new-${Date.now().toString(36)}`
+const missingPath = `${PICKER_PREFIX}/${remote.id}/tmp/${missingName}`
+const missing = await call('directoryPicker/list', { path: missingPath })
+check(decodePickerPath(missing?.path)?.remotePath === `/tmp/${missingName}`,
+  'a folder the node does not have yet answers as a level for that exact path',
+  JSON.stringify(decodePickerPath(missing?.path)))
+check(Array.isArray(missing?.entries) && missing.entries.length === 0,
+  'and it is empty, so nothing false is offered for tapping', JSON.stringify(missing?.entries))
+check(missing?.exists === false,
+  'and it says the folder is not there yet, so a caller can name what confirming will do',
+  String(missing?.exists))
+check((missing?.crumbs ?? []).length >= 2,
+  'and it still carries the ancestry, so the phone can walk back out of it',
+  JSON.stringify((missing?.crumbs ?? []).map(crumb => crumb.path)))
+// The node really does not have it: the level was an answer about a future folder.
+const beforeCreate = await nodeExec(`test -d /tmp/${missingName} && echo present || echo absent`)
+check(beforeCreate.trim() === 'absent', 'the node really does not have that folder yet',
+  beforeCreate.trim())
+
+// The node's own namespace root is **not** a folder, so it cannot borrow the empty-level
+// answer: creating a workspace there is meaningless, and confirming it must fail.
+let rootRefused
 try {
-  await call('directoryPicker/list', { path: `${PICKER_PREFIX}/${remote.id}/__rnh_no_such_dir__` })
+  await call('directoryPicker/list', { path: `${PICKER_PREFIX}/${remote.id}` })
 } catch (error) {
-  missingError = error
+  rootRefused = error
 }
-check(missingError !== undefined, 'a folder the node does not have is refused',
-  missingError === undefined ? 'it answered a listing' : `${String(missingError.code)}: ${missingError.message.slice(0, 90)}`)
+check(rootRefused !== undefined, 'the namespace root of a node is not a confirmable folder',
+  rootRefused === undefined ? 'it answered a level' : String(rootRefused.code))
 
 // An offline node must say so rather than answer an empty level: the phone would show
 // "this machine has no folders", which reads as a configuration problem.
@@ -223,6 +251,26 @@ try {
 
 // ---- 4. workspace/create by node path, and the shadow it leaves -------------
 
+// 4a. The path that did not exist: this is the phone's only route to a new project.
+// The level answered above was empty and confirmable; confirming it must land a directory
+// on the **node** that was not there a moment ago, and must clean up the placeholder the
+// relay made here before dispatching.
+const missingTarget = `${PICKER_PREFIX}/${remote.id}${decodePickerPath(missingPath)?.remotePath ?? missingPath}`
+const missingShadow = resolve(missingTarget)
+const madeFromMissing = await call('workspace/create', { request: { path: missingTarget } })
+const missingWorkspaceId = (madeFromMissing?.workspace ?? madeFromMissing)?.workspaceId
+  ?? madeFromMissing?.workspaceId
+check(typeof missingWorkspaceId === 'string' && missingWorkspaceId.startsWith(`rnh_${remote.id}_`),
+  'a folder the node did not have becomes a workspace on that node', String(missingWorkspaceId))
+const nowOnNode = await nodeExec(`test -d /tmp/${missingName} && echo present || echo absent`)
+check(nowOnNode.trim() === 'present',
+  'and the node really has it now, so the empty level was a promise this kept', nowOnNode.trim())
+check(!existsSync(missingShadow),
+  'and this machine keeps no placeholder for the path it never had', missingShadow)
+await call('workspace/delete', { request: { workspaceId: missingWorkspaceId } }).catch(() => undefined)
+await nodeExec(`rmdir /tmp/${missingName}`).catch(() => undefined)
+
+// 4b. A folder that already exists, and the placeholder cleanup around it.
 const workspacePath = `/tmp/${folderName}`
 const target = `${PICKER_PREFIX}/${remote.id}${workspacePath}`
 // What the relay does before dispatching: `mkdir -p` on the raw request string, in this

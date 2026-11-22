@@ -187,6 +187,9 @@ export async function listLocal(path) {
     crumbs: localCrumbs(target),
     entries,
     truncated,
+    // This machine's levels always exist: `stat` above proved it, so a caller can branch on
+    // one field for both sides instead of on which side it is talking to.
+    exists: true,
   }
 }
 
@@ -200,20 +203,35 @@ export async function listLocal(path) {
  *
  * @param {import('../ssh/connection.js').SshConnection} connection
  * @param {string} [path] - absolute POSIX path; empty means the node's home directory.
- * @returns {Promise<{ path: string, home: string, parent?: string, entries: Array<{ name: string, path: string }>, truncated: boolean }>}
+ * @returns {Promise<{ path: string, home: string, parent?: string, entries: Array<{ name: string, path: string }>, truncated: boolean, exists: boolean }>}
+ *   `exists: false` is a legal absolute path the node does not have yet: the level is
+ *   empty and confirmable, and `workspace/create` makes it. A path that could never be a
+ *   directory, or one this process may not read, still throws.
  */
 export async function listRemote(connection, path) {
   const wanted = typeof path === 'string' && path.trim().length > 0 ? path.trim() : ''
-  // One shell invocation answers all three facts: the resolved absolute path (a bare `~`
-  // or a relative argument has to become absolute before it can be a workspace), the
+  // One shell invocation answers every fact this needs: the resolved absolute path (a bare
+  // `~` or a relative argument has to become absolute before it can be a workspace), the
   // home directory, and the folder list. `$1` is passed as an argument, not interpolated,
   // so a path with spaces or quotes cannot become part of the script.
+  //
+  // A missing directory is reported as its own fact rather than folded into the error: a
+  // path that is legal but not there yet is exactly what "open a project that does not
+  // exist" hands this function, and the picker has to let that path be confirmed. The two
+  // markers are mutually exclusive, so a caller never has to read shell prose to tell
+  // "not there" from "not allowed".
   const script = `
 set -u
 target=\${1:-}
 if [ -z "$target" ]; then target="$HOME"; fi
+if [ ! -e "$target" ]; then
+  printf 'RNH_BROWSE_MISSING=%s\\n' "$target"
+  printf 'RNH_BROWSE_HOME=%s\\n' "$HOME"
+  exit 0
+fi
 if ! cd "$target" 2>/dev/null; then
   printf 'RNH_BROWSE_ERROR=%s\\n' "$(cd "$target" 2>&1 | tail -1)"
+  printf 'RNH_BROWSE_HOME=%s\\n' "$HOME"
   exit 0
 fi
 printf 'RNH_BROWSE_PATH=%s\\n' "$(pwd -P)"
@@ -226,14 +244,40 @@ find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print 2>/dev/null | LC_ALL=
     maxBytes: 512 * 1024,
   })
   const output = `${result.stdout}\n${result.stderr}`
+  const home = /RNH_BROWSE_HOME=(.*)/u.exec(output)?.[1]?.trim() ?? '/'
   const failure = /RNH_BROWSE_ERROR=(.*)/u.exec(output)
   if (failure !== null) {
     throw Object.assign(new Error(`${wanted === '' ? '~' : wanted}: ${failure[1].trim()}`), {
       code: 'browse-failed',
     })
   }
+  // A path that is not there is answered as an **empty level**, and only when it could
+  // become a directory: absolute, no `..`, and not the root itself. Anything else keeps
+  // failing — a picker that silently accepted `../../etc` or `/` would be worse than one
+  // that refuses, because the next step creates it on the node.
+  const missing = /RNH_BROWSE_MISSING=(.*)/u.exec(output)?.[1]?.trim()
+  if (missing !== undefined) {
+    if (!isPosixAbsolute(missing) || missing === '/' || missing.split('/').includes('..')) {
+      throw Object.assign(
+        new Error(`${missing}: not a directory this node can be asked to create`),
+        { code: 'path-invalid' },
+      )
+    }
+    const normalized = missing.replace(/\/+$/u, '') || '/'
+    return {
+      path: normalized,
+      home,
+      roots: ['/'],
+      crumbs: posixCrumbs(normalized),
+      entries: [],
+      truncated: false,
+      // The one field that tells "an empty folder" from "a folder that is not there yet".
+      // A caller that ignores it sees an empty level either way, which is what the phone's
+      // picker needs; a caller that reads it can say what confirming will do.
+      exists: false,
+    }
+  }
   const resolved = /RNH_BROWSE_PATH=(.*)/u.exec(output)?.[1]?.trim()
-  const home = /RNH_BROWSE_HOME=(.*)/u.exec(output)?.[1]?.trim() ?? '/'
   if (resolved === undefined) {
     throw Object.assign(new Error(`reading ${wanted === '' ? '~' : wanted} failed: ${output.trim().slice(-300)}`), {
       code: 'browse-failed',
@@ -261,6 +305,9 @@ find . -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print 2>/dev/null | LC_ALL=
     crumbs: posixCrumbs(resolved),
     entries,
     truncated,
+    // Present on every answer so a caller can branch on one field instead of on whether
+    // the key happens to be there.
+    exists: true,
   }
 }
 
