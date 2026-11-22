@@ -46,6 +46,7 @@ import { RemoteWaterfalls } from './host/remote-waterfall.js'
 import { RemoteWorkspaces } from './host/remote-workspaces.js'
 import { Router } from './host/router.js'
 import { SyncSwitches } from './host/sync-switches.js'
+import { applyRelayPatch } from './host/relay-patch.js'
 import { overrideAgentLookup, overrideWorkspaceFileScope } from './host/lookups.js'
 import {
   decorateDirectoryPickerController,
@@ -163,6 +164,29 @@ export function apply(ctx, config = {}) {
   // fiber-owned effect, so unloading this plugin removes the service on its own.
   ctx.provide('rnhControl', new RnhControl({ rnh, log }))
 
+  /**
+   * Let routed Sessions read their own files through the relay.
+   *
+   * The relay authorises file reads against **this** machine's filesystem before it
+   * dispatches, so a remote Session (`cwd` on the node) is refused with
+   * `WORKSPACE_UNAVAILABLE` before rnh ever sees the call. The fix is a small edit to the
+   * *installed* relay bundle; the upstream repositories stay untouched, and the edit is
+   * re-checked on every Host start because a relay upgrade replaces those bytes. Why it
+   * cannot be solved any other way, and what happens when an anchor disappears, is in
+   * `docs/adr-0008-relay-artifact-patch.zh.md`.
+   */
+  const relay = config.relayPatch === false
+    ? { installed: null, patched: false, reason: 'disabled by config (relayPatch: false)' }
+    : applyRelayPatch({
+      // `profileContext` is the composition's own record of which profile this Host is;
+      // `DSH_PROFILE_DIR` is the same fact when a caller started it from a shell.
+      profileDir: ctx.get('profileContext')?.dir ?? process.env.DSH_PROFILE_DIR,
+      log,
+    })
+  if (relay.patched !== true && relay.reason !== undefined) {
+    log(`rnh: routed Sessions cannot read files through the relay — ${relay.reason}`)
+  }
+
   /** One request handler over the management API, with uniform failures. */
   const guard = handler => async (req, res) => {
     try {
@@ -188,7 +212,7 @@ export function apply(ctx, config = {}) {
           sendJson(res, 200, {
             ok: true,
             version,
-            local: { version, role: 'conductor' },
+            local: { version, role: 'conductor', relay },
             nodes: rnh.list().map(runtime => runtime.describe()),
           })
           return

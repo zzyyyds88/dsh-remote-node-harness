@@ -208,6 +208,14 @@ const SUITES = [
     proves: 'the node-control surface: a pasted secret is refused, a reference is read locally, and a result can never carry authentication material',
   },
   {
+    name: 'relay-patch',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'relay-patch-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    proves: 'the edit that lets a routed Session read files lands exactly once, refuses an unknown relay bundle whole, is idempotent across Host restarts, breaks no hard-linked sibling, and can be reverted byte for byte',
+  },
+  {
     name: 'composition',
     layer: 'offline',
     file: ['packages', 'rnh-brain', 'scripts', 'check-composition.mjs'],
