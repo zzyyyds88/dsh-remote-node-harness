@@ -23,7 +23,13 @@
  *
  * Run:
  *   RNH_TEST_HOST=… RNH_TEST_USER=… RNH_TEST_PASSWORD=… \
- *   node test/artefact-acceptance.mjs [--version 0.2.2-rc.3] [--platform linux-x64]
+ *   node test/artefact-acceptance.mjs [--version <dsh version>] [--platform linux-x64]
+ *
+ * Without `--version` the version comes from the running Host (`/rnh/api/nodes` reports it
+ * as `local.version`), which is the version a node actually has to be able to run. A
+ * hard-coded default went stale once — `0.2.2-rc.3` was deleted from CNB, every run then
+ * answered 404 and the suite reported SKIP — and a test that skips itself forever is worse
+ * than one that fails.
  */
 import { nodeExec, nodeRun } from './node.mjs'
 import { platformTag } from '../src/remote/artefact.js'
@@ -40,8 +46,37 @@ const value = (name, fallback) => {
   const at = args.indexOf(`--${name}`)
   return at >= 0 && args[at + 1] !== undefined ? args[at + 1] : fallback
 }
-const version = value('version', process.env.DSH_INSTALL_VERSION ?? '0.2.2-rc.3')
+
+/**
+ * The DSH version the node must be able to run: this Host's own.
+ *
+ * `run-all` passes `<base> <token>` to every suite, and `/rnh/api/nodes` answers with the
+ * running version. Falling back to the environment keeps the script usable on its own.
+ *
+ * @returns {Promise<string | undefined>}
+ */
+async function runningVersion() {
+  const explicit = process.env.DSH_INSTALL_VERSION
+  if (typeof explicit === 'string' && explicit.length > 0) return explicit
+  const [base, token] = process.argv.slice(2).filter(part => !part.startsWith('--'))
+  if (base === undefined || token === undefined || !/^https?:/u.test(base)) return undefined
+  try {
+    const { authenticate } = await import('./carrier.mjs')
+    const cookie = await authenticate(base, token)
+    const body = await fetch(`${base}/rnh/api/nodes`, { headers: { cookie } }).then(response => response.json())
+    return typeof body?.local?.version === 'string' ? body.local.version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const version = value('version', await runningVersion())
 const platform = value('platform', 'linux-x64')
+if (version === undefined) {
+  log('no DSH version to install: pass --version, set DSH_INSTALL_VERSION, or run through run-all')
+  process.exit(3)
+}
+log(`installing DSH ${version} for ${platform}`)
 
 /**
  * Quote one string so `sh -c` receives it unchanged.

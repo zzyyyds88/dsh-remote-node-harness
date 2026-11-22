@@ -15,7 +15,13 @@ import { upgradeWebSocket } from '../src/host/ws.js'
 import { nodeConfig } from './node.mjs'
 
 const TARGET = nodeConfig()
-const ROOT = process.env.RNH_TEST_ROOT ?? `${process.env.RNH_TEST_HOME ?? '/root'}/.dsh-remote-node-harness`
+// Where the node keeps its resident host. The recorded `remoteRoot` is the only correct
+// answer — a node registered under a different root keeps its status file there instead of
+// in `~/.dsh-remote-node-harness` — so the runner hands it down through the environment.
+// The fallback chain is for running this script by hand.
+const ROOT = process.env.RNH_TEST_REMOTE_ROOT
+  ?? process.env.RNH_TEST_ROOT
+  ?? `${process.env.RNH_TEST_HOME ?? '/root'}/.dsh-remote-node-harness`
 
 const log = message => process.stderr.write(`[gateway-smoke] ${message}\n`)
 const failures = []

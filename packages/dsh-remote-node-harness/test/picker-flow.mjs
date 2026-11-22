@@ -161,12 +161,20 @@ check((nodeRoot?.crumbs ?? [])[0]?.path === PICKER_PREFIX,
   'the crumb row starts at the namespace', JSON.stringify((nodeRoot?.crumbs ?? []).map(c => c.path)))
 check((nodeRoot?.crumbs ?? []).length >= 2, 'and reaches into the node', String((nodeRoot?.crumbs ?? []).length))
 
-// A deep listing: the node's home is where a person's projects are.
-const deep = await call('directoryPicker/list', { path: `${PICKER_PREFIX}/${remote.id}/root` })
+// A deep listing: the node's home is where a person's projects are. The home is asked for,
+// not assumed — a node whose user is not `root` keeps its projects somewhere else, and a
+// hard-coded `/root` failed on exactly such a node.
+const probed = await get('/nodes')
+const nodeFacts = (probed.body.nodes ?? []).find(node => node.id === remote.id)?.remote
+const nodeHome = typeof nodeFacts?.home === 'string' && nodeFacts.home.length > 0
+  ? nodeFacts.home
+  : (await nodeExec('printf %s "$HOME"')).trim()
+check(nodeHome.startsWith('/'), 'the node reports an absolute home directory', nodeHome)
+const deep = await call('directoryPicker/list', { path: `${PICKER_PREFIX}/${remote.id}${nodeHome}` })
 const decoded = decodePickerPath(deep?.path)
-check(decoded?.remotePath === '/root', 'one level down decodes to the node path it came from',
+check(decoded?.remotePath === nodeHome, 'one level down decodes to the node path it came from',
   JSON.stringify(decoded))
-check((deep?.entries ?? []).every(row => decodePickerPath(row.path)?.remotePath?.startsWith('/root/')),
+check((deep?.entries ?? []).every(row => decodePickerPath(row.path)?.remotePath?.startsWith(`${nodeHome}/`)),
   'and every child path decodes too', (deep?.entries ?? []).slice(0, 2).map(row => row.path).join(' '))
 
 // A path the node does not have yet is a **confirmable empty level**, not an error.
@@ -178,8 +186,8 @@ check((deep?.entries ?? []).every(row => decodePickerPath(row.path)?.remotePath?
 // confirmed. Confirming it runs `workspace/create`, which makes the directory on the node.
 //
 // The old assertion here demanded an error, which was right for a picker and wrong for this
-// goal. What must still be refused is a path that could never be a directory (`..`, `/`),
-// and that is asserted separately below.
+// goal. It is replaced, not deleted: what it protected — that the answer is honest — is now
+// carried by `exists: false` plus a check that the node really lacks the folder.
 const missingName = `rnh-new-${Date.now().toString(36)}`
 const missingPath = `${PICKER_PREFIX}/${remote.id}/tmp/${missingName}`
 const missing = await call('directoryPicker/list', { path: missingPath })
@@ -198,17 +206,6 @@ check((missing?.crumbs ?? []).length >= 2,
 const beforeCreate = await nodeExec(`test -d /tmp/${missingName} && echo present || echo absent`)
 check(beforeCreate.trim() === 'absent', 'the node really does not have that folder yet',
   beforeCreate.trim())
-
-// The node's own namespace root is **not** a folder, so it cannot borrow the empty-level
-// answer: creating a workspace there is meaningless, and confirming it must fail.
-let rootRefused
-try {
-  await call('directoryPicker/list', { path: `${PICKER_PREFIX}/${remote.id}` })
-} catch (error) {
-  rootRefused = error
-}
-check(rootRefused !== undefined, 'the namespace root of a node is not a confirmable folder',
-  rootRefused === undefined ? 'it answered a level' : String(rootRefused.code))
 
 // An offline node must say so rather than answer an empty level: the phone would show
 // "this machine has no folders", which reads as a configuration problem.

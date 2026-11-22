@@ -64,10 +64,12 @@ const items = wsStream.frames.find(frame => frame.value?.type === 'baseline')?.v
 wsStream.stop()
 let remoteWorkspace = items.find(item => String(item.workspaceId).startsWith('rnh_'))
 if (remoteWorkspace === undefined) {
-  const nodes = (await (await fetch(`${base}/rnh/api/nodes`, { headers: { cookie } })).json()).nodes ?? []
-  const created = await call('workspace/create', { request: { path: '/root/rnh-tools' } })
+  // A fixture workspace, under the node's own home: a node whose user is not root refuses
+  // `/root/...`, and the failure would read as "workspace/create is broken".
+  const homeEcho = (await nodeExec('printf %s "$HOME"')).trim()
+  const nodeHome = homeEcho.startsWith('/') ? homeEcho : '/root'
+  const created = await call('workspace/create', { request: { path: `${nodeHome}/rnh-tools` } })
   void created
-  void nodes
 }
 if (remoteWorkspace === undefined) {
   const refreshed = liveStream(carrier, 'workspace/follow', {})

@@ -164,7 +164,12 @@ check(String(row?.cwd ?? '').startsWith('/'), 'its cwd is the remote absolute pa
 // The local directory picker browses THIS machine, so it can never select a node
 // path. The plugin API is how a remote workspace gets added, and it must round-trip
 // through the node's own registry.
-const secondPath = '/root/rnh-second'
+//
+// The path is under the node's own home, asked for rather than spelled `/root`: a node
+// whose user is not root refuses the latter, and the failure reads like a broken API.
+const homeEcho = (await nodeExec('printf %s "$HOME"')).trim()
+const nodeHome = homeEcho.startsWith('/') ? homeEcho : '/root'
+const secondPath = `${nodeHome}/rnh-second`
 const nodesResponse = await fetch(`${base}/rnh/api/nodes`, { headers: { cookie } })
 const nodesBody = await nodesResponse.json()
 const nodeId = (nodesBody.nodes ?? [])[0]?.id

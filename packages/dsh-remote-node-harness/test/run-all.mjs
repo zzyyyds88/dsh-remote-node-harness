@@ -39,6 +39,7 @@
  */
 import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -621,6 +622,16 @@ async function launchHost() {
   mkdirSync(LOGS, { recursive: true })
   const logPath = join(LOGS, 'host.log')
   const fd = openSync(logPath, 'w', 0o644)
+  /**
+   * The provider key travels in the child's environment, never in a file.
+   *
+   * The suites that drive a model (`workspace-flow`, `session`, `approval`, `tool-parity`,
+   * `tool-git-image`) need one, and a Host launched here would otherwise have to be
+   * configured by hand — which is exactly the setup gap that produced nine "no API key"
+   * failures in the last full run. The credentials provider ranks the managed store above
+   * the process environment, so this only fills a gap; it never overrides a saved key.
+   */
+  const providerKey = providerKeyFromHome()
   const child = spawn(install.electron, [
     '--expose-internals', cli,
     '--profile', profile,
@@ -630,7 +641,11 @@ async function launchHost() {
   ], {
     cwd: REPO,
     stdio: ['ignore', fd, fd],
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1',
+      ...(providerKey === undefined ? {} : { DEEPSEEK_API_KEY: providerKey }),
+    },
     windowsHide: true,
   })
   closeSync(fd)
@@ -657,11 +672,43 @@ async function launchHost() {
 }
 
 /**
- * Bring every recorded node to `connected`.
+ * Read `DEEPSEEK_API_KEY` out of the real home's credential store, for the test Host.
+ *
+ * The end-to-end suites that drive a model need a provider key, and this Host is launched
+ * with an isolated profile inside the same `DSH_HOME` — the store is shared, so the value is
+ * already here. It is handed to the child **through the environment**, which the credentials
+ * provider ranks below the file but above `.env`; nothing is written to disk, printed, or
+ * copied into `.scratch`.
+ *
+ * Returns `undefined` when the store has no such ref, which is a real state (a machine that
+ * has never signed in) and turns into a named SKIP rather than a failure.
+ *
+ * @returns {string | undefined}
+ */
+function providerKeyFromHome() {
+  const fromEnv = process.env.DEEPSEEK_API_KEY
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  try {
+    const text = readFileSync(join(homedir(), '.dsh', '.credentials.yaml'), 'utf8')
+    const match = /DEEPSEEK_API_KEY:\s*(\S+)\s*\}/u.exec(text)
+    return match?.[1]
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Bring every recorded node to `connected`, seeding one from `RNH_TEST_*` when there is none.
  *
  * A recorded node already holds its credentials, so nothing has to be passed in; a node
  * that is merely idle is a setup gap this runner can close, and one that is failing is a
  * real failure the end-to-end layer should be told about rather than silently skip past.
+ *
+ * The seeding half used to be a promise in this function's own error message and no code:
+ * `/rnh/api/nodes` answered `[]` and the message told the reader to "set
+ * RNH_TEST_HOST/USER/PASSWORD" — which changed nothing, because nothing read those
+ * variables. It does now: with the three set, one node is registered, which is what makes
+ * a fresh profile runnable without opening the settings surface by hand.
  *
  * @param {string} base
  * @param {string} cookie
@@ -676,8 +723,34 @@ async function connectNodes(base, cookie) {
     return `the node list could not be read: ${String(error?.message ?? error)}`
   }
   if (nodes.length === 0) {
-    return 'no node is recorded in this profile; add one in the settings surface once, '
-      + 'or set RNH_TEST_HOST/USER/PASSWORD'
+    const host = process.env.RNH_TEST_HOST
+    const user = process.env.RNH_TEST_USER
+    const password = process.env.RNH_TEST_PASSWORD
+    if (host === undefined || host.length === 0 || user === undefined || user.length === 0) {
+      return 'no node is recorded in this profile, and RNH_TEST_HOST/USER are not set'
+    }
+    // The name is what the sidebar shows; it must not be the host address, which never
+    // belongs in this repository's output.
+    const created = await fetch(`${base}/rnh/api/nodes`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        node: {
+          name: process.env.RNH_TEST_NAME ?? 'acceptance-node',
+          host,
+          port: Number(process.env.RNH_TEST_PORT ?? 22),
+          username: user,
+          remoteRoot: process.env.RNH_TEST_ROOT ?? undefined,
+          ...(password === undefined || password.length === 0 ? {} : { password }),
+        },
+      }),
+    })
+    if (!created.ok) {
+      return `the node could not be registered: HTTP ${String(created.status)} ${(await created.text()).slice(0, 200)}`
+    }
+    nodes = (await fetch(`${base}/rnh/api/nodes`, { headers }).then(response => response.json())).nodes ?? []
+    if (nodes.length === 0) return 'a node was registered but the Host does not list it'
+    process.stdout.write(`${DIM(`  seeded   ${String(nodes[0].name)} from RNH_TEST_*`)}\n`)
   }
 
   for (const node of nodes) {
@@ -696,6 +769,11 @@ async function connectNodes(base, cookie) {
   const after = (await fetch(`${base}/rnh/api/nodes`, { headers }).then(r => r.json())).nodes ?? []
   const down = after.filter(node => node.state !== 'connected')
   if (down.length === after.length) return 'no node reached `connected`'
+  // Hand the recorded root down to every suite through the environment. `gateway-smoke`
+  // reads it to find the node's `run/status.json`; the suites that can ask the API do so
+  // instead, but a script run by hand has no API to ask.
+  const connected = after.find(node => node.state === 'connected')
+  if (typeof connected?.remoteRoot === 'string') process.env.RNH_TEST_REMOTE_ROOT = connected.remoteRoot
   return undefined
 }
 
@@ -800,7 +878,7 @@ for (const suite of SUITES) {
     continue
   }
 
-  if (suite.needs === 'host' || suite.needs === 'chrome') await ensureHost()
+  if (suite.needs === 'host' || suite.needs === 'chrome' || suite.needs === 'release') await ensureHost()
   const reason = blocked(suite)
   if (reason !== undefined) {
     process.stdout.write(`${SKIP('SKIP')} ${label.padEnd(26)} ${DIM(reason)}\n`)
@@ -809,7 +887,10 @@ for (const suite of SUITES) {
   }
 
   const extraArgs = []
-  if (suite.needs === 'host' || suite.needs === 'chrome') {
+  if (suite.needs === 'host' || suite.needs === 'chrome' || suite.needs === 'release') {
+    // The release suite also takes the Host's address: it installs the version that Host is
+    // running, which is the version a node really has to be able to run. A hard-coded
+    // default went stale once and turned the suite into a permanent SKIP.
     extraArgs.push(host.base, host.token)
   }
   // The in-progress line exists to say which suite is currently slow, so it is written on a

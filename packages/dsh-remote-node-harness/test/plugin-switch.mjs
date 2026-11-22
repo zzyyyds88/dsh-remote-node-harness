@@ -15,6 +15,7 @@
  * Usage: node test/plugin-switch.mjs <hostBase> <launchToken>
  */
 import { nodeConfig, nodeExec } from './node.mjs'
+import { nodeLayout } from './layout.mjs'
 import { authenticate, call, openCarrier } from './carrier.mjs'
 
 const [base, token] = process.argv.slice(2)
@@ -123,7 +124,12 @@ if (target === undefined) {
 }
 log(`switching ${target.bundle} (${String(target.spec || 'latest')}) on ${remote.name}`)
 
-const manifest = async () => (await nodeExec('cat ~/.dsh/profiles/rnh/package.json 2>/dev/null || echo {}')).trim()
+// Where the node's own profile lives. Derived from the recorded `remoteRoot`, not spelled
+// out: the profile name follows that root (`rnh` only for the default one), so a node
+// registered elsewhere kept its manifest under a different name and this suite read `{}`.
+const { layout: nodePaths } = await nodeLayout(base, cookie)
+const NODE_PROFILE = nodePaths.profile
+const manifest = async () => (await nodeExec(`cat ${NODE_PROFILE}/package.json 2>/dev/null || echo {}`)).trim()
 const bundleList = async () => {
   try {
     const parsed = JSON.parse(await manifest())
@@ -132,7 +138,7 @@ const bundleList = async () => {
     return []
   }
 }
-const packagePresent = async name => (await nodeExec(`test -d ~/.dsh/profiles/rnh/node_modules/${name} && echo yes || echo no`)).trim() === 'yes'
+const packagePresent = async name => (await nodeExec(`test -d ${NODE_PROFILE}/node_modules/${name} && echo yes || echo no`)).trim() === 'yes'
 
 /** The node still serves: a switch that leaves it dead is not a switch that worked. */
 const nodeAnswers = async () => {

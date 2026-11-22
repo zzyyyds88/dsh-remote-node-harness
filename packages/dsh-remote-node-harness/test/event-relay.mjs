@@ -22,6 +22,7 @@
 import { SshConnection } from '../src/ssh/connection.js'
 import { cookiesOf, httpOverSsh } from '../src/host/ssh-http.js'
 import { authenticate, call, liveStream, openCarrier } from './carrier.mjs'
+import { nodeLayout } from './layout.mjs'
 import { nodeConfig } from './node.mjs'
 
 const [base, token] = process.argv.slice(2)
@@ -46,8 +47,16 @@ const bare = sessionId => sessionId.replace(/^rnh_[a-z0-9]+_/u, '')
  *
  * This is what makes the test honest: every call below is issued to the node by a
  * client that is not this Host, so nothing local can have caused an event.
+ *
+ * The status file's location comes from the node's recorded `remoteRoot`, not from a
+ * spelled-out `~/.dsh-remote-node-harness`: a node registered under another root keeps
+ * its runtime and its `run/status.json` there instead, and guessing produced a
+ * "no such file" that read like a broken host.
+ *
+ * @param {(context: { exec: (argv: string[]) => Promise<string>, call: (endpoint: string, args: unknown) => Promise<unknown> }) => Promise<unknown>} action
+ * @param {{ status: string }} layout
  */
-async function onNode(action) {
+async function onNode(action, layout) {
   const config = nodeConfig()
   const connection = new SshConnection({
     host: config.host,
@@ -63,7 +72,7 @@ async function onNode(action) {
     // `~` is a shell expansion, so this has to go through `sh -c`; an argv element
     // is quoted verbatim and would ask for a literal directory named `~`.
     const status = JSON.parse((await connection.exec({
-      argv: ['sh', '-c', 'cat ~/.dsh-remote-node-harness/run/status.json'],
+      argv: ['sh', '-c', `cat ${layout.status}`],
     })).stdout)
     const login = await httpOverSsh(connection, status.port, { path: `/?token=${status.token}` })
     const cookie = cookiesOf(login.headers) ?? ''
@@ -86,6 +95,10 @@ async function onNode(action) {
 
 const cookie = await authenticate(base, token)
 const carrier = await openCarrier({ base, cookie })
+// Where this node keeps its resident host — asked for, not spelled out. A node registered
+// with a non-default `remoteRoot` keeps `run/status.json` somewhere else, and guessing the
+// default produced a missing-file error that read like a broken host.
+const { layout: nodePaths } = await nodeLayout(base, cookie)
 /** @type {Array<{ event: string, args: unknown[] }>} */
 const events = []
 carrier.onMessage(text => {
@@ -110,11 +123,14 @@ check(eventsBefore < 5, 'the local event stream is quiet before anything happens
   `${String(eventsBefore)} event(s) at open`)
 
 const created = await onNode(async ({ exec, call: nodeCall }) => {
-  const path = `/root/rnh-relay-${Date.now().toString(36)}`
+  // The node's own home, not a spelled-out `/root`: the fixture directory belongs on the
+  // machine under test whatever its user is called.
+  const home = (await exec(['sh', '-c', 'printf %s "$HOME"'])).trim() || '/'
+  const path = `${home}/rnh-relay-${Date.now().toString(36)}`
   await exec(['mkdir', '-p', path])
   const value = await nodeCall('session/create', { request: { cwd: path } })
   return { sessionId: value.value.sessionId, path }
-})
+}, nodePaths)
 log(`node Session ${created.sessionId} in ${created.path}`)
 
 // ---- 1. the list events ---------------------------------------------------
@@ -169,7 +185,7 @@ check(baselines.length === 1, 'the client receives exactly one control baseline'
 const title = `relayed-title-${Date.now().toString(36)}`
 await onNode(async ({ call: nodeCall }) => {
   await nodeCall('session/rename', { request: { sessionId: created.sessionId, title } })
-})
+}, nodePaths)
 const projected = Date.now() + 30_000
 const seenTitle = () => control.frames
   .slice(controlBefore)

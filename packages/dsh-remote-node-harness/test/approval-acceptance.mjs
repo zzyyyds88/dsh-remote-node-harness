@@ -35,6 +35,7 @@
  * @module @greatbaby/dsh-remote-node-harness/test/approval-acceptance
  */
 import { authenticate, call, liveStream, openCarrier } from './carrier.mjs'
+import { nodeLayout } from './layout.mjs'
 import { nodeExec } from './node.mjs'
 
 const [base, token] = process.argv.slice(2)
@@ -63,7 +64,13 @@ const cookie = await authenticate(base, token)
 // using it — so this test does not touch that. It edits the **node's** own profile patch
 // (which the resident host watches and hot-reloads), and puts it back when it is done,
 // including on failure.
-const NODE_PATCH = '~/.dsh/profiles/rnh/cordis.patch.yml'
+//
+// The path is derived from the node's recorded `remoteRoot`, not spelled out: the profile
+// name follows that root (`rnh` only for the default one), and a node registered elsewhere
+// kept its patch under a different name — which made this suite report "the node profile has
+// no permission preset" on an otherwise healthy deployment.
+const { layout: nodePaths } = await nodeLayout(base, cookie)
+const NODE_PATCH = nodePaths.profilePatch
 const originalPatch = await nodeExec(`cat ${NODE_PATCH}`)
 const originalPreset = /defaultPreset:\s*(\S+)/u.exec(originalPatch)?.[1]
 if (originalPreset === undefined) {
