@@ -133,7 +133,6 @@ node packages\dsh-remote-node-harness\test\session-acceptance.mjs <base> <token>
 `--root-rnh-relay-mwkiidoo--/session-83de59a8-…` 里 `seq 20` 是 `tool/call` name=`write`、
 `seq 26` 是 `tool/call` name=`bash`、`seq 36` 是 `turn/end {kind:completed}`。
 
-
 ## 3. 终端：在远程会话里真开一个 PTY
 
 人工：打开远程会话的终端面板，新建终端，输入 `echo MARKER_<随机>`。
@@ -594,7 +593,6 @@ rnh 随即报节点掉线，于是 `plugin-switch` / `tool-parity` / `tool-git-i
 执行它自己的 `sh -c`（argv 里就带着这个模式），把自己杀掉、channel 无退出码。改成 `bin[.]js`
 后实测 `{"out":"SURVIVED","code":0}`，且仍然杀到了真正的 resident host（节点上 2 个变 1 个）。
 
-
 ### 2026-11-22 · 插件 0.6.7 · 中转补丁 + 节点上空层 + 体验层
 
 这一轮改了三处，验收口径也随之变了。
@@ -649,3 +647,47 @@ GOAL §六 的手机判据四步（会话列表里看到远端会话、在节点
 **这一轮仍不能声称「手机达到生产力水准」**：GOAL §六 那一半只有真机能判。桌面这一半的判据
 （连上节点 → 远端工区 → 会话 → agent 在节点上跑工具 → 文件在节点磁盘 → 侧栏能看到 → 审批能答）
 本轮已经全部通过，见上表 e2e 那一行。
+
+### 2026-11-22 · 中转服务端 0.6.5 → 0.6.7，本机插件 0.6.6 → 0.6.7
+
+用户要求升级这台机器连的中转链路。两件事分开做，因为失败面不同：服务端重启会断一次连接，
+插件换字节则可能让 Host 起不来。
+
+**服务端（192.168.3.91，`/root/dsh-deploy/server`）**
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| compose 的 image | `:latest`（实际解析到 0.6.5 的构建，2026-11-14） | `:0.6.7`（digest `sha256:e3d77ff0…`，2026-11-21 构建） |
+| build 段 | 指向 `../src/ds-harness-remote-main`（11-15 的源码树） | **已删**。留着它，一次普通的 `up` 会按旧源码重新构建而不是用钉住的镜像 |
+| 容器 label | `0.6.5` | `0.6.7` |
+| health | healthy | healthy（`since 2026-11-22T12:12:09Z`） |
+| 经 nginx | 200 | `http 200 in 0.019726s` |
+
+备份：`compose.yaml.bak-20261122-121204`。容器里的 `apps/server/package.json` 仍是
+`0.5.21` —— 那是 server app 的版本号，不是发行版；判断版本只能看镜像 label。
+
+**本机三个 profile**
+
+`desktop` / `fleettest` / `rnhtest` 全部到 `ds-harness-remote@0.6.7`，三处的
+`dist/index.js` 现在是同一份（sha256 `3E70227C…`，185 个文件、4,469,439 字节）。
+
+**中转补丁在 0.6.7 上仍然成立**，这是最要紧的一条：起一次 Host 后 rnhtest 的那份被打上，
+sidecar 记 `installed: "0.6.7", anchors: 3`。单独用 0.6.7 的 tarball 跑 `planPatch`
+也是三个锚点 3/3 —— 上游没有动 `assertNativeWorkspaceFileCall` 那一带。
+
+**冒烟**
+
+| 套件 | 结果 |
+|---|---|
+| `e2e/gateway` | PASS |
+| `e2e/host-routing` | PASS |
+| `e2e/picker-flow` | PASS |
+
+`3 passed, 0 failed, 0 skipped in 22.7s`。没有跑全量 e2e：这一轮只换了两端的版本字节，
+产品代码一行没改，而这三个套件正好覆盖「Host 起得来」「每个路由端点通」
+「手机看节点那条路」。
+
+**顺带记两条踩坑**（已写进 `UPGRADE.zh.md` §八）：`docker pull … | tail` 的 `$?` 是
+tail 的退出码，第一次升级因此误报「镜像没到」；desktop profile 的 pnpm 有
+`virtualStoreDirMaxLength: 60` 与 `minimumReleaseAge` 两道门槛，直接 `pnpm install`
+会分别报 `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF` 和被拦下。

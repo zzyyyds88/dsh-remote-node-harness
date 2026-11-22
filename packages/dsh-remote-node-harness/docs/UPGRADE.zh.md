@@ -465,10 +465,44 @@ rnh 有三处行为是**围着中转写的**，升级后逐一确认：
 只声明了一批 `@deepseek-ai/dsh-*` 的 peer range，所以 DSH 升级时它自己不会拒装 ——
 这也是为什么 `dispatch-seam` 那两条缝隙测试必须在**装了中转的同一个 profile** 里跑。
 
-**还有一条不是行为、是部署**：中转服务端目前跑的是镜像 tag `latest`（容器内 `@dsh-remote/server`
-0.5.21，构建于 2026-11-15）。`latest` 会在上游发版时静默变化，而 DSH Go 是安装版、不可能跟着升。
-钉版本的做法：`docker inspect` 确认 tag 不再是 `latest`，升级前先看上游 `docs/compatibility.zh.md`
-的 peer range；重启后 DSH Go 仍能连上才算通过。
+**还有一条不是行为、是部署。** 这一条在 2026-11-22 已经还清，记录做法以免重犯：
+
+服务端跑的是 `ghcr.io/liguobao/ds-harness-remote/server` 的镜像。它此前用 `:latest`，
+而 `latest` 会在上游发版时静默变化（实测：容器里还是 0.6.5 的构建，ghcr 上的
+`latest` 已经指到 0.6.7），DSH Go 却是安装版、不可能跟着升。现在**钉版本**：
+
+```bash
+# compose.yaml 里必须是具体版本，不是 latest
+image: ghcr.io/liguobao/ds-harness-remote/server:0.6.7
+
+# 并且 **不要留 build 段**。它指向一份源码树，留着它，一次普通的 up 会按那份旧代码
+# 重新构建而不是用钉住的镜像 —— 比 tag 漂移更难发现。
+```
+
+升级步骤：`docker pull <tag>` → 改 compose 的 image → `docker compose up -d --no-build`
+→ 等 `healthy` → 确认容器 label 的 `org.opencontainers.image.version` 是新版本 →
+`curl` 一次 nginx 拿 200。升级前先看上游 `docs/compatibility.zh.md` 的 peer range，
+升级后 DSH Go 仍能连上才算通过。
+
+**服务端版本与插件版本不是一回事。** 容器里的 `apps/server` 自己的 `package.json`
+常年停在 `0.5.21`（那是这个 app 的版本，不是发行版的），判断实际版本要看镜像 label：
+
+```bash
+docker inspect server-server-1 \
+  -f '{{index .Config.Labels "org.opencontainers.image.version"}}'
+```
+
+**本机插件升级也有两个坑**（`pnpm install` 在 desktop profile 上会踩）：
+
+1. `node_modules/.modules.yaml` 记着 `virtualStoreDirMaxLength: 60`，本机 pnpm 9.15.9
+   默认值不同 → `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF`。这个 flag 在 9.x 不存在，
+   要写 `pnpm install --config.virtual-store-dir-max-length=60`。
+2. profile 有 `minimumReleaseAge` 门槛，刚发的新版本会被挡下。要在
+   `pnpm-workspace.yaml` 的 `minimumReleaseAgeExclude` 里加 `ds-harness-remote@<版本>`。
+
+装完确认三件事：`node --check dist/index.js` 通过、`GET /rnh/api/nodes` 的
+`local.relay.patched` 是 `true`（本插件的补丁在新版本上仍然成立），
+以及 `dist/index.js` 里没有残留的 `rnh-relay-patch` 以外的改动。
 
 ## 九、DSH Go（安卓客户端）升级后要看什么
 
