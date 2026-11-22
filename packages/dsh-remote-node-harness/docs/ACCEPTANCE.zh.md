@@ -45,7 +45,8 @@ node packages/dsh-remote-node-harness/test/run-all.mjs --host <base> --token <t>
 |---|---|
 | 桌面端 | 用 `--profile rnhtest` 启动的 Host，不是你正在用的那个 profile |
 | rnhtest 的 bundle 清单 | 必须同时有 `@deepseek-ai/dsh-base`、`@deepseek-ai/dsh-web-app` 与本插件。用 `dsh plugin add` 建的 profile 只有前两者之外的插件，**缺 `dsh-web-app` 时 Host 启动后不打印 `dsh web:` 那一行**，runner 会在 90 秒后报「the Host exited」或读不到 URL —— 这个坑已经踩过两次 |
-| rnhtest 里装的是这一轮的代码 | 打包后装进去，而不是软链：`npm pack --pack-destination dist`，再把 `profiles/rnhtest/package.json` 的依赖指到新 tgz 并 `pnpm install`。跑之前确认 `profiles/rnhtest/node_modules/@greatbaby/dsh-remote-node-harness/package.json` 的 `version` 就是本轮版本 |
+| rnhtest 里装的是这一轮的代码 | 打包后装进去，而不是软链：`npm pack --pack-destination ../../dist/plugin`，再把 `profiles/rnhtest/package.json` 的依赖指到新 tgz 并 `pnpm install`。跑之前确认 `profiles/rnhtest/node_modules/@greatbaby/dsh-remote-node-harness/package.json` 的 `version` 就是本轮版本。**改完代码忘了重打，套件跑的还是旧字节**，而失败信息会指向一个早已修好的地方 |
+| rnhtest 的 profile patch | 至少要有三行：`llm-deepseek.baseURL`（指向这台机器能用的 provider）、`agent-default-model`（`provider` + `model` 都必须写）、`permission`（`defaultPreset: danger-full-access`）。缺第一条 → 401；缺第二条 → 默认模型被代理拒（503 重试到超时，一个工具都不会跑）；缺第三条 → 节点没有沙箱后端时每个 `bash` 都 `SANDBOX_ESCALATION_UNAVAILABLE` |
 | 节点 | 一台 Linux 机器，Node ≥ 22，SSH 可达，能匿名下载 CNB 上的归档（源与理由见 [ARCHITECTURE](../../../docs/ARCHITECTURE.md) §六之四） |
 | 凭据 | 只从环境变量读：`RNH_TEST_HOST/USER/PASSWORD/KEY_FILE/PORT`。profile 里没有节点时 runner 会用这三个变量建一条，名字取 `RNH_TEST_NAME`（默认 `acceptance-node`） |
 | 节点 `remoteRoot` | 可以不是默认值。套件从 `/rnh/api/nodes` 的 `remoteRoot` 派生 profile 名与状态文件路径（`test/layout.mjs`），所以 `~/.dsh-fleet` 这种根也能跑；**不要再往套件里写 `~/.dsh/profiles/rnh`** |
@@ -614,6 +615,14 @@ rnh 随即报节点掉线，于是 `plugin-switch` / `tool-parity` / `tool-git-i
 | offline | `run-all.mjs --layer offline` | **19 passed, 0 failed, 0 skipped in 11.0s** |
 | contract | `run-all.mjs --layer contract` | **3 passed, 0 failed, 0 skipped in 856ms** |
 | e2e | `run-all.mjs --layer e2e`（`rnhtest` + 真节点） | **15 passed, 0 failed, 2 skipped in 275.1s** |
+
+**中转补丁在真实调用路径上验证过**，不只是单测里成立：给 `rnhtest` 装上
+`ds-harness-remote@0.6.6`、启动一次 Host 之后，它的 `dist/index.js` 被打上补丁
+（sidecar 记 `installed: 0.6.6, anchors: 3`）；再启动一次，文件 sha256 完全不变。
+
+`desktop` 与 `fleettest` 两个 profile 的 0.6.7 是通过 `link:` 指向这个仓库的源码，
+所以它们不需要重新打包；`rnhtest` 装的是 pack 出来的 tgz，改完代码要重新 pack + install，
+否则跑的还是旧字节 —— 这一轮踩过一次。
 
 唯一两处 SKIP：`browser`（没有带 `--remote-debugging-port` 的 Chrome）与 `plugin-switch`
 （这台桌面没装第三方插件，而 rnhtest 里只有本插件，它本来就该被排除在开关列表外）。

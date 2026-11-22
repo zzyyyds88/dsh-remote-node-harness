@@ -115,10 +115,13 @@ Host 每次启动（`apply()` 里）执行一次：
 `GET /rnh/api/nodes` 的 `local` 块增加：
 
 ```json
-"relay": { "installed": "0.6.6", "patched": true, "anchors": 2 }
+"relay": { "installed": "0.6.6", "patched": true, "anchors": 3 }
 ```
 
-或失败时 `{ "installed": "0.6.7", "patched": false, "reason": "expected 2 anchors, found 0" }`。
+三处不是两处：两个调用点各一处，再加上把判定函数本身插进产物的一处。三处都必须恰好命中一次，
+任何一处对不上就整份放弃。
+
+或失败时 `{ "installed": "0.6.7", "patched": false, "reason": "expected 3 anchors, found 0" }`。
 不只写日志 —— 设置页与验收脚本都要能读到，否则「补丁是否生效」只能靠翻文件。
 
 ## 四、代价

@@ -290,7 +290,7 @@ and a remote `cwd` can never resolve here. The plugin applies that edit on every
 and reports the result in `GET /rnh/api/nodes` → `local.relay`:
 
 ```json
-"relay": { "installed": "0.6.6", "patched": true, "anchors": 2 }
+"relay": { "installed": "0.6.6", "patched": true, "anchors": 3 }
 ```
 
 A relay upgrade replaces those bytes, so the patch reports `patched: false` with a reason
