@@ -308,6 +308,7 @@ reference/          上游源码（只读，不进版本库）
 | [`docs/adr-0004-node-control-and-picker.zh.md`](docs/adr-0004-node-control-and-picker.zh.md) | `/@rnh` 命名空间、选择器接管、节点控制、安装形态 |
 | [`docs/adr-0005-release-and-maintenance.zh.md`](docs/adr-0005-release-and-maintenance.zh.md) | 包名依据、发布形态、三条升级链 |
 | [`docs/adr-0006-node-runtime-supply.zh.md`](docs/adr-0006-node-runtime-supply.zh.md) | 节点运行时从哪来：制品优先、节点自建兜底 |
+| [`docs/adr-0008-relay-artifact-patch.zh.md`](docs/adr-0008-relay-artifact-patch.zh.md) | 手机读远端会话文件：给已装的 `ds-harness-remote` 产物打授权补丁，上游仓库不改 |
 | [`reference/README.md`](reference/README.md) | 四份上游源码各是什么、为什么要它、钉住的版本（含手机端 `dsh-Go` 与中转 `ds-harness-remote`） |
 | [`docs/agent-install.zh.md`](docs/agent-install.zh.md) | 只靠 agent 装一遍：说什么、走哪条路、断点在哪 |
 | [`packages/dsh-remote-node-harness/README.md`](packages/dsh-remote-node-harness/README.md) | 插件安装、接线、测试矩阵、已知限制 |

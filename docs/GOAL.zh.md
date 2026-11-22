@@ -101,10 +101,20 @@ bool get canCreateDirectories => supportsEndpoint('directoryPicker/createDirecto
 
 ### 2. 手机读**远端会话**的文件被中转挡下（直接影响目标 2 的"看文件改动"）
 
-中转在 dispatch 前先 `resolveWorkspaceRootForSession(sessionId)`：让 Host 派发
-`session/list`、取该行 `cwd`、再在 **Host 本机** `realpath()`。rnh 合并进来的远端行
-`cwd` 是节点路径（`/root/proj`），本机 `realpath` 得 `ENOENT` → 回 `WORKSPACE_UNAVAILABLE`。
-受影响端点：`workspaceFiles/{read,readBytes,readAll,stat,search}`。
+**现象**：中转在 dispatch 前先 `resolveWorkspaceRootForSession(sessionId)`：让 Host 派发
+`session/list`、取该行 `cwd`、再在 **Host 本机** `realpath()`，并对目标文件再 `lstat()` 一次。
+rnh 合并进来的远端行 `cwd` 是节点路径（`/root/proj`），本机两处都必然 `ENOENT` →
+回 `WORKSPACE_UNAVAILABLE`。受影响端点：`workspaceFiles/{read,readBytes,readAll,stat,search}`。
+
+**这条为什么不能靠「本机留一棵空的幽灵目录」绕过**：`realpath(cwd)` 那一层能过，读具体文件时
+本机 `lstat(<本机>/root/proj/a.txt)` 仍然 `ENOENT`。要过就得在本机放一份真实副本 —— 那就是
+§七-5 明令禁止的镜像。运行时也包不住：`HarnessRemoteBridge` 不在产物导出里，
+`resolveWorkspaceRoot` 是构造参数、`assertNativeWorkspaceFileCall` 是类私有方法。
+
+**2026-11-22 定的解法（用户选择）**：由本插件对**已安装的** `ds-harness-remote` 产物文件打一处
+最小补丁 —— `rnh_` 开头的会话 id 跳过本机授权检查，路径边界交给节点自己算。上游两个仓库都不改；
+Host **每次启动重新检测**并幂等应用。实现、锚点、硬链接陷阱与回滚见
+[ADR-0008](adr-0008-relay-artifact-patch.zh.md)。
 
 桌面端点开远端文件不受影响（走 rnh 的 `workspaceFileScope` lookup，不经中转）。
 
@@ -128,6 +138,10 @@ bool get canCreateDirectories => supportsEndpoint('directoryPicker/createDirecto
 
 两条都跑通、且都有可复现的命令或截图，才叫达到生产力水准。
 
+**手机这条的验证分层（2026-11-22 定）**：桌面能证明的（远端行进 `session/list`、`directoryPicker/list`
+对不存在的节点路径给空层、`workspace/create` 在节点上落盘、中转补丁装在产物里）用自动化验收；
+真机上的四步（看会话、新建工作区、看文件改动、答审批）**未验证**就必须写「未验证」，不许拿桌面结果代替。
+
 ## 七、以后做决定时的规则
 
 1. **先问它离 §六 更近还是更远。** 不更近就不做，理由写清。
@@ -135,16 +149,19 @@ bool get canCreateDirectories => supportsEndpoint('directoryPicker/createDirecto
    + `patches/node/*.patch`）。节点跑的是官方 DSH 源码的 fork，改源码是本项目的主路径。
 3. **DSH Go 与 `ds-harness-remote` 两个仓库不改**（2026-11-22 定）。手机链路的能力边界以中转白名单为准；
    白名单之外的能力只能在 rnh 一侧迁就，不能靠改那两个仓库绕过去。
+   例外，同日另定：**已装到机器上的 `ds-harness-remote` 产物文件可以由本插件打补丁**（见 §八 第 3 行与
+   ADR-0008）。理由是手机读远端会话文件这件事只能在这一层解，而改仓库会与上游发版直接冲突。
 4. **不发 npm、不给 GitHub 留下载源**（运行时由本项目自建并发布到 CNB）。
 5. **不做远端目录镜像/挂载**：不给"把远端目录映射到本地再在本机跑工具"的路线留任何接口。
 6. 用户明确否定过的概念，从代码、文档、命名里删干净，不许换名保留。
 
-## 八、已定的两个路线分叉（2026-11-22）
+## 八、已定的三个路线分叉（2026-11-22）
 
 | # | 问题 | 用户的选择 | 后果 |
 |---|---|---|---|
 | 1 | 为了「手机在节点上新建工作区」，改 DSH Go / `ds-harness-remote` 吗？ | **不改，rnh 侧迁就** | 手机端点不到「新建文件夹」按钮（`canCreateDirectories` 恒 false，不改它就是不出现），只能用「输入路径」。所以 rnh 必须让**尚不存在的绝对路径**也能被选择器确认并通过 `workspace/create` 落盘 |
 | 2 | 「参照 ZCode」只做「能连上能用」，还是连体验层一起？ | **连体验层一起做** | 连接体验按 `reference/zcode` 的做法落地：错误码 + 主操作、五态展示、阶段进度 + 已用时间、传输百分比/速率/ETA、自动恢复预算、操作日志。调研结论与本项目现状的逐条差距在 `.scratch/research-zcode/FINDINGS.md`（378 行） |
+| 3 | 手机读远端会话文件（§五-2）怎么办？ | **允许本插件给已装的 `ds-harness-remote` 产物打补丁；仓库不改；Host 每次启动重新检测** | 补丁只让 `rnh_` 开头的会话 id 跳过中转的本机授权检查，路径边界交给节点自己算。上游升级导致锚点消失时**放弃并报出原因**，绝不猜 |
 
 ### 第 1 题的实现约束（rnh 侧迁就）
 
