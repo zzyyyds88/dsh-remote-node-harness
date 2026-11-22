@@ -243,6 +243,45 @@ for (const [needle, label] of [
   ['T.browseAnywhere', 'a device entry-point page can still browse freely'],
 ]) check(source.includes(needle), label)
 
+// ---- 6. every failure action leads somewhere ------------------------------
+// The error bar used to map only `retry` and `reinstall` onto buttons and send the other six
+// to the log, which is the same as having no button: a person told "fix the credential" and
+// handed a hundred redacted lines has been told nothing. Each action now either acts or is
+// deliberately absent, and this is what keeps a new code from silently landing in "no button".
+for (const action of [
+  'retry', 'reinstall', 'check-network', 'fix-credential', 'review-host-key',
+]) check(source.includes(`case '${action}':`), `the ${action} failure action has its own control`)
+
+// The three that stay absent on purpose: they ask the person to do something outside this
+// surface (install a newer Node, upgrade the desktop) or to read the log. Naming them here
+// documents the decision rather than leaving it as an omission.
+for (const action of ['upgrade-node', 'upgrade-desktop', 'inspect-log']) {
+  check(!source.includes(`case '${action}':`),
+    `the ${action} failure action is an explanation, not a button`)
+}
+
+// ---- 7. the new copy exists in both languages ------------------------------
+// `T` is chosen once from `navigator.language`, so a key added to one branch and not the
+// other renders as `undefined` for half the users — silently, because a missing function
+// only throws when it is called.
+for (const key of [
+  'recoveryAttempt', 'phasesElapsed', 'transfer', 'resetHostKey', 'reprobe',
+  'copyError', 'errorCopied', 'reveal', 'hide', 'noFoldersYet',
+]) {
+  const hits = source.split(`${key}:`).length - 1
+  check(hits >= 2, `T.${key} exists in both languages`, `${String(hits)} definition(s)`)
+}
+
+// The ladder length is the one constant duplicated into the browser half; it has to match
+// the Host's, or "attempt 3/4" would be wrong on the card.
+const rnhSource = readFileSync(fileURLToPath(new URL('../src/host/rnh.js', import.meta.url)), 'utf8')
+const ladder = /RECOVERY_LADDER_MS = Object\.freeze\(\[([^\]]*)\]\)/u.exec(rnhSource)?.[1]
+const hostRungs = (ladder ?? '').split(',').filter(part => part.trim().length > 0).length
+const clientRungs = Number(/RECOVERY_LADDER_LENGTH = (\d+)/u.exec(source)?.[1])
+check(hostRungs > 0 && hostRungs === clientRungs,
+  'the recovery ladder length the card prints matches the Host\'s ladder',
+  `host ${String(hostRungs)}, client ${String(clientRungs)}`)
+
 if (failures.length > 0) {
   log(`FAILED: ${failures.join(', ')}`)
   process.exitCode = 1

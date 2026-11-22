@@ -129,6 +129,27 @@ window.__ModuleLoader__.load({
           dropped: '已断线，正在重连',
           droppedAt: when => `已断线，正在重连（${when} 断开）`,
           recovered: count => `已重连 ${count} 次`,
+          /** Which rung of the ladder this is. Past the ladder it is a steady retry. */
+          recoveryAttempt: (attempt, ladder) => (attempt <= ladder
+            ? `第 ${attempt}/${ladder} 次`
+            : '每 2 分钟重试一次'),
+          /** How long the current phase has been running. */
+          phasesElapsed: seconds => `已用 ${seconds} 秒`,
+          /** Live download progress; each fragment is dropped when its number is unknown. */
+          transfer: ({ bytes, total, bytesPerSecond, etaMs }) => {
+            const size = value => `${(value / 1048576).toFixed(1)} MiB`
+            const parts = [total === undefined ? size(bytes) : `${size(bytes)} / ${size(total)}`]
+            if (bytesPerSecond !== undefined) parts.push(`${(bytesPerSecond / 1048576).toFixed(1)} MB/s`)
+            if (etaMs !== undefined) parts.push(`剩余 ${String(Math.max(1, Math.round(etaMs / 1000)))} 秒`)
+            return parts.join(' · ')
+          },
+          /** The action verbs that are their own button, rather than "open the log". */
+          resetHostKey: '重置主机密钥',
+          reprobe: '重新探测',
+          copyError: '复制错误',
+          errorCopied: '已复制',
+          reveal: '显示',
+          hide: '隐藏',
           hostKey: key => `主机密钥 ${key}`,
           showLog: '连接日志',
           logEmpty: '还没有日志。',
@@ -160,6 +181,7 @@ window.__ModuleLoader__.load({
           go: '打开',
           loading: '正在读取…',
           noFolders: '这个目录下没有子文件夹。',
+          noFoldersYet: '这台机器上还没有这个目录。选「选择此文件夹」就会在它上面建出来。',
           truncated: '只显示前 500 个文件夹；可以直接在上面输入完整路径。',
           newFolder: '新建文件夹',
           newFolderTitle: '新建文件夹',
@@ -274,6 +296,27 @@ window.__ModuleLoader__.load({
           dropped: 'Disconnected, reconnecting',
           droppedAt: when => `Disconnected, reconnecting (since ${when})`,
           recovered: count => `Reconnected ${String(count)} time(s)`,
+          /** Which rung of the ladder this is. Past the ladder it is a steady retry. */
+          recoveryAttempt: (attempt, ladder) => (attempt <= ladder
+            ? `Attempt ${String(attempt)}/${String(ladder)}`
+            : 'retrying every 2 minutes'),
+          /** How long the current phase has been running. */
+          phasesElapsed: seconds => `${String(seconds)}s elapsed`,
+          /** Live download progress; each fragment is dropped when its number is unknown. */
+          transfer: ({ bytes, total, bytesPerSecond, etaMs }) => {
+            const size = value => `${(value / 1048576).toFixed(1)} MiB`
+            const parts = [total === undefined ? size(bytes) : `${size(bytes)} / ${size(total)}`]
+            if (bytesPerSecond !== undefined) parts.push(`${(bytesPerSecond / 1048576).toFixed(1)} MB/s`)
+            if (etaMs !== undefined) parts.push(`${String(Math.max(1, Math.round(etaMs / 1000)))}s left`)
+            return parts.join(' · ')
+          },
+          /** The action verbs that are their own button, rather than "open the log". */
+          resetHostKey: 'Reset host key',
+          reprobe: 'Probe again',
+          copyError: 'Copy error',
+          errorCopied: 'Copied',
+          reveal: 'Show',
+          hide: 'Hide',
           hostKey: key => `Host key ${key}`,
           showLog: 'Connection log',
           logEmpty: 'Nothing logged yet.',
@@ -303,6 +346,7 @@ window.__ModuleLoader__.load({
           go: 'Open',
           loading: 'Reading…',
           noFolders: 'No subfolders here.',
+          noFoldersYet: 'This folder does not exist on that machine yet. Choosing it creates it there.',
           truncated: 'Showing the first 500 folders; type a full path above to go anywhere.',
           newFolder: 'New folder',
           newFolderTitle: 'New folder',
@@ -493,6 +537,8 @@ window.__ModuleLoader__.load({
       name: { fontSize: 14, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
       meta: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
       grow: { flex: '1 1 auto', minWidth: 0 },
+      /** A secret field and its reveal toggle on one line. */
+      secretRow: { display: 'flex', alignItems: 'center', gap: 8 },
       /**
        * The official button height: 32 px on `--dsw-radius-md` at 13 px. The dialog's
        * secondary and primary buttons share it, so a dialog footer and the page's add
@@ -654,6 +700,16 @@ window.__ModuleLoader__.load({
       idle: 'var(--dsw-alias-state-idle-primary)',
     }
 
+    /**
+     * How many rungs the Host's reconnect ladder has, for "attempt n of m".
+     *
+     * A copy of `RECOVERY_LADDER_MS.length` in `host/rnh.js`: the browser half cannot import
+     * from the Host half (different bundles, different process), and a wrong number here
+     * would be worse than a slightly stale one — so this is the only duplicated constant and
+     * `client-bundle.mjs` checks that the two agree.
+     */
+    const RECOVERY_LADDER_LENGTH = 3
+
     function stateLabel(node) {
       if (node.state === 'connected') return T.connected
       if (node.state === 'connecting') return T.connecting
@@ -668,13 +724,29 @@ window.__ModuleLoader__.load({
      * one way (a downloaded artefact), so the row that installs it is always the same row.
      * The `runtimeVia` prop is still read, because a node connected before build 4 carries a
      * stamp from the removed route and the settings page should name it rather than hide it.
+     *
+     * The clock beside the current step is the whole point of the row. A five-step timeline
+     * with no time on it reads identically at two seconds and at four minutes, and those are
+     * the two cases a person needs to tell apart. `phaseStartedAt` is the Host's own
+     * timestamp, so the number survives a page reload mid-connect.
      */
-    function PhaseList({ phase, runtimeVia }) {
+    function PhaseList({ phase, runtimeVia, phaseStartedAt }) {
       const order = ['probe', 'install', 'provision', 'start', 'verify']
       const at = order.indexOf(phase ?? '')
       const label = id => (id === 'install' && runtimeVia === 'npm' ? T.phases.build : T.phases[id] ?? id)
+      // Ticks once a second so the elapsed number is not frozen between the two-second polls.
+      const [, setNow] = useState(Date.now())
+      useEffect(() => {
+        if (phaseStartedAt === undefined) return undefined
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [phaseStartedAt])
+      const elapsed = phaseStartedAt === undefined
+        ? undefined
+        : Math.max(0, Math.round((Date.now() - phaseStartedAt) / 1000))
       return h('div', { style: styles.phases },
-        order.map((id, index) => h('div', { key: id, style: styles.phase(index === at) }, label(id))))
+        order.map((id, index) => h('div', { key: id, style: styles.phase(index === at) }, label(id))),
+        elapsed === undefined ? null : h('span', { style: styles.meta }, T.phasesElapsed(elapsed)))
     }
 
     /**
@@ -1221,7 +1293,12 @@ window.__ModuleLoader__.load({
               loading
                 ? h('div', { style: styles.empty }, T.loading)
                 : (listing?.entries ?? []).length === 0
-                  ? h('div', { style: styles.empty }, T.noFolders)
+                  // An empty level on a node can mean "this folder is empty" or "this folder
+                  // does not exist yet". The second is the only way to create a project on a
+                  // node from the phone, so it has to be named rather than shown as "empty":
+                  // confirming it is what creates it.
+                  ? h('div', { style: styles.empty },
+                      listing?.exists === false ? T.noFoldersYet : T.noFolders)
                   : (listing?.entries ?? []).map(entry => h('button', {
                       key: entry.path,
                       type: 'button',
@@ -1468,17 +1545,32 @@ window.__ModuleLoader__.load({
           : null,
         connecting && node.phase !== undefined
           ? h('div', { style: styles.cardReason },
-              h(PhaseList, { phase: node.phase, runtimeVia: node.runtimeVia }))
+              h(PhaseList, {
+                phase: node.phase,
+                runtimeVia: node.runtimeVia,
+                phaseStartedAt: node.phaseStartedAt,
+              }),
+              // Bytes while the runtime archive arrives. Absent on every connect after the
+              // first, because there is nothing left to download then.
+              node.transfer === undefined
+                ? null
+                : h('div', { style: styles.meta }, T.transfer(node.transfer)))
           : null,
         // A dropped node is not a failure: nothing is wrong with the machine's configuration,
         // the socket went away and the ladder is bringing it back. Saying "已断线，正在重连" is
-        // the honest state, and it is the one the sidebar's greyed rows agree with.
+        // the honest state, and it is the one the sidebar's greyed rows agree with. The rung
+        // is what turns "reconnecting" into "reconnecting, and this is the third try" — the
+        // difference between waiting and going to look at the machine.
         node.state === 'idle' && node.droppedAt !== undefined
           ? h('div', { style: styles.cardReason },
               h('span', { style: styles.meta },
                 node.droppedAt === undefined
                   ? T.dropped
-                  : T.droppedAt(new Date(node.droppedAt).toLocaleTimeString())))
+                  : T.droppedAt(new Date(node.droppedAt).toLocaleTimeString())),
+              node.recoveryAttempts === undefined
+                ? null
+                : h('span', { style: styles.meta },
+                    ` · ${T.recoveryAttempt(node.recoveryAttempts, RECOVERY_LADDER_LENGTH)}`))
           : null,
         node.recoveries !== undefined && node.recoveries > 0
           ? h('div', { style: styles.cardReason },
@@ -1501,7 +1593,18 @@ window.__ModuleLoader__.load({
           : null,
         node.error !== undefined
           ? h('div', { style: styles.cardReason },
-              h(FailureBlock, { node, onAction: verb => { run(verb).catch(() => undefined) } }))
+              h(FailureBlock, {
+                node,
+                onAction: verb => { run(verb).catch(() => undefined) },
+                onEdit,
+                onResetHostKey: async target => {
+                  // `hostKey: null` is what clears the record: `normalizeNode` keeps the field
+                  // only when it is a non-empty string, so an explicit null drops it and the
+                  // next connect records whatever the machine presents (TOFU again).
+                  await onAction(target.id, 'forget-host-key').catch(() => undefined)
+                  await run('connect').catch(() => undefined)
+                },
+              }))
           : null,
       )
     }
@@ -1514,32 +1617,79 @@ window.__ModuleLoader__.load({
      * **action** decides which button appears — a wrong password does not get a Retry button,
      * because pressing it can only produce the same failure and read as "the app is broken".
      *
+     * Every action in the table gets a control that does something. Two of them used to open
+     * the log instead, which is the same as having no button: a person told "fix the
+     * credential" and handed a hundred lines of redacted output has been told nothing.
+     *
      * The English detail stays available behind a toggle rather than being the headline: it is
      * what a bug report needs, not what a person reads first.
      */
-    function FailureBlock({ node, onAction }) {
+    function FailureBlock({ node, onAction, onEdit, onResetHostKey }) {
       const [open, setOpen] = useState(false)
       const [showLog, setShowLog] = useState(false)
+      const [copied, setCopied] = useState(false)
       const failure = node.failure
       const sentence = failure === undefined
         ? T.errorTitle
         : T.failures[failure.code] ?? T.failures.unknown
-      const action = failure?.action === undefined ? undefined : T.actions[failure.action]
-      // `retry` and `reinstall` map onto node actions; the rest are "go fix something else",
-      // which is what the log is for.
-      const verb = failure?.action === 'reinstall' ? 'reinstall' : failure?.action === 'retry' ? 'connect' : undefined
+      /**
+       * What each action becomes. `undefined` means "there is nothing to press", and the
+       * sentence plus the log is the honest answer — not a button that opens the same log.
+       */
+      const control = (() => {
+        switch (failure?.action) {
+          case 'retry':
+            return { label: T.actions.retry, verb: 'connect', primary: true }
+          case 'reinstall':
+            return { label: T.actions.reinstall, verb: 'reinstall', primary: true }
+          case 'check-network':
+            // Re-runs the probe against the machine: reachability is exactly what it measures,
+            // and it is cheaper and more specific than tearing the whole connect down again.
+            return { label: T.reprobe, verb: 'probe', primary: true }
+          case 'fix-credential':
+            // Opens the form with the credential fields, which is the only place a person can
+            // actually change what was refused.
+            return { label: T.actions['fix-credential'], onPress: () => onEdit?.(node), primary: true }
+          case 'review-host-key':
+            // Forget the recorded key and connect again: that is what "review" has to mean in
+            // a surface with no key-comparison dialog. The new key is recorded on success.
+            return { label: T.resetHostKey, onPress: () => { void onResetHostKey?.(node) }, primary: true }
+          default:
+            return undefined
+        }
+      })()
+      const retryAlso = failure?.retryable === true && control?.verb !== 'connect'
+      const copyError = () => {
+        const lines = [
+          `${String(failure?.code ?? 'unknown')}: ${sentence}`,
+          node.error ?? '',
+          `node=${node.name} host=${node.host}:${String(node.port)}`,
+        ].filter(line => line.length > 0)
+        const write = navigator.clipboard?.writeText(lines.join('\n'))
+        void write?.then(() => {
+          setCopied(true)
+          setTimeout(() => setCopied(false), 1500)
+        }).catch(() => undefined)
+      }
       return h('div', { style: styles.errorBar },
         h('div', { style: styles.failureHead },
           h('strong', null, `${T.errorTitle}: `),
           h('span', null, sentence),
-          action === undefined
+          control === undefined
             ? null
-            : verb === undefined
-              ? h('button', { type: 'button', style: styles.link, onClick: () => setShowLog(true) }, action)
-              : h('button', { type: 'button', style: styles.button, onClick: () => onAction(verb) }, action),
-          failure?.retryable === true && verb === undefined
+            : h('button', {
+                type: 'button',
+                style: control.primary === true ? styles.button : styles.link,
+                onClick: () => {
+                  if (control.onPress !== undefined) control.onPress()
+                  else onAction(control.verb)
+                },
+              }, control.label),
+          retryAlso
             ? h('button', { type: 'button', style: styles.link, onClick: () => onAction('connect') }, T.actions.retry)
             : null,
+          h('button', { type: 'button', style: styles.link, onClick: copyError },
+            copied ? T.errorCopied : T.copyError),
           h('button', {
             type: 'button',
             style: styles.link,
@@ -1606,6 +1756,9 @@ window.__ModuleLoader__.load({
       })
       const [submitting, setSubmitting] = useState(false)
       const [error, setError] = useState(undefined)
+      // Which secret field is currently readable. Not persisted anywhere: a revealed field
+      // closes with the form, so nothing stays on screen after the person moves on.
+      const [reveal, setReveal] = useState({ password: false, passphrase: false })
       const set = (key, value) => setDraft(current => ({ ...current, [key]: value }))
 
       const submit = async event => {
@@ -1672,10 +1825,21 @@ window.__ModuleLoader__.load({
         draft.authKind === 'password'
           ? h('div', { style: styles.field },
               h('label', { style: styles.label }, T.password),
-              h('input', {
-                style: styles.input, type: 'password', value: draft.password,
-                onChange: event => set('password', event.target.value),
-              }))
+              h('div', { style: styles.secretRow },
+                h('input', {
+                  style: { ...styles.input, ...styles.grow },
+                  type: reveal.password ? 'text' : 'password',
+                  value: draft.password,
+                  onChange: event => set('password', event.target.value),
+                }),
+                // A long generated password typed blind is the single most common way a
+                // first connect fails, and the person then has no way to see what they
+                // typed. The toggle reveals the field, not the stored value.
+                h('button', {
+                  type: 'button',
+                  style: styles.link,
+                  onClick: () => setReveal(current => ({ ...current, password: !current.password })),
+                }, reveal.password ? T.hide : T.reveal)))
           : h(React.Fragment, null,
               h('div', { style: styles.field },
                 h('label', { style: styles.label }, T.privateKey),
@@ -1686,10 +1850,18 @@ window.__ModuleLoader__.load({
                 })),
               h('div', { style: styles.field },
                 h('label', { style: styles.label }, T.passphrase),
-                h('input', {
-                  style: styles.input, type: 'password', value: draft.passphrase,
-                  onChange: event => set('passphrase', event.target.value),
-                }))),
+                h('div', { style: styles.secretRow },
+                  h('input', {
+                    style: { ...styles.input, ...styles.grow },
+                    type: reveal.passphrase ? 'text' : 'password',
+                    value: draft.passphrase,
+                    onChange: event => set('passphrase', event.target.value),
+                  }),
+                  h('button', {
+                    type: 'button',
+                    style: styles.link,
+                    onClick: () => setReveal(current => ({ ...current, passphrase: !current.passphrase })),
+                  }, reveal.passphrase ? T.hide : T.reveal)))),
         h('details', null,
           h('summary', { style: styles.link }, T.advanced),
           h('div', { style: { ...styles.field, marginTop: 10 } },

@@ -76,6 +76,11 @@ function memoryCredentials() {
   check(node.describe().droppedAt !== undefined, 'the snapshot carries it to the settings page')
   check(node.describe().failure === undefined,
     'and a drop is not reported as a failure — nothing is misconfigured')
+  // The card can only say "attempt 2 of 3" if the rung is in the snapshot. Without it the
+  // difference between the first try and the tenth is invisible, and those are the two cases
+  // a person acts differently on.
+  check(typeof node.recoveryAttempts === 'number', 'the rung the ladder will use is tracked',
+    String(node.recoveryAttempts))
   check(node.recoveryTimer !== undefined, 'the reconnect ladder is armed')
   rnh.dispose()
   node.recoveryTimer = undefined
@@ -141,7 +146,33 @@ function memoryCredentials() {
   check(byPhase.detail === 'boom', 'the original sentence is kept for a bug report', byPhase.detail)
 }
 
-// ---- 5. an unreachable node keeps its rows -------------------------------
+// ---- 5b. the card's two clocks come from the snapshot ---------------------
+// "How long has this been in `install`" and "how many bytes have arrived" are both facts the
+// Host knows and the browser cannot compute: the page may be opened mid-connect, and a
+// download that started before the tab did would otherwise read as just-started.
+{
+  const rnh = new Rnh({ credentials: memoryCredentials(), version: '0.0.0-test', log: () => {} })
+  const node = await rnh.put({ id: 'n0000000000ad', name: 'fake', host: 'example.test', username: 'root', auth: { kind: 'password' } })
+
+  // Nothing running: neither key is present, so a card cannot render a clock or a bar that
+  // belongs to a phase the node is not in.
+  check(node.describe().phaseStartedAt === undefined, 'a node with no phase has no phase clock')
+  check(node.describe().transfer === undefined, 'and no transfer numbers')
+  check(node.describe().recoveryAttempts === undefined, 'and no ladder rung while it is healthy')
+
+  node.phase = 'install'
+  node.phaseStartedAt = 1_700_000_000_000
+  check(node.describe().phaseStartedAt === 1_700_000_000_000,
+    'a phase carries the moment it began, so the card can show elapsed time',
+    String(node.describe().phaseStartedAt))
+
+  node.transfer = { bytes: 12 * 1024 * 1024, total: 58 * 1024 * 1024, bytesPerSecond: 2 * 1024 * 1024 }
+  check(node.describe().transfer?.bytes === 12 * 1024 * 1024,
+    'live transfer numbers reach the card', JSON.stringify(node.describe().transfer))
+  rnh.dispose()
+}
+
+// ---- 6. an unreachable node keeps its rows -------------------------------
 
 {
   const rows = [{ workspaceId: 'w1' }, { workspaceId: 'w2' }]

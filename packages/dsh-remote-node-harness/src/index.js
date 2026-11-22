@@ -278,6 +278,16 @@ export function apply(ctx, config = {}) {
           sendJson(res, 200, { ok: true, node: runtime.describe() })
           return
         }
+        if (action === 'forget-host-key') {
+          // The one recovery a host-key mismatch has. `normalizeNode` keeps `hostKey` only
+          // when it is a non-empty string, so passing `null` drops the record and the next
+          // connect trusts whatever the machine presents — the same TOFU rule as the first
+          // connect, which is what "review and accept the new key" has to mean in a surface
+          // with no side-by-side comparison dialog.
+          const cleared = await rnh.put({ ...runtime.record, hostKey: null })
+          sendJson(res, 200, { ok: true, node: cleared.describe() })
+          return
+        }
         if (action === 'reinstall') {
           runtime.phase = 'install'
           try {

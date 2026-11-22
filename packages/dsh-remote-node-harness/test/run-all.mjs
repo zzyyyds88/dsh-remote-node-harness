@@ -217,6 +217,14 @@ const SUITES = [
     proves: 'the edit that lets a routed Session read files lands exactly once, refuses an unknown relay bundle whole, is idempotent across Host restarts, breaks no hard-linked sibling, and can be reverted byte for byte',
   },
   {
+    name: 'transfer',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'transfer-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    proves: 'the download numbers shown during a first connect: a rate averaged over a window rather than one tick, an ETA only when both a total and a rate exist and never negative, and nothing invented when the source will not say its size',
+  },
+  {
     name: 'composition',
     layer: 'offline',
     file: ['packages', 'rnh-brain', 'scripts', 'check-composition.mjs'],

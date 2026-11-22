@@ -33,6 +33,7 @@ import {
   platformTag,
   rollbackScript,
 } from './artefact.js'
+import { archiveFor, totalBytes, watchTransfer } from './transfer-progress.js'
 
 /**
  * The Node major version the resident host needs.
@@ -339,7 +340,8 @@ export class RemoteHost {
    * whose terminal fails at first use.
    *
    * @param {{ nodeUsable: boolean, nodeVersion?: string, curlPath?: string, wgetPath?: string, os?: string, arch?: string }} facts
-   * @param {{ sources?: Array<{kind: 'prefix' | 'template', prefix?: string, template?: string}> }} [options]
+   * @param {{ sources?: Array<{kind: 'prefix' | 'template', prefix?: string, template?: string}>,
+   *   onTransfer?: (progress: { bytes: number, total?: number, bytesPerSecond?: number, etaMs?: number } | undefined) => void }} [options]
    * @returns {Promise<{ version: string, via: 'artefact' }>}
    */
   async install(facts, options = {}) {
@@ -401,6 +403,20 @@ export class RemoteHost {
       cli: this.layout.cli,
       urls,
     })
+    // Watch the archive grow while `curl` writes it.
+    //
+    // The download is the only step of a connect with a duration a person notices — 58.2 MiB
+    // on a link that manages 300 KiB/s is three minutes of nothing on screen. `exec` answers
+    // when the channel closes, so `curl`'s own output cannot be used; the archive on disk can.
+    // Both halves are optional: a source that omits `content-length` gives bytes without a
+    // percentage, and a watch that cannot measure simply reports nothing.
+    const stopWatch = options.onTransfer === undefined
+      ? () => {}
+      : watchTransfer(this.connection, {
+        archive: archiveFor(this.layout, this.version),
+        total: await totalBytes(this.connection, urls),
+        onUpdate: progress => options.onTransfer?.(progress),
+      })
     const attempt = await this.connection.exec({
       argv: ['sh', '-c', script],
       // Must outlast the download ceiling, or a slow-but-healthy link gets killed by the SSH
@@ -409,6 +425,11 @@ export class RemoteHost {
       // this leaves a minute for unpack, the `--version` check and the stamp write.
       timeoutMs: (FETCH_CEILING_SECONDS + 60) * 1000,
       maxBytes: 1024 * 1024,
+    }).finally(() => {
+      stopWatch()
+      // Cleared, not left at 100%: the phase has moved on, and a stale bar under "starting
+      // the resident host" would say the install is still running.
+      options.onTransfer?.(undefined)
     })
     if (attempt.code === 0) {
       return { version: attempt.stdout.trim().split('\n').at(-1) ?? this.version, via: 'artefact' }

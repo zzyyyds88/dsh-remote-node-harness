@@ -73,6 +73,15 @@ export class NodeRuntime {
     this.version = options.version
     this.state = NODE_STATE.IDLE
     this.phase = undefined
+    /**
+     * When the current phase began, so the card can say how long it has been there.
+     *
+     * A five-step timeline with no clock reads the same at two seconds and at four minutes;
+     * the one case where a person needs to know which is "is this hung". Cleared with the
+     * phase, kept on a failure so the last phase still shows its duration.
+     * @type {number | undefined}
+     */
+    this.phaseStartedAt = undefined
     this.error = undefined
     /** The classified form of `error`: `{ code, message, action, retryable, detail }`. */
     this.failure = undefined
@@ -103,6 +112,15 @@ export class NodeRuntime {
     this.runtimeVia = undefined
     /** @type {{ port: number, token: string, pid: number, version: string } | undefined} */
     this.serving = undefined
+    /**
+     * Live download progress while a runtime archive is arriving, else `undefined`.
+     *
+     * Set and cleared by the install step itself: it exists only for as long as there is a
+     * number to show, so a card can render it unconditionally instead of also tracking which
+     * phase it belongs to.
+     * @type {{ bytes: number, total?: number, bytesPerSecond?: number, etaMs?: number } | undefined}
+     */
+    this.transfer = undefined
     this.queue = Promise.resolve()
     /** @type {{ kind: 'password' | 'key' | 'agent', password?: string, privateKey?: string, passphrase?: string } | undefined} */
     this.secret = undefined
@@ -209,6 +227,8 @@ export class NodeRuntime {
       remoteRoot: this.record.remoteRoot,
       state: this.state,
       ...(this.phase === undefined ? {} : { phase: this.phase }),
+      ...(this.phaseStartedAt === undefined ? {} : { phaseStartedAt: this.phaseStartedAt }),
+      ...(this.transfer === undefined ? {} : { transfer: this.transfer }),
       ...(this.runtimeVia === undefined ? {} : { runtimeVia: this.runtimeVia }),
       ...(this.error === undefined ? {} : { error: this.error }),
       // The machine-readable half of the same failure: a stable code, the one action worth
@@ -226,6 +246,10 @@ export class NodeRuntime {
       ...(this.record.lastSeenVersion === undefined ? {} : { lastSeenVersion: this.record.lastSeenVersion }),
       ...(this.droppedAt === undefined ? {} : { droppedAt: this.droppedAt }),
       ...(this.recoveries === 0 ? {} : { recoveries: this.recoveries }),
+      // How many rungs of the ladder have been used. Without it the card can say "reconnecting"
+      // but not whether that is the first attempt or the tenth, which is the difference
+      // between waiting and going to look at the machine.
+      ...(this.recoveryAttempts === 0 ? {} : { recoveryAttempts: this.recoveryAttempts }),
     }
   }
 }
@@ -382,6 +406,7 @@ export class Rnh {
           )
         }
         runtime.phase = 'probe'
+        runtime.phaseStartedAt = Date.now()
         this.#publish()
         runtime.facts = await runtime.host.probe()
         if (!runtime.facts.nodeUsable) {
@@ -394,6 +419,7 @@ export class Rnh {
           )
         }
         runtime.phase = 'install'
+        runtime.phaseStartedAt = Date.now()
         this.#publish()
         // The gate decides; the installer only carries it out. Doing the comparison
         // here rather than inside `install` keeps the reason available to the settings
@@ -423,6 +449,14 @@ export class Rnh {
         if (gate.action === GATE.INSTALL) {
           const installedRuntime = await runtime.host.install(runtime.facts, {
             sources: this.sources,
+            // Live byte counts while the archive downloads, and `undefined` the moment the
+            // download ends — the phase has moved on and a stale bar would be a lie. Only
+            // the first connect to a fresh node takes this path, which is exactly the one
+            // that can sit for minutes with nothing on screen.
+            onTransfer: progress => {
+              runtime.transfer = progress
+              this.#publish()
+            },
           })
           runtime.runtimeVia = installedRuntime.via
           runtime.log?.(
@@ -435,6 +469,7 @@ export class Rnh {
         // came up with the wrong composition would look healthy and then either serve a
         // browser surface it has no use for or load no tools at all.
         runtime.phase = 'provision'
+        runtime.phaseStartedAt = Date.now()
         this.#publish()
         const wanted = [...this.nodeBundles()]
         const extras = wanted.filter(name => name !== BRAIN_PACKAGE && name !== '@deepseek-ai/dsh-base')
@@ -468,6 +503,7 @@ export class Rnh {
         const plan = provisioner.plan()
         const wrote = await runtime.host.writePatch(plan.text)
         runtime.phase = 'start'
+        runtime.phaseStartedAt = Date.now()
         this.#publish()
         runtime.serving = await runtime.host.ensureServing({
           force: options.force === true,
@@ -477,6 +513,7 @@ export class Rnh {
           bundleChanged: composition.changed || bundles.changed || bundles.revertedPrevious,
         })
         runtime.phase = 'verify'
+        runtime.phaseStartedAt = Date.now()
         this.#publish()
         const cookie = await runtime.gateway.cookie(true)
         if (cookie.length === 0) throw new Error('the resident host issued no browser cookie')
@@ -503,6 +540,8 @@ export class Rnh {
         }
         runtime.state = NODE_STATE.CONNECTED
         runtime.phase = undefined
+        runtime.phaseStartedAt = undefined
+        runtime.transfer = undefined
         runtime.failure = undefined
         runtime.droppedAt = undefined
         runtime.registryError = undefined
@@ -519,6 +558,9 @@ export class Rnh {
         runtime.error = error instanceof Error ? error.message : String(error)
         runtime.failure = classifyFailure(error, { phase: runtime.phase })
         runtime.serving = undefined
+        // The bytes are gone with the attempt; the phase clock is not — a failure keeps
+        // `phaseStartedAt` so the card can still say how long the failing step took.
+        runtime.transfer = undefined
         runtime.gateway.reset()
         this.registry.recordOutcome(runtime.record.id, { ok: false, error: runtime.error })
         this.#publish()

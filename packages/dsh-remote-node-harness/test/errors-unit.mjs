@@ -114,6 +114,37 @@ const check = (ok, label, detail) => {
     'an ordinary line is untouched')
 }
 
+// ---- 5b. every action leads somewhere -------------------------------------
+// The card offers one control per action, and the client's `FailureBlock` switches on exactly
+// these keys. An action with no control is the bug this table cannot see by itself: the
+// settings page showed "fix the credential" as a link that opened the log, which reads as
+// having no button at all. The set is closed on purpose — a new code has to reuse one.
+{
+  const ACTIONS = [
+    'fix-credential', 'review-host-key', 'check-network', 'retry',
+    'upgrade-node', 'upgrade-desktop', 'reinstall', 'inspect-log',
+  ]
+  for (const [code, entry] of Object.entries(ERROR_CODES)) {
+    check(ACTIONS.includes(entry.action), `${code}'s action is one the card can render`, entry.action)
+  }
+  // The two that are worth a primary button: one acts inside this surface, the other changes
+  // what the next connect will accept. The rest either explain or open the log.
+  const primary = Object.entries(ERROR_CODES)
+    .filter(([, entry]) => ['retry', 'reinstall', 'check-network', 'fix-credential', 'review-host-key']
+      .includes(entry.action))
+    .map(([code]) => code)
+  check(primary.length > 0, 'at least one code gets an actionable control', primary.join(','))
+  // `ssh-auth` must not be retryable — pressing Connect with the same wrong password is the
+  // definition of a button that cannot help.
+  check(ERROR_CODES['ssh-auth'].retryable === false, 'a refused credential offers no plain retry')
+  check(ERROR_CODES['ssh-auth'].action === 'fix-credential',
+    'and it offers the form that can change the credential')
+  check(ERROR_CODES['ssh-host-key'].action === 'review-host-key',
+    'a changed host key offers to forget the recorded one')
+  check(ERROR_CODES['ssh-network'].action === 'check-network',
+    'an unreachable machine offers a probe rather than a full reconnect')
+}
+
 // ---- 6. the log is bounded, ordered and redacted --------------------------
 {
   const log = new NodeLog()
