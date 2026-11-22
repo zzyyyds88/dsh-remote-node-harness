@@ -1,6 +1,6 @@
 {
   "name": "@greatbaby/dsh-remote-node-harness",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "type": "module",
   "description": "Remote Linux machines as first-class DeepSeek Harness workspaces: the brain runs on the node (so bash, grep, git and read_image are native there), while its sessions and workspaces are merged into the local sidebar and the local Remote API, so the desktop app and ds-harness-remote both see one node set.",
   "keywords": [

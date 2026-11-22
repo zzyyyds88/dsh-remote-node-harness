@@ -1034,9 +1034,86 @@ preset 的 `persona` 行只负责把这件事说清楚（拒绝什么、怎么�
 `@greatbaby/dsh-remote-node-harness` 在 `NODE_NEVER_SYNC` 里（见 §六之五）：它带的就是这个预设，节点装上就等于「被控节点能
 控制别的节点」，正好是要避免的形态。`version-unit` 与 `plugin-switch` 各有一条断言守着。
 
+## 六之八、中转产物补丁：手机读远端会话文件的唯一出路
+
+手机读「远端会话」的文件，在链路上被中转挡下。这一节记录为什么只能改产物、补丁长什么样、
+以及它凭什么不会变成一颗定时炸弹。决策记录见
+[ADR-0008](adr-0008-relay-artifact-patch.zh.md)。
+
+### 拦截点在哪
+
+`ds-harness-remote` 的 `HarnessRemoteBridge.call()` 在 dispatch 前对读类端点做一次**本机**
+授权：`resolveWorkspaceRootForSession` 让 Host 派发 `session/list`、取该行 `cwd`、再在桌面
+本机 `realpath()` 并 `stat()`；随后 `assertNativeWorkspaceFileCall` 还会对目标文件本身
+`lstat()` + `realpath()`。
+
+rnh 合并进来的远端行 `cwd` 是**节点路径**（`/root/proj`）。本机没有这个目录，两处都
+`ENOENT`，手机拿到 `WORKSPACE_UNAVAILABLE`。受影响端点：
+`workspaceFiles/{read,readBytes,readAll,stat,search}`。
+
+### 三个被否掉的方案
+
+| 方案 | 否掉的理由 |
+|---|---|
+| 改中转仓库 | 与上游发版直接冲突，每次发布都要重打；GOAL §七-3 已定两个仓库不改 |
+| 运行时从外部包住 | `HarnessRemoteBridge` 不在产物导出里；`dshRemote` 只暴露 runtime；`resolveWorkspaceRoot` 是构造参数、`assertNativeWorkspaceFileCall` 是私有方法 —— 三条路都堵死 |
+| 本机放一份远端目录副本 | `realpath(cwd)` 能过，但 `lstat(<本机>/root/proj/a.txt)` 仍 `ENOENT`，要过就得放真实副本 —— 那是 GOAL §七-5 明令禁止的镜像 |
+
+### 补丁做什么
+
+只做一件事：**`rnh_<nodeId>_<remoteId>` 形式的会话 id 跳过本机授权，原样放行给 rnh 装饰器。**
+路径边界交给节点自己算 —— 节点按自己的会话头重算 `workspaceFileScope`，
+`workspaceFiles/{read,readAll,stat,readBytes}` 的限制仍在节点上生效。这与已经路由的
+`session/page`、`terminal/*` 是同一个信任模型：**这个 Host 已经通过 SSH 信任那台节点**，
+中转不该再用「本机文件系统」给它出第二次证明。
+
+注入一个判定，并在两处调用点前加排除条件：
+
+```js
+const __rnhRemoteScope = id => typeof id === "string" && /^rnh_[a-z0-9]+_/.test(id)
+```
+
+### 三条硬约束
+
+1. **每个锚点必须恰好命中 1 次。** 0 次或多次就整份放弃并报出「期望几处、实际几处、版本号」。
+   半打的补丁比不打更糟：症状会随端点跳，而且每次都不一样。
+2. **写盘只能「新文件 + rename」。** pnpm 把同一份 `dist/index.js` 硬链接进每个装了中转的
+   profile（实测 `nlink: 2`、同 inode）。就地写会连带改掉另一个 profile 的副本；`rename`
+   只替换目录项。`relay-patch-unit` 有一条断言守这个（打完后 `nlink` 变 1、兄弟副本字节不变）。
+3. **必须能退。** 首次打之前把原文件复制成 `index.js.rnh-orig`（只在源文件没有补丁标记时写），
+   sidecar 记 `{ version, originalSha256, patchedSha256, anchors }`，`revertRelayPatch()` 就是一次复制。
+
+### 每次启动重新检测
+
+`apply()` 里调一次 `applyRelayPatch()`。稳态是「已有标记且哈希对得上」→ 什么都不做。
+中转升级会整份替换 `dist/index.js`，标记消失 → 重新对锚点；锚点对不上就放弃并写原因。
+结果进 `GET /rnh/api/nodes` 的 `local.relay`（`installed` / `patched` / `anchors` / `reason`），
+**不只写日志** —— 否则「补丁是否生效」只能靠翻文件。
+
+配置 `relayPatch: false` 可整体关闭。
+
+### 节点上「不存在的绝对路径」
+
+同一条链上另一处改动，服务的是「手机在节点上新建工作区」（GOAL §五-1）。手机的端点白名单里
+没有 `directoryPicker/createDirectory`，所以「新建文件夹」按钮不渲染；它的「输入路径」在能
+浏览时会转成 `browse(path)`，而 `directoryPicker/list` 对节点上不存在的目录原本直接报错，
+就停在那里。
+
+改法是 `listRemote` 把「不在」与「不让看」分成两个互斥标记（`RNH_BROWSE_MISSING` /
+`RNH_BROWSE_ERROR`），前者在路径合法时返回一个**空层**，并带 `exists: false`：
+
+```
+输入 /root/newproj → 空层里点确认 → 中转 dispatch 前 mkdir -p 造本机幽灵目录
+  → rnh 的 workspace/create 在节点上 mkdir -p 并登记 → 成功后精确 rmdir 掉本机那条空链
+```
+
+只有「绝对 POSIX、不是 `/`、不含 `..`」才给空层；权限问题、不是目录、非法路径仍走
+`RNH_BROWSE_ERROR` 报错，因为下一步会在节点上真的 `mkdir -p` 出来。本机（`listLocal`）的
+语义不变，仍是不存在就报错 —— 本机不需要从选择器里造目录。
+
 ## 七、测试
 
-共 31 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 11 个（纯逻辑 + 组合
+共 39 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 19 个（纯逻辑 + 组合
 检查）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个（运行中的 Host + 连上的节点）。
 下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 
@@ -1066,12 +1143,14 @@ preset 的 `persona` 行只负责把这件事说清楚（拒绝什么、怎么�
 | `browser-acceptance.mjs` | 真 Chrome + CDP：渲染后的侧栏文本里**真的有**远程工区；插件自己的入口可达；截图留证。API 测试看不见"baseline 把远程行冲掉"这类问题 | 运行中的 Host + 带 `--remote-debugging-port` 的 Chrome |
 | `version-unit.mjs` | 版本闸门的每个分支（含 rc 排序）、制品 URL、安装脚本内容、每节点 layout 派生、插件开关语义（哪些 bundle 算第三方、**默认全开**、硬排除清单、节点列表顺序、状态文件容错） | 无 |
 | `waterfall-unit.mjs` | 审批/提问中继：允许的 waterfall 才发到浏览器、拒绝与超时各自结算、节点断开时卡片被取消、问题按自己的名字转发 | 无 |
-| `workspace-browse.mjs` | 加工作区对话框背后的两个接口：本机与节点用同一形状回答、节点列的是节点的盘（`/` 没有上级、隐藏目录不列、不存在的目录报 shell 的原因）、选中的节点目录变成带包裹身份的工区 | 运行中的 Host + 已连接节点 |
-| `picker-flow.mjs` | **手机**看节点这条路由：`/@rnh` 列出节点、`/@rnh/<id>/` 列出那台机器真实的根、每个 entry 都拼回命名空间、面包屑不越界、没记过的 id 报 `rnh/node-unknown`；`workspace/create` 用这种路径把工区建在节点上，而中转 dispatch 前建在桌面盘上的那个目录被清掉，且同目录下别人放的文件不动 | 同上 |
+| `workspace-browse.mjs` | 加工作区对话框背后的两个接口：本机与节点用同一形状回答、节点列的是节点的盘（`/` 没有上级、隐藏目录不列）；**本机**不存在的目录仍报错，**节点**上合法但不存在的绝对路径返回 `exists: false` 的空层 | 运行中的 Host + 已连接节点 |
+| `picker-flow.mjs` | **手机**看节点这条路由：`/@rnh` 列出节点、`/@rnh/<id>/` 列出那台机器真实的根、每个 entry 都拼回命名空间、面包屑不越界、没记过的 id 报 `rnh/node-unknown`；节点上不存在的路径给出可确认的空层，拿它 `workspace/create` 之后节点上真有那个目录、桌面盘上那条幽灵链被清掉；已存在的路径同样建工区，且同目录下别人放的文件不动 | 同上 |
 | `picker-paths-unit.mjs` | `/@rnh` 命名空间的编解码（两种路径规范化器都能过、大小写、盘符、重复分隔符、完整 segment 才匹配）；影子目录清理**删不掉**任何有内容的目录，也拒绝命名空间之外的路径 | 无 |
 | `install-unit.mjs` | 安装清单自洽：`dsh.bundle.patch` 每个文件都存在且已声明、`engines.dsh` 是合法范围、`files` 覆盖所有运行物、`meta.detail` 指向真实文件、打包文件里没有内网地址与私钥 | 无 |
 | `autoconnect-unit.mjs` | 重启后不点「连接」也能连上：`autoConnect` 先取凭据再判断，有凭据就连、没凭据/被禁用的不连、凭据库抛错只记日志不外泄 | 无（内存注册表 + 内存凭据库） |
 | `rnh-control-unit.mjs` | 节点控制面：贴进对话的密钥被拒绝、引用在本机读取、任何返回值都不带认证材料 | 无（假 rnh） |
+| `relay-patch-unit.mjs` | 中转产物补丁：三个锚点各命中一次才打、结果能过 `node --check`、重复启动幂等、未知中转整份放弃并报出命中数、解析失败时原文件一字不动、`rename` 后硬链接兄弟副本字节不变、`revert` 逐字节还原 | 无 |
+| `transfer-unit.mjs` | 首次连接下载运行时期间的数字：速率取窗口平均而不是单次采样、ETA 只在总大小与速率都已知时出现且永不为负、源不给 `content-length` 就只报字节数不编百分比、归档路径与安装脚本同法派生 | 无 |
 | `node-control.mjs` | 「节点管理模式」是个**组合**而不是一句提示：预设注册且只声明两行、会话能建、真跑一轮只调 `rnh_nodes` 一个工具、答案是真实节点名册 | 运行中的 Host + 已连接节点 |
 | `plugin-switch.mjs` | 单个插件的开关真的落到节点：包被安装或复制上去、节点自己的 bundle 列表里排在脑 bundle **之前**、常驻 host 重启后仍答得出、远程工区数量不变；关回去同样干净，异常退出也恢复开关 | 同上 |
 | 手工 §2b / §7c | 脚本走协议、用户走界面，两者都要过：真实 Chrome 里新建远程会话、敲字、发送、看到「已完成」；再看智能体协作开关、子代理历史、产物卡片的原生打开 | 运行中的 Host + 真实 Chrome |

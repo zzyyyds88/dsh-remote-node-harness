@@ -423,6 +423,36 @@ DSH 升级才需要。
 这条链此前是空白，而它**无声失效**：中转改一处行为，手机端某个功能就不响应，
 不报错、不打日志，现有端到端又全部走本机 `/api`，一条都测不到。
 
+### 8.0 先看补丁还在不在（0.6.7 起新增）
+
+0.6.7 起，本插件会在**每次 Host 启动**时给已安装的 `ds-harness-remote` 产物打一处补丁：
+让 `rnh_` 开头的会话 id 跳过中转的「本机 realpath 授权」。原因与三个被否掉的方案见
+[ADR-0008](../../../docs/adr-0008-relay-artifact-patch.zh.md)。
+
+**中转一升级，补丁就失效**，因为 `dist/index.js` 是整份替换的。这时不会静默降级：
+`applyRelayPatch` 找不到锚点就整份放弃，并把原因写进 `GET /rnh/api/nodes` 的
+`local.relay`：
+
+```json
+"relay": { "installed": "0.6.8", "patched": false, "reason": "… search-branch matched 0 times …" }
+```
+
+**所以升级中转后的第一件事是读这个字段。** 三种情况：
+
+| `local.relay` | 含义 | 要做什么 |
+|---|---|---|
+| `patched: true` | 已打上，锚点都命中 | 什么都不用做 |
+| `patched: false` + `installed: null` | 这台机器没装中转 | 正常 |
+| `patched: false` + 有 reason | 中转版本变了，锚点对不上 | 看下一段 |
+
+锚点对不上时只有两条路：改 `src/host/relay-patch.js` 的 `RELAY_EDITS`（如果上游只是
+重排了代码），或者承认上游已经不需要这个补丁了。**不要**手工去改 `dist/index.js`：
+sidecar 记着哈希，下次启动会按锚点重打，手改的部分会丢。
+
+回滚：`revertRelayPatch()`，或把 `dist/index.js.rnh-orig` 复制回 `dist/index.js`。
+
+### 8.1 三处围着中转写的行为
+
 rnh 有三处行为是**围着中转写的**，升级后逐一确认：
 
 | rnh 依赖的中转行为 | 在哪 | 变了会怎样 | 怎么确认 |
