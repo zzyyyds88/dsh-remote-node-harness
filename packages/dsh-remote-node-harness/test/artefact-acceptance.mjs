@@ -165,7 +165,13 @@ check(field('nested') === 'no',
 // a ~830-package install: the rest live under the `@scope` directories.
 check(Number(field('packages')) > 150, 'and it carries the full dependency set',
   `${String(field('packages'))} top-level entries`)
-check(Number(field('size')) > 500, 'with the size a real install has', `${String(field('size'))} MiB`)
+// The floor is a **truncation detector**, not a size target. The upstream install is ~830 MiB
+// unpacked, but this project ships a fork that is trimmed at build time (ADR-0007: 2014.6 MiB
+// → 267.4 MiB unpacked), so the honest number on a node is a few hundred MiB — measured
+// 354 MiB for `0.2.2-rc.5`. A hard-coded `> 500` from the upstream figure failed a perfectly
+// good install and said nothing about whether the download was complete.
+check(Number(field('size')) > 200, 'with the size the trimmed runtime really has',
+  `${String(field('size'))} MiB (the fork trims the upstream tree; see ADR-0007)`)
 
 // The natives have to be the node's own platform, which is the whole reason the
 // artefact is per-platform.

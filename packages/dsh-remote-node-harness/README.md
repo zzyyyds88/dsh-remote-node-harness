@@ -278,6 +278,25 @@ node's filesystem is addressable inside the one path syntax that client speaks:
 path like that creates the workspace **on the node**. The prefix is reserved for nodes;
 creating a workspace from it directly is refused.
 
+**A folder that does not exist yet** answers as an empty level with `exists: false` rather
+than an error. That is what makes "create a project on that machine" reachable from a phone:
+the client's endpoint allowlist has no `directoryPicker/createDirectory`, so a new folder
+cannot be made from that side, but confirming an empty level runs `workspace/create`, which
+creates the directory on the node.
+
+**Reading a remote session's files** needs one edit to the *installed* relay bundle, because
+`ds-harness-remote` otherwise authorises every file read against this machine's filesystem
+and a remote `cwd` can never resolve here. The plugin applies that edit on every Host start
+and reports the result in `GET /rnh/api/nodes` → `local.relay`:
+
+```json
+"relay": { "installed": "0.6.6", "patched": true, "anchors": 2 }
+```
+
+A relay upgrade replaces those bytes, so the patch reports `patched: false` with a reason
+instead of silently doing nothing. Why it cannot be solved any other way, and how to roll it
+back, is in [`docs/adr-0008`](../../docs/adr-0008-relay-artifact-patch.zh.md).
+
 ## Installation
 
 ```bash

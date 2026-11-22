@@ -90,6 +90,17 @@ if (remote.state !== 'connected') {
 const listed = await get('/plugins')
 check(listed.status === 200, 'the plugin list answers', `HTTP ${String(listed.status)}`)
 let rows = listed.body.rows ?? []
+// A profile with nothing third-party installed answers `[]`, and that is a **skip**, not a
+// failure: the only plugin in a clean `rnhtest` profile is this one, which is correctly never
+// offered. Declared here rather than after the row checks, because those checks are vacuously
+// true on an empty list and the old order reported a failure for a healthy profile.
+if (rows.length === 0) {
+  log('no third-party plugin is installed on this desktop; nothing to switch')
+  // A clean exit, not `process.exit`: the carrier's sockets are still open and Node 24 raises
+  // a libuv assertion while tearing them down, which the runner reads as a crash.
+  await sleep(250)
+  process.exit(3)
+}
 check(rows.length > 0, 'it lists the plugins installed here', `${String(rows.length)} row(s)`)
 for (const row of rows.filter(entry => entry.source === 'explicit')) {
   const cleared = await post(`/plugins/${encodeURIComponent(row.bundle)}`, { sync: true })
@@ -118,10 +129,6 @@ check(rows.every(row => row.source === 'default'), 'and nothing has been overrid
 // third-party plugin being installed on the desktop, so it takes the first candidate and
 // skips the whole suite when there is none.
 const target = rows[0]
-if (target === undefined) {
-  log('no third-party plugin is installed on this desktop; nothing to switch')
-  process.exit(3)
-}
 log(`switching ${target.bundle} (${String(target.spec || 'latest')}) on ${remote.name}`)
 
 // Where the node's own profile lives. Derived from the recorded `remoteRoot`, not spelled

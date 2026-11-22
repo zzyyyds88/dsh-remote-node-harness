@@ -34,6 +34,7 @@ import { decideGate } from './core/version.js'
 import { Rnh, BRAIN_BUNDLES } from './host/rnh.js'
 import { RnhControl } from './host/rnh-control.js'
 import {
+  ensureRemoteDirectory,
   isPosixAbsolute,
   listLocal,
   listRemote,
@@ -367,6 +368,16 @@ export function apply(ctx, config = {}) {
           const runtime = rnh.get(nodeId)
           if (runtime === undefined) throw apiError('node-not-found', `no node ${nodeId}`, 404)
           if (!runtime.routable) throw apiError('node-offline', `${runtime.record.name} is not connected`, 409)
+          // Make the directory on the node first, exactly as the `workspace/create` decorator
+          // does for the same request. Without this the two entry points disagree: the phone
+          // and the picker can create a workspace at a path that is not there yet, while this
+          // settings-page form answered `ENOENT: realpath` — measured, and it read like a
+          // broken API rather than a missing step.
+          try {
+            await ensureRemoteDirectory(runtime.connection, path)
+          } catch (error) {
+            throw apiError('create-failed', error instanceof Error ? error.message : String(error), 400)
+          }
           let value = await router.call(nodeId, 'workspace/create', { request: { path } })
           const createdId = Reflect.get(Reflect.get(value ?? {}, 'workspace') ?? {}, 'workspaceId')
           if (title.length > 0 && typeof createdId === 'string') {

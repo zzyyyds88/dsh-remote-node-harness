@@ -91,9 +91,16 @@ if (sessionId === undefined) {
 }
 
 // The Session must be materialised on the NODE, under the node's sessions root.
+//
+// The directory name is derived from the workspace path the Session reports, not spelled out:
+// DSH names a Session directory after its cwd (`/root/rnh-second` → `--root-rnh-second--`),
+// and this assertion used to hard-code one particular fixture's name — so it failed on every
+// node whose first remote workspace happened to be a different folder.
+const sessionDir = `--${String(remoteWorkspace.path).replace(/^\/+|\/+$/gu, '').replaceAll('/', '-')}--`
 const nodeSessions = await nodeExec(`ls -1 ~/.dsh/sessions/ 2>/dev/null | tr '\\n' ' '`)
-check(nodeSessions.includes('--root-rnh-brain-test--'),
-  'the node holds the session directory for that workspace', nodeSessions.trim().slice(0, 120))
+check(nodeSessions.includes(sessionDir),
+  'the node holds the session directory for that workspace',
+  `${sessionDir} in ${nodeSessions.trim().slice(0, 120)}`)
 
 // ---- 3. prompt it: the remote brain must run the command -----------------
 const follow = liveStream(carrier, 'session/follow', {

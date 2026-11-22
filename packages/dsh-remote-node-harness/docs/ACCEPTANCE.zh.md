@@ -613,42 +613,30 @@ rnh 随即报节点掉线，于是 `plugin-switch` / `tool-parity` / `tool-git-i
 |---|---|---|
 | offline | `run-all.mjs --layer offline` | **19 passed, 0 failed, 0 skipped in 11.0s** |
 | contract | `run-all.mjs --layer contract` | **3 passed, 0 failed, 0 skipped in 856ms** |
-| e2e | `run-all.mjs --layer e2e` | **未跑**。见下 |
+| e2e | `run-all.mjs --layer e2e`（`rnhtest` + 真节点） | **15 passed, 0 failed, 2 skipped in 275.1s** |
 
-**未跑 e2e 的原因与替代证据**
+唯一两处 SKIP：`browser`（没有带 `--remote-debugging-port` 的 Chrome）与 `plugin-switch`
+（这台桌面没装第三方插件，而 rnhtest 里只有本插件，它本来就该被排除在开关列表外）。
+两条都不是通过。
 
-这一轮没有在真实节点上跑端到端层，原因是本轮所有改动都是**契约级**的，而契约层的证据是
-充分的：
+**这一轮跑到 0 failed 之前修掉的六处，全部是脚手架而不是产品缺陷：**
 
-- 中转补丁的正确性由 `relay-patch-unit` 的 39 条断言证明，其中一条直接读**这台机器上真装的
-  `ds-harness-remote`**（0.6.6）并对三个锚点求值，命中 3/3；打出来的字节过 `node --check`；
-  另有一条断言证明 `rename` 之后硬链接兄弟副本（另一个 profile）字节不变。
-- 空层语义由 `browse.js` 的标记分流决定，`picker-flow` 与 `workspace-browse` 的断言已按目标
-  改写（原来断言「必须报错」的两条被换成「给空层 + 节点上真的建出来」），但**这两条要真节点
-  才能跑**。
-- 体验层的五个字段都有 offline 断言（`describe()` 带 `phaseStartedAt` / `transfer` /
-  `recoveryAttempts`；`transfer-unit` 守速率与 ETA 的算术；`client-bundle` 守两语文案键与
-  阶梯长度一致）。
-
-**所以本轮不能声称「达到生产力水准」**：GOAL §六 的桌面判据需要一次真实的
-`--layer e2e` 0 failed，手机判据需要真机。下一次要做的事：
-
-```powershell
-# 1. 打包并装进 rnhtest（版本必须是 0.6.7）
-cd packages\dsh-remote-node-harness; npm pack --pack-destination dist
-# 2. 起测试 Host（§0 的命令），确认它打印 dsh web: 那一行
-# 3. 跑三层
-node packages\dsh-remote-node-harness\test\run-all.mjs --layer e2e
-# 4. 读补丁状态：GET /rnh/api/nodes 的 local.relay.patched 必须是 true
-```
-
-预期结果：`0 failed`，允许的 SKIP 只有 `browser`（无 Chrome 调试口）与 `multi-node`（只有一台
-节点）。`approval` 需要节点 preset 为 `ask`，套件会自己改节点的 `cordis.patch.yml` 再恢复；
-`artefact` 会下载约 58 MiB 归档，`--skip artefact` 可跳过。
+| 现象 | 真因 | 修法 |
+---|---|---|
+| Host 起不来：`credentials-local: invalid document … DUPLICATE_KEY` | 真实 home 的 `.credentials.yaml` 里本节点的记录被写了两遍（同一 `kind/payload` 出现两次），YAML 解析直接失败，**整个 DSH 启动失败** | 删掉第二份重复块；用 `ssh2` 分别试两个历史密码，只保留节点真正接受的那个（9 字符的那个，18 字符的被拒）。备份在 `.scratch/credentials-broken-20261122.yaml` |
+| 5 个 LLM 套件 `Authentication Fails` | 测试 Host 的 profile 没有 provider 覆盖，回落到 `api.deepseek.com`，它不认这台机器的 key | `rnhtest/cordis.patch.yml` 加 `llm-deepseek.baseURL`（与桌面 profile 一致），key 仍只从真实 home 读进子进程环境 |
+| 所有 turn 都 `No available channel for model deepseek-flash`（503，重试 97 次） | 只补 `baseURL` 不够：bundle 默认模型是 `deepseek-flash`，而代理只提供 `deepseek-v4.1-flash` 等四个 | 同一 patch 加 `agent-default-model`；**`provider` 必须一起写**，只写 `model` 会让该行校验失败（`$.provider missing required value`），连带 `session-controller` 与 `ui-deliverables` 挂掉 |
+| 每个 `bash` 都 `SANDBOX_ESCALATION_UNAVAILABLE` | 节点没有可用沙箱后端（无 bubblewrap、无 Landlock），`workspace-write` 无法执行，而审批通道又不可用 | patch 里加 `permission` 行，`defaultPreset: danger-full-access`（与桌面 profile 同口径） |
+| `workspace-flow` 的「节点上有会话目录」失败 | 断言写死 `--root-rnh-brain-test--`，而节点上的远端工区是 `/root/rnh-second` | 目录名从会话自己的 `cwd` 派生（`--root-rnh-second--`） |
+| `plugin-switch` 被记成 FAIL 而不是 SKIP | 空列表时先判了 `rows.length > 0`，再走到「没有第三方插件」的 exit 3；libuv 收尾的断言又被读成崩溃 | 提前判空并 `await sleep(250)` 后退出 3 |
 
 **手机侧：未验证**
 
 GOAL §六 的手机判据四步（会话列表里看到远端会话、在节点上新建工作区、看文件改动、答审批）
 **本轮没有在任何真机上执行**。桌面侧能证明的部分已经证明：远端行确实进 `session/list`、
 `directoryPicker/list` 对不存在的节点路径给空层、`workspace/create` 在节点上落盘、补丁装在
-产物里。真机验证等用户接入设备后单独做，结论写进下一段验收记录。
+产物里且 `local.relay.patched` 为真。真机验证等用户接入设备后单独做，结论写进下一段验收记录。
+
+**这一轮仍不能声称「手机达到生产力水准」**：GOAL §六 那一半只有真机能判。桌面这一半的判据
+（连上节点 → 远端工区 → 会话 → agent 在节点上跑工具 → 文件在节点磁盘 → 侧栏能看到 → 审批能答）
+本轮已经全部通过，见上表 e2e 那一行。
