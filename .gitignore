@@ -10,6 +10,8 @@ packages/*/lib/*.map
 # 上游参考源码：各自是独立 git 仓库，克隆在本地即可
 reference/zcode/
 reference/deepseek-harness/
+reference/dsh-Go/
+reference/ds-harness-remote/
 
 # 抓取/调试现场（探针输出、截图、临时脚本），永不提交
 .scratch/

@@ -9,7 +9,7 @@
 | 占位符 | 本项目取值 |
 |---|---|
 | `@@PROJECT:<name>@@` | **DSH RemoteNodeHarness**（目录与本地工作区仍叫 `DSHpl`）—— DeepSeek Harness 的远程工作区能力。两个包：`packages/dsh-remote-node-harness`（插件，装桌面端）、`packages/rnh-brain`（节点侧 DSH 组合，只当大脑） |
-| `@@TRUTH:<path>@@` | `docs/ARCHITECTURE.md`（设计与取舍，唯一真源）。对外用法在根 `README.md`；升级流程在 `packages/dsh-remote-node-harness/docs/UPGRADE.zh.md` |
+| `@@TRUTH:<path>@@` | **`docs/GOAL.zh.md`（用户口述目标的正式版本，最高真源：做什么、为谁做、什么算成） → `docs/ARCHITECTURE.md`（设计与取舍）**。对外用法在根 `README.md`；升级流程在 `packages/dsh-remote-node-harness/docs/UPGRADE.zh.md` |
 | `@@COMMAND:<command>@@` | §12 各适配块的 `verification` 字段 |
 | `@@OWNER:<module/layer>@@` | 路由与身份语义归 `packages/dsh-remote-node-harness/src/host/`；节点组合语义归 `packages/rnh-brain/cordis.patch.yml`（生成物，源是 `scripts/sync-from-upstream.mjs`） |
 | `@@BOUNDARY:<goal/non-goal>@@` | 见 §4 |
@@ -49,7 +49,7 @@
 
 ## 4. 项目边界
 
-- **目标**：让桌面端把局域网 Linux 机器当成**本地工作区**用 —— 大脑（agent、模型调用、工具执行、会话日志）跑在节点上，桌面端只做身份编码、请求转发、结果还原；远端会话出现在同一个侧栏，手机端 `ds-harness-remote` 也能读到。
+- **目标**：见 [`docs/GOAL.zh.md`](docs/GOAL.zh.md)（用户口述目标的正式版本，最高真源）。一句话：把 ZCode 那套「手机连一台 Linux 机器干活」搬到 DSH 上 —— 大脑跑在节点上，桌面端与手机只是窗口；远端会话混排进同一个侧栏，手机经 `ds-harness-remote` 能读；并且能在远端节点上**新建**工作区。任何取舍先回答"它让 GOAL §六 更近还是更远"。
 - **做法的前提**：节点跑的是**官方 DSH 源码的 fork**，本项目在那棵树上改源码，而不是另写一个节点端。所以「改上游源码」**是允许的、是这个项目的主路径**，唯一的要求是**每一处改动都进台账**（`packages/dsh-remote-node-harness/docs/node-patches.zh.md` + `patches/node/*.patch`）：能单独读、单独测、单独弃用，上游改到同一处时冲突可见而不是被静默丢掉。删包/删文件是打包步骤，不需要进台账。
 - **非目标**（用户已明确否定，不许换名保留）：把远端目录镜像/挂载到本地再在本机跑工具；改 Electron 主进程；接管 `/api` 或 `/api/remote.mux`；碰上游 Loader 行；**改上游源码却不留台账**（改了不记，等于下次上游发版时静默丢改动）；**不发 npm**；**不给 GitHub 留下载源**。
 - **节点的形态**：只当远程大脑。做法是**源码级定制组合层** —— 节点 profile 组合 `dsh-base` + `@local/rnh-brain`，`dsh-web-app` 那层根本不加载。所有节点共用同一份组合（不做 per-node 定制）。
@@ -264,7 +264,8 @@ git -c http.proxy= -c https.proxy= clone https://git.yylx.win/https://github.com
 
 ## 14. 真源优先级
 
-1. 当前设计文档 / `docs/ARCHITECTURE.md`。
+1. **`docs/GOAL.zh.md`（用户口述的目标本身）** > 当前设计文档 / `docs/ARCHITECTURE.md`。
+   目标与设计冲突时，设计错，改设计。
 2. 当前源码、测试、配置、日志、git 状态、用户侧证据。
 3. 本文件（AGENTS.md）与同层 agent 规则。
 4. 仍有效的 docs、README、issue、review 评论。
