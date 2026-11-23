@@ -28,7 +28,6 @@ window.__ModuleLoader__.load({
     // (the same button heights, the same focus ring, the same modal chrome).
     const ui = require('@deepseek-ai/dsh-client-ui-primitives')
     const {
-      Button, StateDot,
       IconChevronLeftOutlineRegular,
       IconChevronRightOutlineRegular,
       IconChevronsUpDownOutlineRegular,
@@ -87,7 +86,7 @@ window.__ModuleLoader__.load({
           phases: {
             probe: '正在识别远端环境',
             install: '正在安装远端 Harness',
-            build: '正在由节点自行构建运行时',
+            build: '正在准备节点运行时',
             provision: '正在下发模型与凭据',
             start: '正在启动远端服务',
             verify: '正在验证远端会话通道',
@@ -95,7 +94,7 @@ window.__ModuleLoader__.load({
           /** How a node's runtime arrived. Shown only when the Host reported it. */
           runtimeVia: {
             artefact: '运行时来源：下载的制品',
-            npm: '运行时来源：旧版节点自建（重连会换成制品）',
+            npm: '运行时来源：旧版插件装好的树（版本与构建匹配就保留）',
           },
           missingSecret: '还没有保存密码或私钥。',
           /** Why a connect failed, as one sentence plus the one action worth offering. */
@@ -126,7 +125,8 @@ window.__ModuleLoader__.load({
             'inspect-log': '查看连接日志',
           },
           retrying: '重试中',
-          dropped: '已断线，正在重连',
+          /** Prefix for an action this surface cannot perform itself (see EXPLAINED_ACTIONS). */
+          nextStep: '下一步',
           droppedAt: when => `已断线，正在重连（${when} 断开）`,
           recovered: count => `已重连 ${count} 次`,
           /** Which rung of the ladder this is. Past the ladder it is a steady retry. */
@@ -254,7 +254,7 @@ window.__ModuleLoader__.load({
           phases: {
             probe: 'Identifying the remote environment',
             install: 'Installing the remote Harness',
-            build: 'Building the runtime on the node',
+            build: 'Preparing the node runtime',
             provision: 'Sending models and credentials',
             start: 'Starting the remote service',
             verify: 'Verifying the remote session channel',
@@ -262,7 +262,7 @@ window.__ModuleLoader__.load({
           /** How a node's runtime arrived. Shown only when the Host reported it. */
           runtimeVia: {
             artefact: 'Runtime: downloaded artefact',
-            npm: 'Runtime: built on the node by an older plugin (a reconnect replaces it)',
+            npm: 'Runtime: a tree installed by an older plugin (kept while its version and build match)',
           },
           missingSecret: 'No password or private key is stored yet.',
           /** Why a connect failed, as one sentence plus the one action worth offering. */
@@ -293,7 +293,8 @@ window.__ModuleLoader__.load({
             'inspect-log': 'Open the connection log',
           },
           retrying: 'retrying',
-          dropped: 'Disconnected, reconnecting',
+          /** Prefix for an action this surface cannot perform itself (see EXPLAINED_ACTIONS). */
+          nextStep: 'Next step',
           droppedAt: when => `Disconnected, reconnecting (since ${when})`,
           recovered: count => `Reconnected ${String(count)} time(s)`,
           /** Which rung of the ladder this is. Past the ladder it is a steady retry. */
@@ -333,6 +334,8 @@ window.__ModuleLoader__.load({
           pluginNoNodes: 'No node is connected; the switch is remembered and applies on connect',
           pluginsNone: 'No third-party plugin is installed on this machine. Once one is, it is sent to nodes automatically and you can switch it off here.',
           pluginFailed: 'The plugin list is not composed yet',
+          pluginOnHint: 'Sent to this node',
+          pluginOffHint: 'Runs on this machine only',
           pickFolder: 'Choose a workspace folder',
           machine: 'On which machine',
           chooseDevice: 'Choose a device',
@@ -603,9 +606,17 @@ window.__ModuleLoader__.load({
         fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)',
       },
       phases: { display: 'flex', flexDirection: 'column', gap: 4, padding: '0 0 6px' },
-      phase: active => ({
+      /**
+       * One row of the phase timeline. `failed` paints the step the attempt died in with the
+       * error colour: on a failed connect the timeline is the only thing that says *where* it
+       * stopped, so that row has to be the one that stands out rather than the one that
+       * happens to be current.
+       */
+      phase: (active, failed = false) => ({
         fontSize: 12, lineHeight: '18px',
-        color: active ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-tertiary)',
+        color: active
+          ? (failed ? 'var(--dsw-alias-label-error)' : 'var(--dsw-alias-label-primary)')
+          : 'var(--dsw-alias-label-tertiary)',
         fontWeight: active ? 500 : 400,
       }),
       /**
@@ -718,19 +729,26 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * One phase timeline while a node connects.
+     * One phase timeline: while a node connects, and after it fails.
      *
      * There is no separate "build" row and no per-route label any more: the runtime arrives
      * one way (a downloaded artefact), so the row that installs it is always the same row.
      * The `runtimeVia` prop is still read, because a node connected before build 4 carries a
      * stamp from the removed route and the settings page should name it rather than hide it.
      *
+     * **The timeline outlives the attempt.** The Host keeps `phase` and `phaseStartedAt` on a
+     * failure on purpose (`host/rnh.js`: "which step did it die in" is the most useful fact
+     * about a failed connect), so rendering it only for `connecting` threw that fact away at
+     * exactly the moment it mattered. `failed` paints the step it died in with the error
+     * colour: a timeline whose current row looks like every other row would say where it
+     * stopped but not that it stopped.
+     *
      * The clock beside the current step is the whole point of the row. A five-step timeline
      * with no time on it reads identically at two seconds and at four minutes, and those are
      * the two cases a person needs to tell apart. `phaseStartedAt` is the Host's own
      * timestamp, so the number survives a page reload mid-connect.
      */
-    function PhaseList({ phase, runtimeVia, phaseStartedAt }) {
+    function PhaseList({ phase, runtimeVia, phaseStartedAt, failed }) {
       const order = ['probe', 'install', 'provision', 'start', 'verify']
       const at = order.indexOf(phase ?? '')
       const label = id => (id === 'install' && runtimeVia === 'npm' ? T.phases.build : T.phases[id] ?? id)
@@ -745,7 +763,10 @@ window.__ModuleLoader__.load({
         ? undefined
         : Math.max(0, Math.round((Date.now() - phaseStartedAt) / 1000))
       return h('div', { style: styles.phases },
-        order.map((id, index) => h('div', { key: id, style: styles.phase(index === at) }, label(id))),
+        order.map((id, index) => h('div', {
+          key: id,
+          style: styles.phase(index === at, failed === true),
+        }, label(id))),
         elapsed === undefined ? null : h('span', { style: styles.meta }, T.phasesElapsed(elapsed)))
     }
 
@@ -1543,12 +1564,18 @@ window.__ModuleLoader__.load({
               }, T.remove),
               h('button', { type: 'button', style: styles.link, onClick: () => setConfirming(false) }, T.cancel))
           : null,
-        connecting && node.phase !== undefined
+        // **Any node that has a phase renders the timeline, whatever its state.** The Host
+        // keeps `phase`/`phaseStartedAt` on a failed connect on purpose, so requiring
+        // `connecting` here hid exactly the fact it went out of its way to keep. On `failed`
+        // the step it died in is painted with the error colour; the transfer numbers below
+        // still only exist while connecting, because a failed attempt has no bytes in flight.
+        node.phase !== undefined
           ? h('div', { style: styles.cardReason },
               h(PhaseList, {
                 phase: node.phase,
                 runtimeVia: node.runtimeVia,
                 phaseStartedAt: node.phaseStartedAt,
+                failed: node.state === 'failed',
               }),
               // Bytes while the runtime archive arrives. Absent on every connect after the
               // first, because there is nothing left to download then.
@@ -1563,10 +1590,10 @@ window.__ModuleLoader__.load({
         // difference between waiting and going to look at the machine.
         node.state === 'idle' && node.droppedAt !== undefined
           ? h('div', { style: styles.cardReason },
+              // `droppedAt` is guaranteed by the condition above, so there is no
+              // "dropped, no time" branch to render — it used to be a dead `T.dropped`.
               h('span', { style: styles.meta },
-                node.droppedAt === undefined
-                  ? T.dropped
-                  : T.droppedAt(new Date(node.droppedAt).toLocaleTimeString())),
+                T.droppedAt(new Date(node.droppedAt).toLocaleTimeString())),
               node.recoveryAttempts === undefined
                 ? null
                 : h('span', { style: styles.meta },
@@ -1576,9 +1603,11 @@ window.__ModuleLoader__.load({
           ? h('div', { style: styles.cardReason },
               h('span', { style: styles.meta }, T.recovered(node.recoveries)))
           : null,
-        // A node that built its own runtime says so on its own line: it is the one fact
-        // that explains why this machine behaves differently from its neighbours, and it is
-        // not something a person could infer from the version.
+        // A node's runtime route says so on its own line: it is the one fact that explains
+        // why this machine behaves differently from its neighbours, and it is not something a
+        // person could infer from the version. Only on `connected`: the route is read from a
+        // tree that is in service, and `describeStatus` also reports it on `failed` — showing
+        // it there would be a behaviour change this batch does not make.
         connected && node.runtimeVia !== undefined && T.runtimeVia[node.runtimeVia] !== undefined
           ? h('div', { style: styles.cardReason, title: T.runtimeVia[node.runtimeVia] },
               h('span', { style: styles.meta }, T.runtimeVia[node.runtimeVia]))
@@ -1591,7 +1620,18 @@ window.__ModuleLoader__.load({
           ? h('div', { style: styles.cardReason },
               h(NodeWorkspaces, { nodeId: node.id, workspaces, onAdded: onAction === undefined ? undefined : onRefresh }))
           : null,
-        node.error !== undefined
+        // The failure block belongs to `failed` and nothing else. On `idle`/`stopping` a
+        // leftover `error` is the sentence from an attempt that no longer exists — after
+        // "edit and save" or "disconnect", the card would show an unconnected node wearing a
+        // red "could not connect + edit credential" block, which describes a connection that
+        // is not being attempted. Hiding it loses nothing that is still true: the sentence is
+        // stale, and it comes back with the next failed attempt. The trade-off is deliberate:
+        // the block also carries this card's only "connection log" toggle, so on a residual
+        // `idle + error` there is no log button here — accepted because the Host keeps `error`
+        // only on `failed` (`host/node-status.js` invariant 3), so whenever there is a failure
+        // worth reading the log for, the block and its toggle are there. The stale-state
+        // window only exists for a snapshot produced by an older Host.
+        node.state === 'failed'
           ? h('div', { style: styles.cardReason },
               h(FailureBlock, {
                 node,
@@ -1610,6 +1650,17 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The actions that are deliberately **not** a button on this surface.
+     *
+     * Each of them asks the person to do something this page cannot do — install a newer Node
+     * on the node, upgrade the desktop, or read the connection log — so a button would be a
+     * lie. Leaving them as silence was worse: the sentence says *what* went wrong ("the
+     * machine's Node.js is too old") and the action is the only part that says *what next*.
+     * So the action text is rendered as one plain line instead of a control.
+     */
+    const EXPLAINED_ACTIONS = Object.freeze(['upgrade-node', 'upgrade-desktop', 'inspect-log'])
+
+    /**
      * Why a connect failed, and the one thing to do about it.
      *
      * The Host classifies every failure into a code (`core/errors.js`) and sends
@@ -1626,7 +1677,6 @@ window.__ModuleLoader__.load({
      */
     function FailureBlock({ node, onAction, onEdit, onResetHostKey }) {
       const [open, setOpen] = useState(false)
-      const [showLog, setShowLog] = useState(false)
       const [copied, setCopied] = useState(false)
       const failure = node.failure
       const sentence = failure === undefined
@@ -1658,6 +1708,12 @@ window.__ModuleLoader__.load({
             return undefined
         }
       })()
+      // The action that has no button still has a sentence: see EXPLAINED_ACTIONS. Kept as a
+      // separate value rather than a `default:` branch of `control` so the "no control" case
+      // stays an explicit absence.
+      const explained = EXPLAINED_ACTIONS.includes(failure?.action)
+        ? T.actions[failure.action]
+        : undefined
       const retryAlso = failure?.retryable === true && control?.verb !== 'connect'
       const copyError = () => {
         const lines = [
@@ -1675,6 +1731,9 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.failureHead },
           h('strong', null, `${T.errorTitle}: `),
           h('span', null, sentence),
+          explained === undefined
+            ? null
+            : h('span', { style: styles.meta }, `${T.nextStep}: ${explained}`),
           control === undefined
             ? null
             : h('button', {
@@ -1695,7 +1754,7 @@ window.__ModuleLoader__.load({
             style: styles.link,
             onClick: () => setOpen(current => !current),
           }, open ? T.back : T.showLog)),
-        open || showLog
+        open
           ? h(NodeLogPanel, { nodeId: node.id })
           : h('div', { style: styles.failureDetail }, node.error),
       )
@@ -1889,6 +1948,11 @@ window.__ModuleLoader__.load({
 
     /** Shared rnh state: one poll loop per mounted surface. */
     function useRnh() {
+      // `loading` is tracked but deliberately **not consumed** yet: the first render happens
+      // before the first poll answers, so the page shows the "no remote nodes yet" empty state
+      // for one frame even on a profile with nodes. Fixing that means branching the empty
+      // state on `loading` in `RnhBody`, which is a change to how the whole page decides
+      // "nothing to show" — out of scope here, so the field stays and this note says why.
       const [state, setState] = useState({ loading: true, error: undefined, nodes: [], version: '', workspaces: [] })
       const timer = useRef()
       const load = useCallback(async () => {
