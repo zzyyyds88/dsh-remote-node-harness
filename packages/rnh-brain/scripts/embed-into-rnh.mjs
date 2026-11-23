@@ -55,6 +55,9 @@ const source = `/**
  *   cd packages/rnh-brain
  *   node scripts/sync-from-upstream.mjs && node scripts/embed-into-rnh.mjs
  *
+ * Embedded sources (${String(FILES.length)}):
+${FILES.map(path => ` *   ${path}`).join('\n')}
+ *
  * @module @greatbaby/dsh-remote-node-harness/host/brain-bundle.generated
  */
 

@@ -7,6 +7,15 @@
  *   cd packages/rnh-brain
  *   node scripts/sync-from-upstream.mjs && node scripts/embed-into-rnh.mjs
  *
+ * Embedded sources (7):
+ *   package.json
+ *   cordis.patch.yml
+ *   presets/cordis.patch.yml
+ *   presets/minimal.patch.yml
+ *   presets/ptc.patch.yml
+ *   presets/standard.patch.yml
+ *   src/runtime.js
+ *
  * @module @greatbaby/dsh-remote-node-harness/host/brain-bundle.generated
  */
 
@@ -157,7 +166,7 @@ export const BRAIN_FILES = Object.freeze({
     - id: settings-controller
       name: '@deepseek-ai/dsh-api-settings-controller'
 
-    # One shared MCP server rnh: Settings-configured servers plus servers
+    # One shared MCP server fleet: Settings-configured servers plus servers
     # that installed plugins register, with status and recovery over Remote.
     # Credential templates and OAuth grants resolve through the credentials
     # provider, so the manager starts after it.
