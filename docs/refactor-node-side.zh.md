@@ -78,6 +78,19 @@
 | F4 | `ws.js` 只处理未分片消息，`encodeControl` 在长度 ≥126 时位模式冲突会发出**损坏帧**（PONG 回显不截断到 125 字节即触发）。 | 代码路径确定 |
 | F5 | `remoteRoot` 只校验「非空字符串」，随后**不加引号**插入 `sh -c`（`daemon.js` 十余处 `mkdir -p ${run}` / `cd ${runtime}` / `rm -f ${status}`）。带空格就崩，带 `;`/`$( )` 就是远端命令注入，入口是设置页。`artefact.js:547` 的 `quote()` 也不转义内部单引号，而同一仓库 `transfer-progress.js:39` 有正确实现却没被复用。 | 代码路径确定 |
 
+### 2.4b 核心与接线层（最后一批审计补上的，含一条实测）
+
+| # | 缺陷 | 证据 |
+|---|---|---|
+| G1 | **换过主机密钥的节点，唯一有用的按钮永不出现**：ssh2 拒绝 host key 时的错误文本是字面量 `Host denied (verification failed)`（`node_modules/ssh2/lib/protocol/kex.js:1210`），而 `connection.js:93` 的正则只认 `/host key\|hostkey\|man-in-the-middle\|fingerprint/` → `classifySshError` 归 `unknown` → `classifyFailure` 按阶段（`probe`）归成 `ssh-network`，`retryable: true`。界面显示「连不上那台机器 / 检查网络 / 重试」，点重试无限循环。 | 本地实测 `classifySshError` → `unknown`、`sshCategory=unknown`、`classifyFailure(phase=probe)` → `ssh-network/check-network/retryable:true` |
+| G2 | **`nodes.json` 只坏一个字段，整张节点表静默清零**：`#load` 在读取失败、解析失败、任一 `normalizeNode` 校验失败时都置 `[]`（`registry.js:188-203`），而下一次任何 `put/remove/recordOutcome` 都会把这张空表写回（`:205-217`）。无 `.corrupt` 备份、无告警。 | 代码路径确定 |
+| G3 | **校验错误返回 500 而不是 400**：`normalizeNode` 的 8 处裸 `Error`（`registry.js:58-72`）没有 `code`，`describeFailure` 兜底 500/`rnh-failed`。同类还有 `rnh.js:443`（把 `node-ahead` 语义丢成裸 `Error`，最后显示成「运行时装不上」；而 `index.js:309` 的 reinstall 分支是对的——两条路径不一致）、`rnh.js:519/522`。 | 实测：`normalizeNode({name:''})` → `{"status":500,"code":"rnh-failed"}` |
+| G4 | **「某个命名空间没被路由」的唯一证据走 `console.log`**（`index.js:601/606/613`、`decorators.js:264/266`）：不进 Host 日志、不参与脱敏。而 `index.js:580-584` 的注释正好在警告这种静默，紧接着 559-572 就有 4 处用同一模式。 | 代码路径确定 |
+| G5 | `daemon.js:790/802/736/927` 把 `layout.profile` / `manifestPath` / 包名直接插进 `sh -c`；同仓 `connection.js:612-623` 有正确的 `quotePosixArgument`、`browse.js:390-404` 用位置参数 `sh -c '… "$1"' _ <path>` —— 说明不是做不到，是没复用。 | 代码路径确定（与 F5 同源） |
+| G6 | 两套 teardown 所有权：`disposers` 数组与 `ctx.effect` 同时持有同一批回调（`index.js:744-762`），卸载时双重 dispose，靠 `catch {}` 掩盖。 | 代码路径确定 |
+| G7 | 死路由：`POST /workspaces/:id/rename`（`index.js:464`）与 `PATCH /nodes/:id`（`:239`）全仓无调用方；`provideRnhControl`（`rnh-control.js:287`）、`secrets.describe`（`secrets.js:91`）、`requiresProvisioning`、`jumpHost`、`auth.secretRef` 同理。 | 全仓 grep 确认 |
+| G8 | `node-control` 的 schema 说 `auth` 用于 add **和 update**（`node-control/index.js:157`），但 `update` 分支（`:206-221`）根本不往下传 `auth` —— 模型按描述改凭据会「成功」却没改动任何东西。 | 代码路径确定 |
+
 ### 2.5 死代码与重复实现（重写时要一并收掉）
 
 - `ChangeSignal`（`routing.js:194`）、`sessionStream` / `workspaceEndpoint` / `encode` / `toFailure` / `SESSION_REQUEST_KEYS`（`router.js`）、`installedVersionScript` / `installedBuildScript`（`artefact.js:669,683`）、`uninstallPlugins`（`daemon.js:733`）、`SecretStore.describe`（`secrets.js:91`）、`PROVISION_FAILURES`（`daemon.js:993`）——全部无消费者。
@@ -291,33 +304,38 @@ src/
 
 **批 0：止血（不改变架构，1 天内可完成）**
 
-1. 修 D1（阶梯 attempts 移入 `recovering` 载荷，`cancelTimer` 只清 timer）；
-2. 修 D3（agent kind 可写入、`credentialsReady` 对 agent 返回 true）；
-3. 修 B5（`printf` 的转义）；
-4. 修 A1（rollback 加「当前 runtime 是否可用」判据，或先改成不动 runtime）；
-5. 修 C1 的对外表现（节点不宣告跑不了的 office 工具）。
+1. 修 G1（host-key 判定不再依赖 ssh2 文本：在 mismatch 分支给 error 打标，或按 `level==='handshake'` + `/host denied/i` 补规则 + 单测）——这条是**唯一让用户卡死在无限重试里**的界面缺陷；
+2. 修 G2（`nodes.json` 解析失败先改名 `.corrupt-<ts>` 再置空，别让下一次写把证据抹掉）；
+3. 修 G3（`normalizeNode` 的校验错误带 `code:'node-invalid'` → 400；`rnh.js:443` 给 `node-ahead` 打标）；
+4. 修 D1（阶梯 attempts 移入 `recovering` 载荷，`cancelTimer` 只清 timer）；
+5. 修 D3（agent kind 可写入、`credentialsReady` 对 agent 返回 true）；
+6. 修 B5（`printf` 的转义）；
+7. 修 A1（rollback 加「当前 runtime 是否可用」判据，或先改成不动 runtime）；
+8. 修 C1 的对外表现（节点不宣告跑不了的 office 工具）。
 
-批 0 的验收：`fork-runtime-unit` + 新增 `recovery-ladder-unit`（假时钟断言 2/4/8/120 s）+ 真节点一次首连。
+批 0 的验收：`fork-runtime-unit` + 新增 `recovery-ladder-unit`（假时钟断言 2/4/8/120 s）+ `errors-unit` 补 host-key 文本一条 + 真节点一次首连。
 
 **批 1：闸门（让同类 bug 以后自己变红）**
 
-6. `fork-runtime-unit` 改成依赖闭包检查，夹具写真实 `dependencies`；
-7. 加 `check-capabilities.mjs` 做「26 处声明 vs 注册表」对账（先只打印不失败，拿到真实差异表）；
-8. 加「CI 跑 `sync && embed` 后 `git diff --exit-code`」。
+9. `fork-runtime-unit` 改成依赖闭包检查，夹具写真实 `dependencies`；
+10. 加 `check-capabilities.mjs` 做「26 处声明 vs 注册表」对账（先只打印不失败，拿到真实差异表）；
+11. 加「CI 跑 `sync && embed` 后 `git diff --exit-code`」；
+12. 加一条测试把 `client.js` 的 `T.failures`/`T.actions` 键集合与 `ERROR_CODES`/`ERROR_ACTIONS` 绑起来（现在靠人肉同步）。
 
 **批 2：能力单一真源（§四）**
 
-9. 落 `capabilities.mjs` 数据（先把今天 26 处抄进去当现状快照）；
-10. 切 trim 的 keep 集到派生 + 闭包回验；
-11. 切 presets 到「照抄 + 减」；
-12. 收敛三份 `BRAIN_BUNDLES` 与四份 bundle 名。
+13. 落 `capabilities.mjs` 数据（先把今天 26 处抄进去当现状快照）；
+14. 切 trim 的 keep 集到派生 + 闭包回验；
+15. 切 presets 到「照抄 + 减」；
+16. 收敛三份 `BRAIN_BUNDLES` 与四份 bundle 名；
+17. 删 `RETAINED`（它今天 0 命中，保留机制事实上从未生效，改成派生的 keep 集合差）。
 
 **批 3：安装事务化（§五）**
 
-13. 脚本走 stdin + JSON 结果通道（先只改 `installScript`，顺手消灭 F5 的引号类）；
-14. 符号链接 + 一代目录，删 `rollbackScript` 与 `daemon.js:438-444` 的分支；
-15. 进程身份校验（B7/B8）；
-16. 进度路径（E6）与 npm bootstrap（B5 的正式解）。
+18. 脚本走 stdin + JSON 结果通道（先只改 `installScript`，顺手消灭 F5/G5 的引号类）；
+19. 符号链接 + 一代目录，删 `rollbackScript` 与 `daemon.js:438-444` 的分支；
+20. 进程身份校验（B7/B8）；
+21. 进度路径（E6）与 npm bootstrap（B5 的正式解）。
 
 **批 4：状态机（§六）**
 
@@ -347,7 +365,7 @@ src/
 - **不改 DSH Go 与 `ds-harness-remote` 两个仓库**（GOAL §七-3；唯一例外仍是 ADR-0008 的产物补丁）。
 - **不为了整齐而抽基类**：`rnh-control` 是 agent 工具面，与路由/事件无关，不塞进同一个抽象；`remote-waterfall` 与 `remote-events` 共享的是流不是逻辑。
 - **不顺手重构没有缺陷的模块**：`multipart.js` 已接近纯模块模板，只补大小上限；`transfer-progress` 的算术是对的（`transfer-unit` 25 条断言覆盖），只修路径解析。
-- **不删除 `.previous` 之外的任何回滚能力**：一代备份是刻意保留的，不是可以省的磁盘。
+- **不删除一代备份**：`runtime.<n-1>` 是回滚能力，不是可以省的磁盘。改了符号链接模型之后它只在切换时被读，删了就没有退路。
 
 ## 十二、待确认
 
