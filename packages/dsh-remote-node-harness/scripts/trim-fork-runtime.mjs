@@ -10,11 +10,30 @@
  *
  * | | before | after |
  * |---|---|---|
- * | whole tree | 2014.6 MiB | 1185.8 MiB |
+ * | whole tree | 2014.6 MiB | 1185.8 MiB (old rules) / ~1335.5 MiB (now, derived) |
  * | `dsh-client-ui-*` | 78.8 MiB / 65 packages | 0 |
  * | `dsh-web-frontend` | 20.1 MiB | 0 |
- * | `libreoffice-kit*` | 339.5 MiB | 0 |
+ * | `libreoffice-kit-win32-*` / `-darwin-*` | 189.7 MiB (win32-x64, unpacked) | 0 |
+ * | `libreoffice-kit` (driver) + `libreoffice-kit-wasm` | 149.7 MiB (4.4 + 145.3) | 149.7 MiB (kept) |
  * | `dsh-experimental-*` | 111.3 MiB / 41 packages | 0 |
+ *
+ * ## The Office engine, and the closure bug this trim shipped
+ *
+ * The first version of {@link DROP_RULES} dropped `^libreoffice-kit` — the whole family,
+ * 339.5 MiB. That did remove the native engines, but it also took the two packages a
+ * Linux node needs: the driver (`@deepseek-ai/libreoffice-kit`, 4.4 MiB unpacked) and the
+ * portable WASM engine it selects on Linux (`@deepseek-ai/libreoffice-kit-wasm`,
+ * 145.3 MiB). `dsh-office-kit` itself stayed, because a kept row imports it — so the node
+ * advertised `office_render` / `office_convert` / `office_recalculate` while every call
+ * failed at `import.meta.resolve('@deepseek-ai/libreoffice-kit')`.
+ *
+ * The rule now drops only native engines for platforms this artefact does not target, and
+ * keeps the driver plus the WASM engine. The tree is therefore 149.7 MiB heavier than the
+ * old `after` column (1185.8 → 1335.5 MiB); that is the price of the Office capability,
+ * decided deliberately rather than a regression. The `before` column and the per-package
+ * figures were measured on the rc.5 staging tree; **1335.5 MiB has not been re-measured
+ * end to end** — only the arithmetic from those package sizes. The build acceptance owns
+ * that measurement; this module owns the rules.
  *
  * ## `@deepseek-ai/dsh-web-app` stays, and that is not an oversight
  *
@@ -49,6 +68,7 @@
  */
 import { existsSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { basename, join, relative } from 'node:path'
+import { keptPackages } from '../../rnh-brain/capabilities.mjs'
 
 /**
  * Build residue no runtime reads: type declarations, TypeScript sources, source maps,
@@ -165,27 +185,55 @@ export function foreignPlatformResidue(platform) {
   return patterns
 }
 
-/** Packages a kept host-plane row imports at runtime, so they survive the trim. */
-export const RETAINED = Object.freeze([
-  // The manifest that declares the dependency closure the brain's kept rows need.
-  '@deepseek-ai/dsh-web-app',
-  // Office host rows the brain composition keeps.
-  '@deepseek-ai/dsh-office-kit',
-  '@deepseek-ai/dsh-skill-office',
-  '@deepseek-ai/dsh-tool-office',
-])
+/**
+ * Packages a kept host-plane row imports at runtime, so they survive the trim.
+ *
+ * **Derived, not listed.** The names come from `packages/rnh-brain/capabilities.mjs`, which is
+ * the one place this project says what a node can do: a package survives because an *enabled
+ * capability* names it, not because somebody remembered to add it here. The list used to be
+ * written out in this file, and that is how the Office row came to be kept while the engine it
+ * resolves at call time was deleted — two lists, two files, no cross-check.
+ *
+ * Two retention lists, two key shapes, and that asymmetry is a known defect rather than a
+ * design: this list holds **full names** (`@deepseek-ai/…`) and is compared against full names
+ * in {@link dropPackages}, while {@link DROP_RULES} is matched against the **bare directory
+ * name**. Reconciling those two key spaces changes what the build drops, which is a separate
+ * decision from where the names come from; `check-capabilities` asserts the derivation today.
+ *
+ * `capabilities.mjs` is a build-time import: this script is not published (`package.json`'s
+ * `files` excludes `scripts/`), so reaching across to the sibling package costs nothing at
+ * runtime and cannot create an inter-package dependency for anyone installing the plugin.
+ */
+export const RETAINED = Object.freeze(keptPackages())
 
 /**
  * Removal rules, applied to the `@deepseek-ai` scope by package name.
  *
  * Each entry says why nothing the brain keeps can reach that package. A rule that
  * cannot state its reason is not a rule; it is a guess with a regular expression.
+ *
+ * **The patterns are matched against the bare directory name**
+ * (`libreoffice-kit-win32-x64`, no scope), because that is what {@link dropPackages}
+ * reads out of `node_modules/@deepseek-ai`; {@link RETAINED} is compared against the
+ * full name. A rule written with the scope would therefore match nothing. That
+ * asymmetry — one key space for rules, another for retention — is a known defect,
+ * left alone here on purpose: changing it changes what the build drops, which is a
+ * capability-inventory decision, not a regex tidy-up.
  * @type {ReadonlyArray<readonly [RegExp, string]>}
  */
 export const DROP_RULES = Object.freeze([
   [/^dsh-client-ui-/u, 'a browser window this node does not have'],
   [/^dsh-web-frontend$/u, 'the SPA dist the brain never serves'],
-  [/^libreoffice-kit/u, 'document conversion the node never runs; the win32 engine alone is 189.7 MiB'],
+  // Only the *native* engines of a platform this artefact does not target. The rule used
+  // to be `^libreoffice-kit`, which also removed the driver
+  // (`@deepseek-ai/libreoffice-kit`) and the WASM engine — exactly the two packages
+  // `dsh-office-kit` resolves on Linux — so the node advertised Office tools whose every
+  // call threw. Linux is the only published platform and selects WASM, therefore the
+  // win32/darwin native payloads are the only part of the family no node here can reach.
+  // `@deepseek-ai/libreoffice-kit` also lists unscoped `koffi` in its
+  // `optionalDependencies`; this walk only scans the `@deepseek-ai` scope, so `koffi` is
+  // never a candidate — nothing is missing, it is outside this scope by construction.
+  [/^libreoffice-kit-(?:win32|darwin)-/u, 'native engine for a platform this artefact does not target; the portable WASM engine is what Linux uses'],
   [/^dsh-experimental-/u, 'evaluated capabilities with no product commitment; none is a row in the brain composition'],
   [/^dsh-cua(?:-|$)/u, 'computer use: needs a screen on the node'],
   [/^dsh-browser-use$/u, 'browser automation: needs a browser on the node'],
@@ -195,6 +243,97 @@ export const DROP_RULES = Object.freeze([
   [/^dsh-hooks-(?:claude-code|codex)$/u, 'editor hooks for a developer machine'],
   [/^dsh-(?:llm-mock-server|llm-replay|loader-smoke|session-snapshot|remote-mock|tool-testkit|agent-loop-testkit|typert-generator)$/u, 'test and replay tooling'],
 ])
+
+/**
+ * Packages that must survive: the retained set plus their runtime dependency closure.
+ *
+ * This answers the question the trim rules were never asked: not "does a kept name
+ * happen to match a drop rule" (those are two different lists over two different key
+ * spaces) but **"can a package a kept package depends on be deleted?"** The bug that
+ * made Office uncallable on every node was exactly that shape — `dsh-office-kit` was
+ * retained, `@deepseek-ai/libreoffice-kit` was dropped by prefix, and nothing compared
+ * the two.
+ *
+ * Edges are followed only where npm guarantees installation:
+ *
+ * - `dependencies`: followed. The package is required at runtime, so its own
+ *   dependencies are required too.
+ * - `devDependencies`: **not** followed. They are absent from a production install,
+ *   and following them would keep test tooling in a node's tree.
+ * - `peerDependencies`: their **names are collected, but not walked**. A peer is
+ *   supplied by the composition, not by the package that names it, so the name is a
+ *   real declaration worth checking against the drop list, while walking the peer's
+ *   own manifest would import a closure this package does not own.
+ * - `optionalDependencies`: **not** followed at all. "Optional" means the install is
+ *   correct without it, and this is what lets a Linux node drop
+ *   `libreoffice-kit-win32-x64` / `-darwin-*` (they are optional dependencies of
+ *   `@deepseek-ai/libreoffice-kit`) without making the driver's closure incomplete.
+ *
+ * A dependency whose manifest is missing from the tree is reported by name and not
+ * walked: that is a gap {@link unresolvedInTree} is for, and silently treating it as
+ * a leaf would hide a broken install inside the keep set.
+ * @param {(name: string) => {dependencies?: Record<string, string>, peerDependencies?: Record<string, string>} | undefined} manifestOf
+ *   reads one package manifest by full name; `undefined` means "not in the tree".
+ * @param {ReadonlyArray<string>} [roots] - full package names to start from.
+ * @returns {Set<string>} every full name the kept composition cannot lose.
+ */
+export function keepClosure(manifestOf, roots = RETAINED) {
+  const keep = new Set()
+  const walked = new Set()
+  const pending = [...roots]
+  while (pending.length > 0) {
+    const name = pending.pop()
+    keep.add(name)
+    // A name can enter the closure twice — once as a peer (collected only) and once as a
+    // real dependency (which must be walked). Marking it walked only here keeps the
+    // second arrival from suppressing the traversal, while the first still records the
+    // name. Dropping that distinction made a peer that is also a dependency lose its
+    // own subtree.
+    if (walked.has(name)) continue
+    walked.add(name)
+    const manifest = manifestOf(name)
+    if (manifest === undefined) continue
+    for (const dependency of Object.keys(manifest.dependencies ?? {})) pending.push(dependency)
+    // Peers are collected by name and never walked: a peer is supplied by the
+    // composition rather than by this package, so its own closure is not this package's.
+    for (const peer of Object.keys(manifest.peerDependencies ?? {})) keep.add(peer)
+  }
+  return keep
+}
+
+/**
+ * Assert every package the kept composition resolves actually exists in the staged tree.
+ *
+ * The keep set and the drop rules can agree with each other and still ship an archive
+ * a node cannot boot: the rules only look at what is *present* in the staging tree, so
+ * a package the resolver never installed is invisible to them. This probe asks the
+ * question a node will ask on first call — "can this specifier be resolved from this
+ * tree?" — and lets the build refuse the archive instead of discovering it later.
+ *
+ * It deliberately does **not** use `import.meta.resolve`: that resolves against *this*
+ * process's `node_modules` (the repository's), not against `root`, so it would answer
+ * about the build machine instead of the artefact.
+ *
+ * **`root` is sealed.** Node's algorithm climbs parent directories, and copying that
+ * literally would be a trap here: the fork build stages at `<fork>/stage/<platform>`,
+ * directly under a checkout with its own `node_modules`, so a climb would "resolve"
+ * packages that are not in the archive at all. The walk therefore stops at `root`:
+ * `<root>/node_modules/<name>/package.json`, scope kept as two path segments.
+ * @param {string} root - unpacked runtime tree, `node_modules` at its top.
+ * @param {ReadonlyArray<string>} specifiers - bare package names, e.g. `@deepseek-ai/libreoffice-kit`.
+ * @returns {{ missing: string[] }} the specifiers with no manifest in the tree.
+ */
+export function unresolvedInTree(root, specifiers) {
+  const missing = []
+  for (const specifier of specifiers) {
+    const parts = String(specifier).split('/')
+    const segments = parts[0].startsWith('@') ? parts.slice(0, 2) : parts.slice(0, 1)
+    const candidate = join(root, 'node_modules', ...segments, 'package.json')
+    const present = existsSync(candidate) && statSync(candidate).isFile()
+    if (!present) missing.push(String(specifier))
+  }
+  return { missing }
+}
 
 /** Measure a file or a directory tree. */
 function measure(entry) {

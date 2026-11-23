@@ -19,14 +19,33 @@
  * @module @greatbaby/dsh-remote-node-harness/core/plugin-sync
  */
 
-/** Bundles a node always composes, so they are never a choice. */
-export const UPSTREAM_BUNDLES = Object.freeze([
-  '@deepseek-ai/dsh-base',
-  '@deepseek-ai/dsh-web-app',
-])
+/** The upstream bundle a node is built on: the half that is not the browser. */
+export const NODE_BUNDLE_BASE = '@deepseek-ai/dsh-base'
+
+/** The upstream bundle a node is a **subtraction from**: its rows are what the brain keeps. */
+export const NODE_BUNDLE_UPSTREAM_SURFACE = '@deepseek-ai/dsh-web-app'
+
+/**
+ * Bundles a node always composes, so they are never a choice.
+ *
+ * Both names are exported on their own as well, because two callers need one of them each and
+ * used to spell it themselves: `rnh.js` assembles the profile's bundle list, and
+ * `sync-switches.js` filters a user's switches against it. A literal in those files had already
+ * drifted once from this list, and a drifted literal is invisible until a node fails to boot.
+ */
+export const UPSTREAM_BUNDLES = Object.freeze([NODE_BUNDLE_BASE, NODE_BUNDLE_UPSTREAM_SURFACE])
 
 /** This plugin's node-side bundle: the thing that makes a node a brain. */
 export const BRAIN_PACKAGE = '@local/rnh-brain'
+
+/**
+ * The bundles a node composes by construction, in compose order.
+ *
+ * **The one list.** `rnh.js` builds a node's profile from it and re-exports it as
+ * `BRAIN_BUNDLES`; `sync-switches.js` filters a user's switches against it. The brain has to
+ * come after the base it subtracts from, and it does, in this order.
+ */
+export const NODE_BASE_BUNDLES = Object.freeze([NODE_BUNDLE_BASE, BRAIN_PACKAGE])
 
 /**
  * This plugin's own package name.

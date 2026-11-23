@@ -2,8 +2,8 @@
  * The fork-runtime build: which packages a brain tree keeps, and what it refuses to
  * hand to npm.
  *
- * Two rules from that script decide whether a node can boot at all, and both were
- * measured rather than guessed, so both get an assertion:
+ * Three rules from that script decide whether a node can boot at all, and all three
+ * were measured rather than guessed, so all three get an assertion:
  *
  * 1. **`@deepseek-ai/dsh-web-app` is retained even though the brain never loads it.**
  *    Upstream resolves a profile's dependency closure through the installation's
@@ -13,11 +13,17 @@
  *    choose what to resolve *for*; they do not exempt a direct `file:` dependency
  *    from its own `os` field, so a darwin-only tarball in the staging manifest fails
  *    the whole install with `EBADPLATFORM`.
+ * 3. **Nothing a retained package depends on is dropped.** This is the gate that did
+ *    not exist, and the failure it missed shipped for a year: the Office host row was
+ *    retained, its hard dependency `@deepseek-ai/libreoffice-kit` was dropped by a
+ *    prefix rule, and the node advertised `office_*` tools whose every call threw. The
+ *    old assertion compared `RETAINED` against `DROP_RULES` *by name*; the real failure
+ *    is a relation between manifests, which is why the fixture below writes them.
  *
- * The rest of the trim is a removal list, and its risk is the opposite one: removing
- * something a kept row imports. That cannot be checked from the script alone — it is
- * checked by booting the built tree, which `docs/ARCHITECTURE.md` records as the
- * acceptance evidence for this path.
+ * Booting a built tree is still the only evidence that the whole composition loads; it
+ * belongs to the build acceptance, not here. What this file can prove is that the
+ * *rules* cannot contradict each other, and that the staged tree resolves what the kept
+ * composition names.
  *
  * Run: `node test/fork-runtime-unit.mjs`
  */
@@ -31,7 +37,9 @@ import {
   RETAINED,
   dropPackages,
   foreignPlatformResidue,
+  keepClosure,
   stripResidue,
+  unresolvedInTree,
 } from '../scripts/trim-fork-runtime.mjs'
 import { PUBLISHED_PLATFORMS, isPublishedPlatform } from '../src/remote/artefact.js'
 
@@ -42,14 +50,49 @@ const check = (ok, label, detail) => {
   if (!ok) failures.push(label)
 }
 
-/** One package directory with a manifest, so the trim has something to weigh. */
-function packageIn(root, name) {
+/**
+ * One package directory with a manifest, so the trim has something to weigh.
+ *
+ * `dependencies` is the third argument because the bug this suite exists to catch is a
+ * *relation between manifests*, and a fixture that writes only `{name, version}` erases
+ * that relation before any assertion can look at it. Writing the real edge
+ * (`dsh-office-kit` → `libreoffice-kit`) is what turns "retained ∪ dropped" into
+ * something checkable.
+ * @param {string} root
+ * @param {string} name full package name, scope included.
+ * @param {Record<string, string>} [dependencies] runtime `dependencies` of this package.
+ * @param {Record<string, Record<string, string>>} [optionalFields] extra manifest fields,
+ *   e.g. `{ optionalDependencies: { '…-win32-x64': '0.2.3' } }`.
+ */
+function packageIn(root, name, dependencies = {}, optionalFields = {}) {
   const dir = join(root, 'node_modules', ...name.split('/'))
   mkdirSync(dir, { recursive: true })
-  writeFileSync(join(dir, 'package.json'), JSON.stringify({ name, version: '0.0.0' }), 'utf8')
+  writeFileSync(join(dir, 'package.json'), JSON.stringify({
+    name,
+    version: '0.0.0',
+    ...(Object.keys(dependencies).length > 0 ? { dependencies } : {}),
+    ...optionalFields,
+  }), 'utf8')
   writeFileSync(join(dir, 'index.js'), 'export {}\n', 'utf8')
   return dir
 }
+
+/** Read the manifest the closure walk sees: by full name, `undefined` when absent. */
+function manifestsUnder(root) {
+  return name => {
+    try {
+      return JSON.parse(readFileSync(join(root, 'node_modules', ...name.split('/'), 'package.json'), 'utf8'))
+    } catch {
+      return undefined
+    }
+  }
+}
+
+/** The bare directory name `dropPackages` feeds to `DROP_RULES`. */
+const bareName = name => name.slice(name.lastIndexOf('/') + 1)
+
+/** The rules a full package name collides with, matching exactly as `dropPackages` does. */
+const collidingRules = name => DROP_RULES.filter(([pattern]) => pattern.test(bareName(name)))
 
 // ---- what the trim must keep, and why ---------------------------------------
 {
@@ -57,13 +100,167 @@ function packageIn(root, name) {
   // brain's own kept rows cannot resolve their dependencies.
   check(RETAINED.includes('@deepseek-ai/dsh-web-app'), 'the web-app manifest is retained')
   check(RETAINED.includes('@deepseek-ai/dsh-office-kit'), 'the office host row keeps its kit')
-  // A retained name must not also match a drop rule, or the two lists contradict
-  // each other and the result depends on which one the loop reaches first.
-  const contradictions = RETAINED.filter(name => DROP_RULES.some(([pattern]) => pattern.test(name.slice('@deepseek-ai/'.length))))
-  check(contradictions.length === 0, 'no retained package matches a drop rule', contradictions.join(', '))
+  check(RETAINED.includes('@deepseek-ai/libreoffice-kit'),
+    'the driver the office rows resolve at call time is retained, not just its caller')
+  check(RETAINED.includes('@deepseek-ai/libreoffice-kit-wasm'),
+    'and so is the portable engine that driver loads on this platform')
+  // The old assertion, kept because the relation it tests is still real — but labelled
+  // for what it is: a same-name cross-check between two lists over *different key
+  // spaces*. It cannot say anything about Office, and for a year it read as if it did:
+  // `dsh-office-kit` never matched a rule, while the package it depends on was dropped.
+  const contradictions = RETAINED.filter(name => collidingRules(name).length > 0)
+  check(contradictions.length === 0, 'no retained name itself matches a drop rule', contradictions.join(', '))
   // Every rule states why; a rule without a reason is a guess with a regex.
   check(DROP_RULES.every(([, reason]) => typeof reason === 'string' && reason.length > 10),
     'every drop rule states its reason')
+}
+
+// ---- the dependency closure a kept package cannot lose ----------------------
+// This is the gate the same-name check could never be. The shipped failure was not
+// "a retained name matched a rule"; it was "a package a retained package *depends on*
+// matched a rule", and no assertion looked along that edge. The fixture writes the real
+// manifests of the Office chain — including the real `optionalDependencies`, because
+// which field an edge lives in is the whole question.
+{
+  const root = mkdtempSync(join(tmpdir(), 'fork-closure-'))
+  try {
+    packageIn(root, '@deepseek-ai/dsh-web-app')
+    // The metapackage's real manifest also declares `dsh-client-ui-*`, which DROP_RULES
+    // removes on purpose: upstream resolves its closure by walking manifests and skips a
+    // declared-but-absent package (recorded as the known gap in `docs/refactor-node-side`).
+    // Modelling those edges here would make this gate red forever over a documented
+    // decision, so the fixture writes only the edges this gate is about — rooted at the
+    // Office capability, where "declared, absent, skipped" is *not* acceptable.
+    packageIn(root, '@deepseek-ai/dsh-office-kit', { '@deepseek-ai/libreoffice-kit': '0.2.3' }, {
+      // devDependencies are *not* installed into a production tree, so following them
+      // would drag test tooling into the keep set and hide a real gap behind noise.
+      devDependencies: { '@deepseek-ai/dsh-office-kit-dev-only': '0.2.3' },
+      // A peer is a composition-supplied declaration: its name is collected because it
+      // is a real declaration worth checking against the drop list, but its own subtree
+      // is not this package's to walk.
+      peerDependencies: { '@deepseek-ai/cordis': '~4.1.0' },
+    })
+    packageIn(root, '@deepseek-ai/dsh-office-kit-dev-only')
+    packageIn(root, '@deepseek-ai/dsh-skill-office')
+    packageIn(root, '@deepseek-ai/dsh-tool-office')
+    packageIn(root, '@deepseek-ai/libreoffice-kit', { fflate: '0.8.2', fontkit: '2.0.4', saxes: '6.0.0' }, {
+      optionalDependencies: {
+        koffi: '3.1.1',
+        '@deepseek-ai/libreoffice-kit-wasm': '0.2.3',
+        '@deepseek-ai/libreoffice-kit-darwin-arm64': '0.2.3',
+        '@deepseek-ai/libreoffice-kit-win32-x64': '0.2.3',
+      },
+    })
+    packageIn(root, '@deepseek-ai/libreoffice-kit-wasm')
+    packageIn(root, '@deepseek-ai/libreoffice-kit-win32-x64')
+    packageIn(root, '@deepseek-ai/dsh-client-ui-chat')
+    packageIn(root, 'fflate')
+    packageIn(root, 'fontkit')
+    packageIn(root, 'saxes')
+
+    const manifestOf = manifestsUnder(root)
+
+    // 1. The walk actually follows the edge the bug travelled along.
+    const office = keepClosure(manifestOf, ['@deepseek-ai/dsh-office-kit'])
+    check(office.has('@deepseek-ai/libreoffice-kit'),
+      'the keep closure of the office kit reaches the engine driver through dependencies',
+      [...office].join(', '))
+    check(office.has('fflate') && office.has('fontkit') && office.has('saxes'),
+      'and continues through the driver\'s own dependencies, so the walk is recursive')
+
+    // Which manifest field an edge lives in is the whole question, so each one is pinned:
+    // `dependencies` is walked, `devDependencies` is ignored (absent from a production
+    // tree), `peerDependencies` contributes its name but not its subtree.
+    packageIn(root, '@deepseek-ai/cordis', { 'cordis-inner': '1.0.0' })
+    packageIn(root, 'cordis-inner')
+    const walked = keepClosure(manifestOf, ['@deepseek-ai/dsh-office-kit'])
+    check(walked.has('@deepseek-ai/cordis'),
+      'a peer dependency\'s name enters the keep set, because it is a real declaration to check')
+    check(!walked.has('cordis-inner'),
+      'but the peer is not walked — its closure belongs to the composition, not to this package')
+    check(!walked.has('@deepseek-ai/dsh-office-kit-dev-only'),
+      'devDependencies are not followed: a production tree does not install them')
+
+    // 2. The gate: nothing the kept composition needs may be dropped. Red under
+    //    `^libreoffice-kit` (driver and engine both matched), green under the narrowed
+    //    rule. This is the assertion whose absence shipped an uncallable Office toolset.
+    const keep = keepClosure(manifestOf)
+    const forbidden = [...keep].filter(name => collidingRules(name).length > 0)
+    check(forbidden.length === 0,
+      'no package in the keep closure matches a drop rule',
+      forbidden.map(name => `${name} (${collidingRules(name).map(([, reason]) => reason).join('; ')})`).join(', '))
+
+    // 3. Optional dependencies are not followed. That is not an oversight: it is what
+    //    lets a Linux node drop the win32 payload of the same driver. `optional` means
+    //    "the install is correct without it", so treating it as required would keep
+    //    189.7 MiB of unexecutable bytes; treating it as an absence it cannot tolerate
+    //    would make the gate red for a package that is *supposed* to be gone.
+    check(!keep.has('@deepseek-ai/libreoffice-kit-win32-x64'),
+      'a foreign-platform engine declared as optionalDependencies is not in the keep closure')
+    check(!keep.has('@deepseek-ai/libreoffice-kit-darwin-arm64'),
+      'and neither is another platform\'s')
+    const driverOnly = keepClosure(manifestOf, ['@deepseek-ai/libreoffice-kit'])
+    check(!driverOnly.has('@deepseek-ai/libreoffice-kit-wasm'),
+      'the WASM engine is kept because RETAINED names it as this platform\'s engine, not because it is optional')
+    check(keep.has('@deepseek-ai/libreoffice-kit-wasm'),
+      'yet it is in the kept set all the same — the driver is useless without it on Linux')
+
+    // 4. A dependency with no manifest is kept by name and not walked: silently treating
+    //    it as a leaf would hide a broken install inside the keep set. `unresolvedInTree`
+    //    is the probe that reports it; this only pins the closure's half of the contract.
+    const partial = keepClosure(manifestOf, ['@deepseek-ai/dsh-office-kit', 'not-installed-pkg'])
+    check(partial.has('not-installed-pkg'), 'a root with no manifest is still a kept name')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+// ---- the probe: does the staged tree resolve what the composition keeps? -----
+// The keep set and the drop rules can agree perfectly and still ship an archive that
+// cannot boot, because the rules only see what is *present*. The probe asks about the
+// tree being packed, not about this checkout.
+{
+  const root = mkdtempSync(join(tmpdir(), 'fork-unresolved-'))
+  try {
+    packageIn(root, '@deepseek-ai/libreoffice-kit')
+    packageIn(root, 'fflate')
+    check(unresolvedInTree(root, ['@deepseek-ai/libreoffice-kit', 'fflate']).missing.length === 0,
+      'a present package — scoped and unscoped — is reported resolvable')
+    const missing = unresolvedInTree(root, ['@deepseek-ai/libreoffice-kit-win32-x64', 'koffi'])
+    check(missing.missing.length === 2 &&
+      missing.missing.includes('@deepseek-ai/libreoffice-kit-win32-x64') &&
+      missing.missing.includes('koffi'),
+    'absent packages are reported by name', missing.missing.join(', '))
+    // The name is kept as two path segments: a lookup that dropped the scope would look
+    // for `libreoffice-kit/package.json` and wrongly report the scoped package missing.
+    check(!missing.missing.includes('@deepseek-ai/libreoffice-kit'),
+      'and a scoped package is not mistaken for an unscoped one')
+
+    // The walk must not climb above `root`. The fork build stages at
+    // `<fork>/stage/<platform>`, directly under a checkout that has its own
+    // `node_modules` — a Node-literal climb would "resolve" packages that are not in the
+    // archive, which is the false green this probe exists to prevent. This fixture puts a
+    // package one level above `root` and asserts it is still reported missing.
+    const outer = mkdtempSync(join(tmpdir(), 'fork-unresolved-outer-'))
+    try {
+      packageIn(outer, 'left-behind')
+      mkdirSync(join(outer, 'stage', 'linux-x64'), { recursive: true })
+      const staged = join(outer, 'stage', 'linux-x64')
+      check(unresolvedInTree(staged, ['left-behind']).missing.includes('left-behind'),
+        'a package that exists only above the tree root is still reported missing — the walk is sealed at root')
+    } finally {
+      rmSync(outer, { recursive: true, force: true })
+    }
+
+    // The exact shape of the shipped bug: remove the driver from a tree that keeps
+    // dsh-office-kit, and the probe names it instead of letting the archive ship.
+    rmSync(join(root, 'node_modules', '@deepseek-ai', 'libreoffice-kit'), { recursive: true, force: true })
+    const broken = unresolvedInTree(root, ['@deepseek-ai/libreoffice-kit'])
+    check(broken.missing.includes('@deepseek-ai/libreoffice-kit'),
+      'a driver deleted out of the tree is exactly what the probe reports')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 }
 
 // ---- the trim itself --------------------------------------------------------
@@ -72,10 +269,15 @@ function packageIn(root, name) {
   try {
     packageIn(root, '@deepseek-ai/dsh')
     packageIn(root, '@deepseek-ai/dsh-web-app')
-    packageIn(root, '@deepseek-ai/dsh-office-kit')
+    packageIn(root, '@deepseek-ai/dsh-office-kit', { '@deepseek-ai/libreoffice-kit': '0.2.3' })
     packageIn(root, '@deepseek-ai/dsh-client-ui-chat')
     packageIn(root, '@deepseek-ai/dsh-experimental-inspector')
     packageIn(root, '@deepseek-ai/libreoffice-kit-win32-x64')
+    // The driver and the WASM engine are the two packages the old rule took with the
+    // native payloads, and the two the node actually resolves on Linux: the trim must
+    // leave them standing while removing the platform payloads it cannot execute.
+    packageIn(root, '@deepseek-ai/libreoffice-kit')
+    packageIn(root, '@deepseek-ai/libreoffice-kit-wasm')
     packageIn(root, '@deepseek-ai/dsh-cua-bundle')
     packageIn(root, '@deepseek-ai/dsh-unclassified-new-package')
     writeFileSync(join(root, 'node_modules', '@deepseek-ai', 'dsh', 'index.d.ts'), 'export {}\n', 'utf8')
@@ -100,7 +302,13 @@ function packageIn(root, name) {
       'a package with no matching rule is kept rather than guessed at')
     check(!left('dsh-client-ui-chat'), 'the browser surface is dropped')
     check(!left('dsh-experimental-inspector'), 'experimental bundles are dropped')
-    check(!left('libreoffice-kit-win32-x64'), 'the Office engine is dropped')
+    // Both halves of the Office answer have to be pinned here, in one assertion pair:
+    // the drop rule that used to be `^libreoffice-kit` took the driver and the WASM
+    // engine too, so "the engine is dropped" was true and the capability was dead.
+    check(!left('libreoffice-kit-win32-x64'),
+      'the win32 Office engine is dropped — a Linux artefact cannot execute it')
+    check(left('libreoffice-kit') && left('libreoffice-kit-wasm'),
+      'the driver and the portable WASM engine survive, so the kept office rows can resolve them')
     check(!left('dsh-cua-bundle'), 'computer use is dropped')
     check(result.dropped.length === 4, 'every drop is reported', String(result.dropped.length))
 

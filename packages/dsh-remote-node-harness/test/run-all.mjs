@@ -110,7 +110,39 @@ const SUITES = [
     file: ['packages', 'dsh-remote-node-harness', 'test', 'multipart-unit.mjs'],
     runtime: 'node',
     timeoutMs: 120_000,
-    proves: 'a multipart reply decodes into bytes at the right JSON path; malformed parts are rejected',
+    proves: 'a multipart reply decodes into bytes at the right JSON path; malformed parts are rejected, and the part count and byte total are bounded',
+  },
+  {
+    name: 'ws-frame',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'ws-frame-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    // Three defects live here and none of them is visible from a working node: a damaged
+    // control frame, a fragmented message decoded as whole text, and a buffer with no
+    // ceiling.
+    proves: 'the RFC 6455 codec: every length branch round-trips, a control frame over 125 bytes is refused instead of sent damaged, fragmentation and RSV bits are refused by code, and both buffer budgets hold',
+  },
+  {
+    name: 'http-over-ssh',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'http-over-ssh-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    // `asSocket` used to make `setTimeout` a no-op, so this is the layer that had no
+    // deadline at all; the fake channel is a real `Duplex`, so `node:http` drives the same
+    // path a node does.
+    proves: 'one exchange over a forwarded channel: a normal answer, a deadline that fires with rnh/timeout, a body over the ceiling with rnh/too-large, and an abort that reaches forwardOut',
+  },
+  {
+    name: 'error-frame',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'error-frame-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    // The worst silent failure in the repository: `finish()` reached the consumer before the
+    // error did, and `AsyncQueue.fail` dropped an error arriving after `end()`.
+    proves: 'a node error frame reaches the browser as an error rather than an end of stream, through the real carrier, the real AsyncQueue and the real gateway',
   },
   {
     name: 'provision',
@@ -231,6 +263,31 @@ const SUITES = [
     runtime: 'electron',
     timeoutMs: 180_000,
     proves: 'the node composition is still a brain: Remote controllers in, no client-UI rows, YAML parses',
+  },
+  {
+    name: 'generated',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'generated-sync-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // `composition` reads the SOURCE files only, so a source edit whose `embed-into-rnh`
+    // rebuild was skipped passes it and ships the old composition to the node. This one
+    // compares the embedded copy against the sources, which is the missing half.
+    proves: 'the embedded brain bundle is the files on disk: same set, same bytes, and a header that names them',
+  },
+  {
+    name: 'capabilities',
+    layer: 'offline',
+    file: ['packages', 'rnh-brain', 'scripts', 'check-capabilities.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    // The single-source gate. Everything a node's capability implies — composed rows, preset
+    // rows, kept packages, dropped packages, the provisioning whitelist, the bundle names —
+    // is asserted against `capabilities.mjs`, so a declaration changed in one place and not the
+    // others fails here instead of on a node at the first tool call. `--strict` is what turns
+    // its report into a failure; without it the script only prints.
+    args: ['--strict'],
+    proves: 'every place that declares what a node can do agrees with capabilities.mjs: rows, presets, kept and dropped packages, the provisioning whitelist, the bundle names',
   },
   {
     name: 'packet',
@@ -546,7 +603,13 @@ async function runSuite(suite, extraArgs = []) {
   const executable = electronMode ? install.electron : process.execPath
   // `--expose-internals` is what the seam tests need to require upstream internals; it is
   // only meaningful under the desktop binary, so the plain-Node path does not get it.
-  const args = electronMode ? ['--expose-internals', target, ...extraArgs] : [target, ...extraArgs]
+  // `suite.args` carries flags the suite itself parses (`check-capabilities --strict` turns its
+  // report into a gate). Declared per suite rather than appended to `extraArgs`, because those
+  // are the Host coordinates handed to the end-to-end suites and would be nonsense here.
+  const suiteArgs = Array.isArray(suite.args) ? suite.args : []
+  const args = electronMode
+    ? ['--expose-internals', target, ...suiteArgs, ...extraArgs]
+    : [target, ...suiteArgs, ...extraArgs]
   // The third argument to `openSync` is the **mode**, and it only applies when `O_CREAT` is
   // set. Passing the flags value there by habit made every log file read-only on Windows
   // (mode 577 has no owner-write bit), so the next run could not truncate its own log and

@@ -10,6 +10,7 @@
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import {
+  NODE_BASE_BUNDLES,
   installedPlugins,
   isLocalSpec,
   parseSwitches,
@@ -20,17 +21,27 @@ import {
 /**
  * The bundles a node composes by construction, in compose order.
  *
- * Exported because the connect path builds the node's profile from the switches **and**
- * from this list, and the two have to agree about which entry is the brain.
+ * **Re-exported, not re-spelled.** This file used to hold its own literal pair, which had to
+ * agree with `rnh.js: BRAIN_BUNDLES` by inspection alone; the two would have stayed correct
+ * until the day one of them changed. The list now lives once, in `core/plugin-sync.js`, and
+ * `check-capabilities` asserts that neither file spells a bundle name of its own.
  */
-export const NODE_BASE_BUNDLES = Object.freeze(['@deepseek-ai/dsh-base', '@local/rnh-brain'])
+export { NODE_BASE_BUNDLES }
 
 /**
  * The row ids one installed bundle contributes.
  *
  * Used to show a person what a switch actually brings, and to refuse a switch that would
- * contribute nothing. Reads the bundle's own `cordis.patch.yml` through its manifest's
+ * contribute nothing. Reads the bundle's own patch file(s) through its manifest's
  * `dsh.bundle.patch`, so it needs no list of package names.
+ *
+ * **`dsh.bundle.patch` is a string *or* a list.** Both shapes are in use by bundles a node
+ * composes: upstream's `dsh-web-app` and this project's own `@local/rnh-brain` declare an
+ * array (the brain needs its composition plus four preset files), while `dsh-base` declares a
+ * single string. Reading only the string shape returned `[]` for those bundles — so the plugin
+ * page said "this switch brings 0 rows" for the two bundles it most needs to explain, and the
+ * "a switch that contributes nothing is refused" guard silently did not apply to them.
+ * Measured on 2026-11-23: `rowsOfBundle()` answered `[]` for both.
  *
  * @param {string} nodeModules - where this profile's packages are installed.
  * @param {string} name
@@ -44,18 +55,21 @@ function rowsOfBundle(nodeModules, name) {
   } catch {
     return []
   }
-  const relative = manifest?.dsh?.bundle?.patch
-  if (typeof relative !== 'string') return []
-  let text
-  try {
-    text = readFileSync(join(dir, relative), 'utf8')
-  } catch {
-    return []
-  }
+  const declared = manifest?.dsh?.bundle?.patch
+  const files = typeof declared === 'string' ? [declared] : Array.isArray(declared) ? declared : []
   const ids = []
-  for (const line of text.split('\n')) {
-    const match = /^\s*-\s*id:\s*(\S+)\s*$/u.exec(line)
-    if (match !== null && !ids.includes(match[1])) ids.push(match[1])
+  for (const relative of files) {
+    if (typeof relative !== 'string') continue
+    let text
+    try {
+      text = readFileSync(join(dir, relative), 'utf8')
+    } catch {
+      continue
+    }
+    for (const line of text.split('\n')) {
+      const match = /^\s*-\s*id:\s*(\S+)\s*$/u.exec(line)
+      if (match !== null && !ids.includes(match[1])) ids.push(match[1])
+    }
   }
   return ids
 }
