@@ -37,12 +37,12 @@ import { NODE_STATUS_KIND, STATUS_EVENT } from './host/node-status.js'
 import { RnhControl } from './host/rnh-control.js'
 import {
   ensureRemoteDirectory,
-  isPosixAbsolute,
   listLocal,
   listRemote,
   makeLocalDirectory,
   makeRemoteDirectory,
 } from './host/browse.js'
+import { normalizePosix } from './host/posix-path.js'
 import { RemoteControl } from './host/remote-control.js'
 import { RemoteEvents } from './host/remote-events.js'
 import { RemoteWaterfalls } from './host/remote-waterfall.js'
@@ -407,9 +407,15 @@ export function apply(ctx, config = {}) {
             sendJson(res, 200, { ok: true, ...value })
             return
           }
-          if (!isPosixAbsolute(path)) {
+          // Folded **before** anything uses it. `isPosixAbsolute` alone accepted
+          // `/home/x/../../etc`, which every later step then treated as a different directory
+          // than the caller named: `ensureRemoteDirectory` would fold it, `workspace/create`
+          // would not. One fold, one path, from here on.
+          const normalized = normalizePosix(path)
+          if (!normalized.ok) {
             throw apiError('path-invalid', 'a remote workspace path must be absolute, e.g. /root/project', 400)
           }
+          const nodePath = normalized.path
           const runtime = rnh.get(nodeId)
           if (runtime === undefined) throw apiError('node-not-found', `no node ${nodeId}`, 404)
           if (!runtime.routable) throw apiError('node-offline', `${runtime.record.name} is not connected`, 409)
@@ -419,11 +425,11 @@ export function apply(ctx, config = {}) {
           // settings-page form answered `ENOENT: realpath` — measured, and it read like a
           // broken API rather than a missing step.
           try {
-            await ensureRemoteDirectory(runtime.connection, path)
+            await ensureRemoteDirectory(runtime.connection, nodePath)
           } catch (error) {
             throw apiError('create-failed', error instanceof Error ? error.message : String(error), 400)
           }
-          let value = await router.call(nodeId, 'workspace/create', { request: { path } })
+          let value = await router.call(nodeId, 'workspace/create', { request: { path: nodePath } })
           const createdId = Reflect.get(Reflect.get(value ?? {}, 'workspace') ?? {}, 'workspaceId')
           if (title.length > 0 && typeof createdId === 'string') {
             // A rename that fails must not lose the workspace that was just created:

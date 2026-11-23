@@ -21,6 +21,8 @@
 import { rmdirSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 
+import { normalizePosix } from './posix-path.js'
+
 /** The namespace marker. Reserved: nothing but a node may be addressed here. */
 export const PICKER_PREFIX = '/@rnh'
 
@@ -90,10 +92,16 @@ export function encodePickerPath(nodeId, remotePath) {
 /**
  * Split one path back into what it addresses.
  *
+ * The remote half is **folded** (`.` dropped, `..` resolved) before it is returned, because the
+ * caller hands it straight to `mkdir -p` on a node: a path that means `/home/x/../../etc` has to
+ * arrive as `/etc`, or be refused. It is refused when `..` would rise above `/` — clamping
+ * `/../../etc` to `/etc` would be a different path than the one asked for.
+ *
  * @param {unknown} path
  * @returns {{ kind: 'nodes' } | { kind: 'node', nodeId: string, remotePath: string } | undefined}
  *   `{kind:'nodes'}` for the namespace itself, a node target otherwise, and
- *   `undefined` when the path is not in the namespace at all.
+ *   `undefined` when the path is not in the namespace at all — **or** when it names a node but
+ *   its tail escapes the root, which is a path no node can be asked about.
  */
 export function decodePickerPath(path) {
   const text = normalizePickerPath(path)
@@ -107,7 +115,11 @@ export function decodePickerPath(path) {
   const nodeId = slash === -1 ? rest : rest.slice(0, slash)
   if (!NODE_ID.test(nodeId)) return undefined
   const tail = slash === -1 ? '' : rest.slice(slash + 1)
-  return { kind: 'node', nodeId, remotePath: tail.length === 0 ? '/' : `/${tail}` }
+  const folded = normalizePosix(tail.length === 0 ? '/' : `/${tail}`)
+  // An escaping tail is not a path this namespace can spell: answering `undefined` keeps the
+  // caller on "not a node path" instead of handing it a silently-clamped directory.
+  if (!folded.ok) return undefined
+  return { kind: 'node', nodeId, remotePath: folded.path }
 }
 
 /**

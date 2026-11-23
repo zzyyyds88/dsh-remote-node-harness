@@ -349,6 +349,20 @@ const SUITES = [
     proves: 'the reconciliation gate really fails: five single-site drifts — a dropped row, an invented preset row, a drifted bundle name, an underivable credential, an orphan drop rule — each make it exit non-zero and say which',
   },
   {
+    name: 'browse-protocol',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'browse-protocol-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 180_000,
+    // The listing protocol is `type\0value\0` records plus a NUL/base64 name block, and every
+    // defect it replaced was a *parsing* defect — a directory named like a marker forging the
+    // answer, a newline in a name becoming two entries, `find` failing behind a pipe reading as
+    // "empty". A stubbed parser would prove none of that, so the shell script runs for real
+    // against real hostile directories and the parser reads the bytes it produced.
+    // Exit 3 (a named SKIP) when this machine has no POSIX shell.
+    proves: 'the remote listing protocol on a real shell: marker-shaped names stay names, a newline stays one entry, a non-UTF-8 name is flagged instead of replaced, an absent path is a confirmable level, an escaping path is refused, a missing `find` is an error, and creating a folder validates one segment',
+  },
+  {
     name: 'packet',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'packet-unit.mjs'],
