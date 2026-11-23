@@ -256,6 +256,30 @@ const SUITES = [
     proves: 'a connect failure becomes a code with one action and a retryable flag, and a node\'s own log redacts secrets before storing them and stays bounded',
   },
   {
+    name: 'registry',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'registry-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // This file has existed since the registry fix but was **never registered**, so its 67
+    // assertions had not run in a full sweep — the exact gap a matrix is supposed to prevent.
+    // Found by cross-checking the test directory against `SUITES`, which is now the only way
+    // this can be noticed.
+    proves: 'nodes.json is the one file whose failure mode is "your nodes disappear": a healthy file reads back, a missing one is first run, a corrupt one is renamed aside before the next save, one bad record does not take the table, and a validation failure serializes to HTTP 400',
+  },
+  {
+    name: 'suite-registry',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'suite-registry-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // The matrix's own completeness check. `registry-unit.mjs` sat unregistered for a whole
+    // batch, so 67 assertions never ran in a full sweep while the README counted the suite as
+    // if they had. A set comparison between the test directory and `SUITES` is the only way
+    // that is noticeable, and it has to run inside the sweep it is checking.
+    proves: 'the test matrix is complete: every test file on disk is scheduled by run-all.mjs, every scheduled file exists, and every entry declares its layer',
+  },
+  {
     name: 'picker-paths',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'picker-paths-unit.mjs'],
