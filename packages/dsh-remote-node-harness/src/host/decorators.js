@@ -29,6 +29,7 @@ import {
   pruneShadow,
   shadowRoot,
 } from './picker-paths.js'
+import { mergedStream } from './merge-stream.js'
 import { AsyncQueue, decodeRemoteId, decorateMethods, remoteIterable } from './routing.js'
 
 /** Read a nested request field without trusting its shape. */
@@ -333,11 +334,11 @@ export function decorateWorkspaceController(service, router, workspaces) {
  * @returns {AsyncIterable<unknown>}
  */
 function mergeWorkspaceStream(local, workspaces, signal) {
-  return {
-    [Symbol.asyncIterator]() {
-      const queue = new AsyncQueue()
+  return mergedStream({
+    local,
+    signal,
+    create: emit => {
       let opened = false
-      let stopped = false
       /** The local half's last picture, kept so a remote change can re-merge. */
       let localBaseline
       const first = () => {
@@ -355,19 +356,8 @@ function mergeWorkspaceStream(local, workspaces, signal) {
        */
       const remerge = () => {
         if (!opened) return
-        queue.push({ type: 'replace', value: workspaces.mergeBaseline(localBaseline) })
+        emit({ type: 'replace', value: workspaces.mergeBaseline(localBaseline) })
       }
-      const unsubscribe = workspaces.subscribe(frame => {
-        if (stopped) return
-        if (Reflect.get(frame ?? {}, 'type') === 'replace') {
-          remerge()
-          return
-        }
-        if (!opened) return
-        queue.push(frame)
-      })
-      const onAbort = () => { stopped = true }
-      signal?.addEventListener('abort', onAbort, { once: true })
 
       /** Fold one local frame into `localBaseline` so a later re-merge keeps it. */
       const adoptLocal = frame => {
@@ -407,51 +397,41 @@ function mergeWorkspaceStream(local, workspaces, signal) {
         }
       }
 
-      const pump = async () => {
-        try {
-          await workspaces.sync()
-          for await (const frame of local) {
-            if (stopped) return
-            const type = Reflect.get(frame ?? {}, 'type')
-            adoptLocal(frame)
-            if (type === 'baseline' || type === 'replace') {
-              opened = true
-              queue.push({ type: 'baseline', value: workspaces.mergeBaseline(localBaseline) })
-              continue
-            }
-            if (!opened) {
-              // A remote change may have arrived before this baseline; it was
-              // folded into `workspaces`, so the opening frame already has it.
-              queue.push(first())
-            }
-            queue.push(frame)
-          }
-        } catch (error) {
-          queue.fail(error)
-          return
-        } finally {
-          unsubscribe()
-          signal?.removeEventListener('abort', onAbort)
-        }
-        // The local feed ended: this Host is going away, so the merged stream
-        // ends too rather than idling on a registry that no longer changes.
-        if (!opened) queue.push(first())
-        queue.end()
-      }
-      void pump()
-
       return {
-        next: () => queue.next(),
-        return: async () => {
-          stopped = true
-          unsubscribe()
-          signal?.removeEventListener('abort', onAbort)
-          queue.end()
-          return { done: true, value: undefined }
+        // The node set has to be current before the local baseline is merged into it.
+        prelude: () => workspaces.sync(),
+        subscribe: () => workspaces.subscribe(frame => {
+          if (Reflect.get(frame ?? {}, 'type') === 'replace') {
+            remerge()
+            return
+          }
+          if (!opened) return
+          emit(frame)
+        }),
+        onLocalFrame: frame => {
+          const type = Reflect.get(frame ?? {}, 'type')
+          adoptLocal(frame)
+          if (type === 'baseline' || type === 'replace') {
+            // A local baseline is the opening frame as far as the client is concerned: it
+            // carries the whole local picture, and the remote rows are folded into it.
+            opened = true
+            emit({ type: 'baseline', value: workspaces.mergeBaseline(localBaseline) })
+            return
+          }
+          if (!opened) {
+            // A remote change may have arrived before this baseline; it was
+            // folded into `workspaces`, so the opening frame already has it.
+            emit(first())
+          }
+          emit(frame)
         },
+        // The local feed ended: this Host is going away, so the merged stream
+        // ends too rather than idling on a registry that no longer changes. A
+        // consumer that never saw an opening frame still gets one.
+        onFinish: emit => { if (!opened) emit(first()) },
       }
     },
-  }
+  })
 }
 
 /**

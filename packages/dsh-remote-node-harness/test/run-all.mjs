@@ -97,6 +97,19 @@ const SUITES = [
     proves: 'identity round-trip, stream fan-out, workspace merge, local passthrough, job endpoints',
   },
   {
+    name: 'merge-stream',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'merge-stream-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // `mergeControlStream` and `mergeWorkspaceStream` carried byte-for-byte identical
+    // lifecycle code around genuinely different payload strategies. Extracting it is only safe
+    // if the lifecycle itself is tested — a throw reaching the consumer as a rejection,
+    // `return()`/abort releasing the subscription exactly once, the prelude ordering — rather
+    // than each payload test happening to cover its own copy.
+    proves: 'the merged-stream lifecycle once: local frames pumped, a throw rejects instead of ending cleanly, return() and abort release the subscription exactly once, the prelude runs before the first frame, and exactly one baseline leaves a control merge',
+  },
+  {
     name: 'routing-extra',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'routing-extra-unit.mjs'],

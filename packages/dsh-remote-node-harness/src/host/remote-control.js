@@ -23,7 +23,8 @@
  *
  * @module @greatbaby/dsh-remote-node-harness/host/remote-control
  */
-import { AsyncQueue, decodeRemoteId, encodeRemoteId } from './routing.js'
+import { mergedStream } from './merge-stream.js'
+import { decodeRemoteId, encodeRemoteId } from './routing.js'
 
 /** One node's control stream, reduced to the two frame kinds that matter. */
 class NodeControl {
@@ -273,10 +274,10 @@ export class RemoteControl {
  * @returns {AsyncIterable<unknown>}
  */
 export function mergeControlStream(local, control, signal) {
-  return {
-    [Symbol.asyncIterator]() {
-      const queue = new AsyncQueue()
-      let stopped = false
+  return mergedStream({
+    local,
+    signal,
+    create: emit => {
       /** The local baseline's blocks, kept so a later remote change can re-merge. */
       let localBlocks = {}
       /** Whether the client has received its one and only opening baseline. */
@@ -290,61 +291,34 @@ export function mergeControlStream(local, control, signal) {
         return { type: 'baseline', value: { projections } }
       }
 
-      const unsubscribe = control.subscribe(frame => {
-        if (stopped) return
-        // A remote baseline replaced that node's blocks, so the whole picture has
-        // to be re-sent. Before the local baseline arrives there is nothing to
-        // merge into, and the opening frame will carry the new blocks anyway.
-        if (Reflect.get(frame ?? {}, 'type') === 'baseline') {
-          if (opened) queue.push(merged())
-          return
-        }
-        queue.push(frame)
-      })
-      const onAbort = () => { stopped = true }
-      signal?.addEventListener('abort', onAbort, { once: true })
-
-      const pump = async () => {
-        try {
-          for await (const frame of local) {
-            if (stopped) return
-            if (Reflect.get(frame ?? {}, 'type') === 'baseline') {
-              const value = Reflect.get(frame, 'value')
-              const projections = Reflect.get(value ?? {}, 'projections')
-              localBlocks = projections !== null && typeof projections === 'object' ? projections : {}
-              // The first baseline is the interesting one: it becomes the single
-              // merged frame. A later local baseline would carry a fresh local
-              // picture, so it replaces `localBlocks` and re-merges too.
-              opened = true
-              queue.push(merged())
-              continue
-            }
-            queue.push(frame)
-          }
-        } catch (error) {
-          queue.fail(error)
-          return
-        } finally {
-          unsubscribe()
-          signal?.removeEventListener('abort', onAbort)
-        }
-        // The local generation ended: this Host is shutting down.
-        queue.end()
-      }
-      void pump()
-
       return {
-        next: () => queue.next(),
-        return: async () => {
-          stopped = true
-          unsubscribe()
-          signal?.removeEventListener('abort', onAbort)
-          queue.end()
-          return { done: true, value: undefined }
+        subscribe: () => control.subscribe(frame => {
+          // A remote baseline replaced that node's blocks, so the whole picture has
+          // to be re-sent. Before the local baseline arrives there is nothing to
+          // merge into, and the opening frame will carry the new blocks anyway.
+          if (Reflect.get(frame ?? {}, 'type') === 'baseline') {
+            if (opened) emit(merged())
+            return
+          }
+          emit(frame)
+        }),
+        onLocalFrame: frame => {
+          if (Reflect.get(frame ?? {}, 'type') !== 'baseline') {
+            emit(frame)
+            return
+          }
+          const value = Reflect.get(frame, 'value')
+          const projections = Reflect.get(value ?? {}, 'projections')
+          localBlocks = projections !== null && typeof projections === 'object' ? projections : {}
+          // The first baseline is the interesting one: it becomes the single
+          // merged frame. A later local baseline would carry a fresh local
+          // picture, so it replaces `localBlocks` and re-merges too.
+          opened = true
+          emit(merged())
         },
       }
     },
-  }
+  })
 }
 
 /** Whether an id names a Session this Host does not own. */
