@@ -1214,13 +1214,18 @@ provision 白名单、bundle 名。
   是已知债务，改它会改变构建删什么，需要重新构建制品验收。
 - 节点 brain 没有独立版本号（它是以文件写入的，唯一戳是内容哈希），所以 `decideGate` 的
   brain 分支保持惰性 —— 代价是「节点被别的桌面装新了要拒绝」这条保护仍然不存在。
-- `remoteRoot` 仍不加引号插进 `sh -c`（入口是设置页，属本机可信输入，但仍是注入面）。
 - `decorators.js` 仍是单文件约 1010 行、按命名空间分 18 个 `decorate*` 函数；设计 §九 批 5
   第 23 项只做了合并流那一半（`host/merge-stream.js`），**按命名空间拆分未做**。
 - `client.js` 仍是单文件约 2350 行，`node-view.js` 的纯视图模型没有独立出来。
+- `artefact.js` 的 `quote()` 不转义内部单引号。触发面只剩「发布源配置里塞了带单引号的 URL」，
+  属发布侧配置错误 —— `remoteRoot` 已在注册表入口校验，路径不再可能带引号。
 
 ### 已经关上的口子（本轮）
 
+- **`remoteRoot` 的远端命令注入面**：`normalizeRemoteRoot()` 在 `normalizeNode` 里做白名单校验
+  （`[A-Za-z0-9._\-/~+@,=:]`，每个允许字符在未加引号的 shell 词里都惰性；`~` 只在开头）。
+  `normalizeNode` 是记录被创建或修改的唯一路径，所以 35 处 `sh -c` 插值不用改一行就安全了。
+  空格被拒绝：允许它会让 `mkdir -p <root>/run` 裂成两个参数。
 - 错误词汇**只剩一张表**：`src/core/errors.js` 的 `ERROR_CODES` + `classifyFailure`。
   `daemon.js` 的 `PROVISION_FAILURES`（旧那套、零消费者）已删，设计 §七 的「失败只有一个出口」
   因此在词汇层面成立。

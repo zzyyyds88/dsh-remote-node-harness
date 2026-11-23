@@ -381,6 +381,13 @@ src/
     `detach()` 幂等，`merge-stream-unit` 20 条断言）；**`decorators.js` 的按命名空间拆分未做**
     （仍约 1010 行、18 个 `decorate*` 函数），记在 ARCHITECTURE 的「仍然开着的口子」里。
 
+**批 5 之后的补批：注入面与死代码**
+
+24. F5/G5 的 `remoteRoot` 注入面 —— **已做**：`normalizeRemoteRoot()` 在 `normalizeNode`
+    入口做白名单校验（允许字符全部在未加引号的 shell 词里惰性），35 处 `sh -c` 插值不用改；
+25. §八 的删除清单 —— **已做**，11 项零消费者死代码已删（`encode` 与 `SecretStore.describe`
+    复核后**不是**死代码，保留并改正设计文档）。
+
 ## 十、验收判据
 
 - **分层**（沿用项目现有分层，不新增层级）：offline（现 33 个）、contract（3 个）、e2e 真节点（17 个，本机实跑 15 passed + 2 skipped）。
