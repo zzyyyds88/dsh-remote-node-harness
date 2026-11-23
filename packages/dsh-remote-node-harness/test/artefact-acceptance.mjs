@@ -180,11 +180,16 @@ check(stamp?.build !== undefined,
   'the tree carries the build stamp, without which every connect reinstalls', shapeField('stamp'))
 // Each line is a labelled answer rather than a bare value: a failed `test` prints
 // nothing, and an unlabelled empty line silently shifts every later field.
+//
+// `du` must **dereference**: since the install became a transaction, `runtime` is a symlink
+// to a numbered generation (`runtime -> runtime.<n>`), and plain `du -sm` on a symlink reports
+// 0 — it measures the link, not the tree. Measured: this check failed with `0 MiB` on a
+// perfectly good 355 MiB install the first time the symlink layout ran end to end.
 const tree = await nodeExec(
   `test -f ${cli} && echo cli=yes || echo cli=no; `
   + `test -d ${runtime}/node_modules/@deepseek-ai/dsh/node_modules && echo nested=yes || echo nested=no; `
   + `echo packages=$(ls ${runtime}/node_modules | wc -l); `
-  + `echo size=$(du -sm ${runtime} | cut -f1)`,
+  + `echo size=$(du -smL ${runtime} | cut -f1)`,
 )
 const field = name => tree.trim().split('\n')
   .map(line => line.trim())
