@@ -306,7 +306,7 @@ node packages\dsh-remote-node-harness\test\workspace-browse.mjs <base> <token>
 node packages\dsh-remote-node-harness\test\run-all.mjs --layer offline,contract
 ```
 
-单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 53 个套件与它们各自的依赖。
+单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 54 个套件与它们各自的依赖。
 **每个套件守的是哪条上游契约、DSH 升级后按什么顺序重跑**，见 [`UPGRADE.zh.md`](UPGRADE.zh.md) §二。
 
 ```powershell
@@ -739,7 +739,7 @@ bug，是同一类结构缺陷在长新 bug。设计文档与逐条实证见
 
 | 层 | 结果 |
 |---|---|
-| offline | **33 passed, 0 failed, 0 skipped** in 23.2s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`/`merge-stream`/`registry`/`suite-registry`） |
+| offline | **34 passed, 0 failed, 0 skipped** in 21.4s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`/`merge-stream`/`registry`/`suite-registry`/`node-stream-set`） |
 | contract | **3 passed, 0 failed** in 940ms |
 | e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 215.9s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
 

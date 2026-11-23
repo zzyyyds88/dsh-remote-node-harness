@@ -1214,8 +1214,10 @@ provision 白名单、bundle 名。
   是已知债务，改它会改变构建删什么，需要重新构建制品验收。
 - 节点 brain 没有独立版本号（它是以文件写入的，唯一戳是内容哈希），所以 `decideGate` 的
   brain 分支保持惰性 —— 代价是「节点被别的桌面装新了要拒绝」这条保护仍然不存在。
-- `decorators.js` 仍是单文件约 1010 行、按命名空间分 18 个 `decorate*` 函数；设计 §九 批 5
-  第 23 项只做了合并流那一半（`host/merge-stream.js`），**按命名空间拆分未做**。
+- `decorators.js` 仍是单文件约 1010 行、按命名空间分 18 个 `decorate*` 函数。
+  设计 §九 批 5 第 23 项的两半都做完了 —— 合并流骨架（`host/merge-stream.js`）与
+  四个 `Remote*` 的 per-node 簿记（`host/node-stream-set.js`）—— 但**按命名空间拆分
+  `decorators.js` 本身未做**，那是同一条项里的第三件事。
 - `client.js` 仍是单文件约 2350 行，`node-view.js` 的纯视图模型没有独立出来。
 - `artefact.js` 的 `quote()` 不转义内部单引号。触发面只剩「发布源配置里塞了带单引号的 URL」，
   属发布侧配置错误 —— `remoteRoot` 已在注册表入口校验，路径不再可能带引号。
@@ -1232,6 +1234,10 @@ provision 白名单、bundle 名。
 - 两份逐行同构的合并流骨架收敛成 `host/merge-stream.js`：生命周期归一处，
   `mergeControlStream` / `mergeWorkspaceStream` 各自只提供载荷策略。`detach()` 幂等，
   订阅恰好释放一次（`merge-stream-unit` 断言）。
+- 四个 `Remote*` 类各自抄了一遍的 per-node 簿记收敛成 `host/node-stream-set.js`。
+  它只算「发生了什么」（`plan()` 返回 `left`/`arrived`/`staying` 且**不做任何改动**），
+  因为其中三个对「节点离开了」的反应是关流，而 `RemoteWorkspaces` 要保留行并标记 offline ——
+  同一条事实、两种 policy，共用的是事实那一半。
 - 设计 §八 列的 11 项死代码已删；`encode` 与 `SecretStore.describe` 经复核**不是**死代码，
   保留（设计文档里的那两条是误判，已在 §八 注明）。
 
@@ -1247,7 +1253,7 @@ provision 白名单、bundle 名。
 
 ## 七、测试
 
-共 53 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 33 个（纯逻辑 + 组合
+共 54 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 34 个（纯逻辑 + 组合
 检查 + 真 POSIX shell 跑安装脚本与目录列举脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
 （运行中的 Host + 连上的节点）。下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 
@@ -1286,6 +1292,7 @@ provision 白名单、bundle 名。
 | `gate-mutation-unit.mjs` | 闸门**自己的**测试：五种真实漂移各让 `check-capabilities --strict` 非零退出并说出是哪一处（在临时副本上做，不动工作区） | 无 |
 | `browse-protocol-unit.mjs` | 目录列举的 `type\0value\0` 记录协议，在**真 POSIX shell** 上跑真脚本：marker 形状的目录名、含换行的名字、非 UTF-8 名字、缺 `find`、越界路径、`mkdir` 的单段校验 | 真 shell（WSL 或 `/bin/bash`），无则 SKIP |
 | `merge-stream-unit.mjs` | 合并流的**生命周期**（载荷策略各自不同，只测共用那层）：抛错以 rejection 到达消费者、`return()`/abort 恰好释放订阅一次、`prelude` 在首帧之前 | 无 |
+| `node-stream-set-unit.mjs` | 四个 `Remote*` 共用的 per-node 簿记：`plan()` 只分类不改任何东西（`left`/`arrived`/`staying`）、同一节点只创建一次、`drop()` 在出路关流且只关一次、`disposeAll()` 全关 | 无 |
 | `ws-frame-unit.mjs` | WS 帧纯编解码：控制帧载荷 ≤125 字节（超了就是损坏帧）、分片明确拒绝而不是拼错 | 无 |
 | `http-over-ssh-unit.mjs` | SSH 上的 HTTP：超时预算唯一（`asSocket.setTimeout` 已删）、响应体有上限、`Content-Length` 不符时明确失败 | 无（假 socket） |
 | `error-frame-unit.mjs` | 节点错误帧不被降级成正常结束：真 ws + 真 Gateway + 真 `AsyncQueue`，错误到达消费者 | 无（假 socket） |

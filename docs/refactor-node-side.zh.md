@@ -377,9 +377,12 @@ src/
     在真实 shell 上跑真实脚本，含 marker 形状的目录名、换行、非 UTF-8、缺 `find`）；
 22. 错误唯一出口 + 一张错误表 —— **已做**：错误帧不再退化成 EOF（`error-frame-unit`），
     词汇只剩 `src/core/errors.js` 一张表（`PROVISION_FAILURES` 已删）；
-23. 合并流与四个 `Remote*` 骨架收敛 —— **合并流已做**（`host/merge-stream.js`，生命周期归一处，
-    `detach()` 幂等，`merge-stream-unit` 20 条断言）；**`decorators.js` 的按命名空间拆分未做**
-    （仍约 1010 行、18 个 `decorate*` 函数），记在 ARCHITECTURE 的「仍然开着的口子」里。
+23. 合并流与四个 `Remote*` 骨架收敛 —— **已做**：合并流生命周期收敛成
+    `host/merge-stream.js`（`detach()` 幂等，`merge-stream-unit` 20 条断言）；
+    四个 `Remote*` 的 per-node 簿记收敛成 `host/node-stream-set.js`
+    （`plan()` 只分类、不做改动，`node-stream-set-unit` 18 条断言）。
+    **`decorators.js` 的按命名空间拆分未做**（仍约 1010 行、18 个 `decorate*` 函数），
+    记在 ARCHITECTURE 的「仍然开着的口子」里。
 
 **批 5 之后的补批：注入面与死代码**
 
@@ -390,7 +393,7 @@ src/
 
 ## 十、验收判据
 
-- **分层**（沿用项目现有分层，不新增层级）：offline（现 33 个）、contract（3 个）、e2e 真节点（17 个，本机实跑 15 passed + 2 skipped）。
+- **分层**（沿用项目现有分层，不新增层级）：offline（现 34 个）、contract（3 个）、e2e 真节点（17 个，本机实跑 15 passed + 2 skipped）。
 - **每条缺陷一个回归测试**，且测试必须在**修复前红**（否则测的不是那条缺陷）。
 - **真节点验收**：一台机器从「刚 SSH 连上」到「大脑在答话」，全程走新通道；首连（含插件安装）、升级（含故意制造的校验失败，断言**不降级**）、断线重连（断言 2/4/8/120 s 阶梯与 `attempt` 递增）、reinstall（断言 host 真的重启了）。
 - **能力可判定**：能力清单在 `capabilities.mjs` 里带 `verdict`/`host`/`credentials`，
