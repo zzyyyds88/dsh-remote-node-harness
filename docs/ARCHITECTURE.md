@@ -1261,7 +1261,7 @@ provision 白名单、bundle 名。
 | `multipart-unit.mjs` | Gateway 的 `multipart/form-data` 应答能解：字节附件在正确的 JSON 路径上还原成 `Uint8Array`，畸形分片被拒绝而不是静默读成 `null` | 无 |
 | `provision-unit.mjs` | 下发给节点的东西是对的：provider 行复制而账号行不复制、行里没写 `apiKeyEnv` 时也能推断出 key ref、配置能过真 YAML 解析器 | Electron Node（解析器在 `app.asar` 里） |
 | `rnh-brain/scripts/check-composition.mjs` | 节点组合仍然是个**大脑**：7 个 Remote 控制器行在、4 个传输行在（`webserver` / `connection` / `api-remotes` / `web-startup`）、`web-runtime` 不在、没有任何 `dsh-client-ui-*`、6 条 agent-plane disable 在、preset 文件齐全且已声明、YAML 可解析 | Electron Node（借用安装里的 YAML 解析器） |
-| `rnh-brain/scripts/sync-from-upstream.mjs` | 组合可重新生成（幂等；生成后与已提交版本一致即说明没有手改生成物） | 已安装的 DSH release |
+| `rnh-brain/scripts/sync-from-upstream.mjs` | **生成器，不是套件**（不在 `run-all` 的调度表里，因为它会写 `cordis.patch.yml`）。它把组合从已安装的 release 重新派生；「生成后与已提交版本一致」这条由 `generated` 套件间接证明 —— 它断言内嵌副本与磁盘上的源逐字节一致（按行尾归一），所以手改生成物会立刻红。`check-composition` 是另一件事：断言组合仍然是个大脑 | 已安装的 DSH release（只在升级时手动跑） |
 | `client-bundle.mjs` | 桌面端真的 serve 了这份客户端代码；三个槽位注册且能渲染 | 运行中的 Host |
 | `event-relay.mjs` | 在**节点上直接建**的 Session 能到达浏览器：`api-session/*` 列表事件与 `session/control` 投影帧都带着包裹后的身份到达；baseline 里有远程投影块；没有任何裸的节点 Session id 泄漏 | 运行中的 Host + 已连接节点 |
 | `session-acceptance.mjs` | **像用户一样**：在远程工作区真实建 Session、真实下一条要让 agent 用 write/bash/grep 干活的指令、读回 `session/follow` 核对三条工具调用与结果、`turn/end` 是 `completed`、助手说 DONE；再用**独立 SSH 连接**读节点上的产物字节 | 运行中的 Host + 已连接节点 |
