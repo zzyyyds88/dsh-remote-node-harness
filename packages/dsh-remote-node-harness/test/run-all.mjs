@@ -110,6 +110,19 @@ const SUITES = [
     proves: 'the merged-stream lifecycle once: local frames pumped, a throw rejects instead of ending cleanly, return() and abort release the subscription exactly once, the prelude runs before the first frame, and exactly one baseline leaves a control merge',
   },
   {
+    name: 'node-stream-set',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'node-stream-set-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // Four `Remote*` classes each carried a copy of this: a node-id map, a `sync()` walk and a
+    // `dispose()`. The extraction is only safe if the shared part is tested on its own — in
+    // particular that `plan()` decides NOTHING (three of the four close a node that left,
+    // `RemoteWorkspaces` keeps its rows), which is the property that made a single shared
+    // implementation possible at all.
+    proves: 'the per-node stream bookkeeping once: plan() classifies left/arrived/staying without touching anything, a node is created exactly once, drop() closes on the way out and only once, and disposeAll() closes everything',
+  },
+  {
     name: 'routing-extra',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'routing-extra-unit.mjs'],

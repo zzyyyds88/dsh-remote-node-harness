@@ -56,6 +56,8 @@ export const RELAYED_WATERFALLS = Object.freeze(['approval/request', 'user-quest
  * behaviour this plugin had before it could answer at all — so expiring is a
  * degrade, never a new failure mode.
  */
+import { NodeStreamSet } from './node-stream-set.js'
+
 const DEFAULT_TTL_MS = 10 * 60_000
 
 /** Result the local dispatch returns when no listener claimed the request. */
@@ -314,8 +316,9 @@ export class RemoteWaterfalls {
       log: options.log ?? (() => {}),
       ttlMs: options.ttlMs ?? DEFAULT_TTL_MS,
     }
-    /** @type {Map<string, NodeWaterfalls>} */
-    this.nodes = new Map()
+    this.streams = new NodeStreamSet(runtime => new NodeWaterfalls(
+      runtime.record.id, runtime.gateway, this.router, this.hostGateway, this.settings,
+    ))
     this.disposed = false
   }
 
@@ -327,36 +330,19 @@ export class RemoteWaterfalls {
    */
   sync() {
     if (this.disposed) return
-    const live = new Set(this.rnh.routable().map(runtime => runtime.record.id))
-    for (const [nodeId, node] of [...this.nodes]) {
-      if (live.has(nodeId)) continue
-      node.close()
-      this.nodes.delete(nodeId)
-    }
-    for (const runtime of this.rnh.routable()) {
-      const nodeId = runtime.record.id
-      if (this.nodes.has(nodeId)) continue
-      this.nodes.set(nodeId, new NodeWaterfalls(
-        nodeId, runtime.gateway, this.router, this.hostGateway, this.settings,
-      ))
-    }
+    const plan = this.streams.plan(this.rnh)
+    for (const nodeId of plan.left) this.streams.drop(nodeId)
+    for (const runtime of plan.arrived) this.streams.add(runtime)
   }
 
   /** The relay for one node, creating it if the caller got here first. */
   forNode(runtime) {
-    const nodeId = runtime.record.id
-    let node = this.nodes.get(nodeId)
-    if (node === undefined) {
-      node = new NodeWaterfalls(nodeId, runtime.gateway, this.router, this.hostGateway, this.settings)
-      this.nodes.set(nodeId, node)
-    }
-    return node
+    return this.streams.get(runtime.record.id) ?? this.streams.add(runtime)
   }
 
   /** Withdraw every card and stop relaying. */
   dispose() {
     this.disposed = true
-    for (const node of this.nodes.values()) node.close()
-    this.nodes.clear()
+    this.streams.disposeAll()
   }
 }

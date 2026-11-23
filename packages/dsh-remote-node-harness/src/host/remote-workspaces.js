@@ -16,6 +16,7 @@
  *
  * @module @greatbaby/dsh-remote-node-harness/host/remote-workspaces
  */
+import { NodeStreamSet } from './node-stream-set.js'
 import { isRemoteId, remapIds } from './routing.js'
 
 /** One node's current workspace picture. */
@@ -186,8 +187,12 @@ export class RemoteWorkspaces {
    */
   constructor(rnh) {
     this.rnh = rnh
-    /** @type {Map<string, NodeWorkspaces>} */
-    this.nodes = new Map()
+    this.streams = new NodeStreamSet(runtime => {
+      const node = new NodeWorkspaces(runtime.record.id, runtime.gateway)
+      node.onIncrement = (owner, frame) => this.#onNodeIncrement(owner, frame)
+      node.onReplaced = () => this.#publish({ type: 'replace', value: this.baseline() })
+      return node
+    })
     /** @type {Set<(frame: unknown) => void>} */
     this.subscribers = new Set()
     this.disposed = false
@@ -210,9 +215,8 @@ export class RemoteWorkspaces {
   async sync() {
     if (this.disposed) return
     const before = this.#signature()
-    const live = new Set(this.rnh.routable().map(runtime => runtime.record.id))
-    for (const [nodeId, node] of [...this.nodes]) {
-      if (live.has(nodeId)) continue
+    const plan = this.streams.plan(this.rnh)
+    for (const nodeId of plan.left) {
       // A node that is **gone** (its record was removed) loses its rows; a node that is merely
       // unreachable keeps them, marked offline.
       //
@@ -222,25 +226,22 @@ export class RemoteWorkspaces {
       // only way to tell it apart from a real deletion was to watch it happen. Keeping the rows
       // and saying they are offline is the honest version — and it is what the sidebar's own
       // greyed rows do for a closed window.
+      //
+      // This is the one caller where "left" does not mean "drop": the decision stays here,
+      // which is why `plan()` reports what changed instead of applying anything.
       if (this.rnh.get(nodeId) === undefined) {
-        node.close()
-        this.nodes.delete(nodeId)
+        this.streams.drop(nodeId)
         continue
       }
-      if (node.offline) continue
+      const node = this.streams.get(nodeId)
+      if (node === undefined || node.offline) continue
       node.markOffline()
       this.#publish({ type: 'replace', value: this.baseline() })
     }
     const opened = []
-    for (const runtime of this.rnh.routable()) {
-      const nodeId = runtime.record.id
-      let node = this.nodes.get(nodeId)
-      if (node === undefined) {
-        node = new NodeWorkspaces(nodeId, runtime.gateway)
-        node.onIncrement = (owner, frame) => this.#onNodeIncrement(owner, frame)
-        node.onReplaced = () => this.#publish({ type: 'replace', value: this.baseline() })
-        this.nodes.set(nodeId, node)
-      }
+    for (const runtime of [...plan.arrived, ...plan.staying]) {
+      let node = this.streams.get(runtime.record.id)
+      if (node === undefined) node = this.streams.add(runtime)
       opened.push(node.open().then(() => node.ready()).catch(() => undefined))
     }
     await Promise.all(opened)
@@ -261,7 +262,7 @@ export class RemoteWorkspaces {
    */
   #signature() {
     const parts = []
-    for (const [nodeId, node] of this.nodes) {
+    for (const [nodeId, node] of this.streams.nodes) {
       parts.push(
         `${nodeId}:${node.baseline === null ? '-' : String(node.baseline.items.length)}`
         + `${node.offline ? '!' : ''}`,
@@ -278,7 +279,7 @@ export class RemoteWorkspaces {
    * @returns {Array<{ nodeId: string, offline: boolean, rows: number }>}
    */
   nodeStates() {
-    return [...this.nodes].map(([nodeId, node]) => ({
+    return [...this.streams.nodes].map(([nodeId, node]) => ({
       nodeId,
       offline: node.offline,
       rows: node.baseline?.items.length ?? 0,
@@ -288,7 +289,7 @@ export class RemoteWorkspaces {
   /** Every local workspace id this module currently knows about. */
   remoteWorkspaceIds() {
     const ids = new Set()
-    for (const node of this.nodes.values()) {
+    for (const node of this.streams.nodes.values()) {
       for (const item of node.baseline?.items ?? []) {
         const id = Reflect.get(item, 'workspaceId')
         if (typeof id === 'string') ids.add(id)
@@ -302,7 +303,7 @@ export class RemoteWorkspaces {
     const items = []
     const archived = []
     const pinned = []
-    for (const node of this.nodes.values()) {
+    for (const node of this.streams.nodes.values()) {
       if (node.baseline === null) continue
       items.push(...node.baseline.items)
       archived.push(...node.baseline.archivedSessionIds)
@@ -339,8 +340,7 @@ export class RemoteWorkspaces {
   /** Drop every node subscription. */
   dispose() {
     this.disposed = true
-    for (const node of this.nodes.values()) node.close()
-    this.nodes.clear()
+    this.streams.disposeAll()
     this.subscribers.clear()
   }
 

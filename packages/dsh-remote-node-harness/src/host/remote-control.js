@@ -24,6 +24,7 @@
  * @module @greatbaby/dsh-remote-node-harness/host/remote-control
  */
 import { mergedStream } from './merge-stream.js'
+import { NodeStreamSet } from './node-stream-set.js'
 import { decodeRemoteId, encodeRemoteId } from './routing.js'
 
 /** One node's control stream, reduced to the two frame kinds that matter. */
@@ -157,8 +158,11 @@ export class RemoteControl {
     this.rnh = rnh
     this.router = router
     this.log = log
-    /** @type {Map<string, NodeControl>} */
-    this.nodes = new Map()
+    this.streams = new NodeStreamSet(runtime => new NodeControl(
+      runtime.record.id,
+      runtime.gateway,
+      (owner, frame) => this.#onNodeFrame(owner, frame),
+    ))
     /** @type {Set<(frame: unknown) => void>} */
     this.subscribers = new Set()
     this.disposed = false
@@ -175,24 +179,19 @@ export class RemoteControl {
    */
   sync() {
     if (this.disposed) return
-    const routable = this.rnh.routable()
-    const live = new Set(routable.map(runtime => runtime.record.id))
     let changed = false
-    for (const [nodeId, node] of [...this.nodes]) {
-      if (live.has(nodeId)) continue
-      node.close()
-      this.nodes.delete(nodeId)
+    const plan = this.streams.plan(this.rnh)
+    for (const nodeId of plan.left) {
+      this.streams.drop(nodeId)
       changed = true
     }
-    for (const runtime of routable) {
-      const nodeId = runtime.record.id
-      const existing = this.nodes.get(nodeId)
-      if (existing !== undefined) {
-        if (!existing.live) void existing.open()
-        continue
-      }
-      const node = new NodeControl(nodeId, runtime.gateway, (owner, frame) => this.#onNodeFrame(owner, frame))
-      this.nodes.set(nodeId, node)
+    for (const runtime of plan.staying) {
+      const existing = this.streams.get(runtime.record.id)
+      // Same node, same gateway: only the carrier is missing.
+      if (!existing.live) void existing.open()
+    }
+    for (const runtime of plan.arrived) {
+      const node = this.streams.add(runtime)
       void node.open()
       changed = true
     }
@@ -206,7 +205,7 @@ export class RemoteControl {
   baselineFrame() {
     /** @type {Record<string, unknown>} */
     const projections = {}
-    for (const node of this.nodes.values()) {
+    for (const node of this.streams.nodes.values()) {
       if (node.projections === undefined) continue
       for (const [sessionId, block] of Object.entries(node.projections)) {
         projections[encodeRemoteId(node.nodeId, sessionId)] = this.router.toLocal(block, node.nodeId)
@@ -224,8 +223,7 @@ export class RemoteControl {
   /** Close every node stream. */
   dispose() {
     this.disposed = true
-    for (const node of this.nodes.values()) node.close()
-    this.nodes.clear()
+    this.streams.disposeAll()
     this.subscribers.clear()
   }
 

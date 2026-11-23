@@ -27,6 +27,7 @@
  *
  * @module @greatbaby/dsh-remote-node-harness/host/remote-events
  */
+import { NodeStreamSet } from './node-stream-set.js'
 
 /**
  * The forwarded events a remote Session row needs in order to stay live.
@@ -204,8 +205,19 @@ export class RemoteEvents {
     this.waterfalls = waterfalls
     this.emit = sink.emit
     this.log = sink.log ?? (() => {})
-    /** @type {Map<string, NodeEvents>} */
-    this.nodes = new Map()
+    this.streams = new NodeStreamSet(runtime => new NodeEvents(
+      runtime.record.id,
+      runtime.gateway,
+      // Without a relay the node's own default applies, which is what this
+      // module's older build always did. Keeping that fallback means a Host
+      // composed without `typertGateway` still answers instead of hanging.
+      this.waterfalls?.forNode(runtime) ?? new DecliningRelay(runtime.record.id, runtime.gateway, this.log),
+      {
+        emit: (event, args) => this.#relay(runtime.record.id, event, args),
+        log: this.log,
+        ended: () => this.#reopen(runtime.record.id),
+      },
+    ))
     this.disposed = false
   }
 
@@ -223,35 +235,15 @@ export class RemoteEvents {
    */
   sync() {
     if (this.disposed) return
-    const routable = this.rnh.routable()
-    const live = new Set(routable.map(runtime => runtime.record.id))
-    for (const [nodeId, node] of [...this.nodes]) {
-      if (live.has(nodeId)) continue
-      node.close()
-      this.nodes.delete(nodeId)
+    const plan = this.streams.plan(this.rnh)
+    for (const nodeId of plan.left) this.streams.drop(nodeId)
+    for (const runtime of plan.staying) {
+      // Same node, same gateway: only the carrier is missing.
+      const existing = this.streams.get(runtime.record.id)
+      if (!existing.live) void existing.open()
     }
-    for (const runtime of routable) {
-      const nodeId = runtime.record.id
-      const existing = this.nodes.get(nodeId)
-      if (existing !== undefined) {
-        // Same node, same gateway: only the carrier is missing.
-        if (!existing.live) void existing.open()
-        continue
-      }
-      const node = new NodeEvents(
-        nodeId,
-        runtime.gateway,
-        // Without a relay the node's own default applies, which is what this
-        // module's older build always did. Keeping that fallback means a Host
-        // composed without `typertGateway` still answers instead of hanging.
-        this.waterfalls?.forNode(runtime) ?? new DecliningRelay(nodeId, runtime.gateway, this.log),
-        {
-          emit: (event, args) => this.#relay(nodeId, event, args),
-          log: this.log,
-          ended: () => this.#reopen(nodeId),
-        },
-      )
-      this.nodes.set(nodeId, node)
+    for (const runtime of plan.arrived) {
+      const node = this.streams.add(runtime)
       void node.open()
     }
   }
@@ -266,12 +258,12 @@ export class RemoteEvents {
    */
   #reopen(nodeId) {
     if (this.disposed) return
-    const node = this.nodes.get(nodeId)
+    const node = this.streams.get(nodeId)
     if (node === undefined) return
     const runtime = this.rnh.get(nodeId)
     if (runtime === undefined) return
     runtime.gateway.revive(() => {
-      const current = this.nodes.get(nodeId)
+      const current = this.streams.get(nodeId)
       if (current === undefined || current.live) return
       const live = this.rnh.get(nodeId)
       if (live === undefined || !live.routable) return
@@ -290,16 +282,14 @@ export class RemoteEvents {
   adopt(waterfalls) {
     this.waterfalls = waterfalls
     if (this.disposed) return
-    for (const node of this.nodes.values()) node.close()
-    this.nodes.clear()
+    this.streams.disposeAll()
     this.sync()
   }
 
   /** Close every stream. */
   dispose() {
     this.disposed = true
-    for (const node of this.nodes.values()) node.close()
-    this.nodes.clear()
+    this.streams.disposeAll()
   }
 
   /**
