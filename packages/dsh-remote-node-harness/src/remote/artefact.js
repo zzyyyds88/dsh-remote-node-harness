@@ -984,31 +984,6 @@ function stampText(input) {
 }
 
 /**
- * Read the version an unpacked runtime reports, without starting it.
- *
- * Kept as `node -e` rather than a second download of `package.json`: the version a node
- * will actually run is the one in its own tree, and this reads exactly that.
- * @param {string} runtime - the runtime directory.
- */
-export function installedVersionScript(runtime) {
-  const manifest = shellPath(`${runtime}/node_modules/@deepseek-ai/dsh/package.json`)
-  return `node -e 'const m=require(process.argv[1]);process.stdout.write(String(m.version))'`
-    + ` "${manifest}" 2>/dev/null || echo`
-}
-
-/**
- * Read the packaging build of an installed tree, or empty when it has no stamp.
- *
- * A tree installed before stamps existed has none, which must read as "older than
- * anything this build publishes" rather than as "current": that is what repairs a node
- * left on a tree packed by an earlier, broken rule set.
- * @param {string} runtime
- */
-export function installedBuildScript(runtime) {
-  return `cat "${shellPath(runtime)}/${BUILD_STAMP}" 2>/dev/null || echo`
-}
-
-/**
  * Whether an installed tree can be trusted for this release.
  *
  * Both halves matter and neither implies the other: the version says *which release* the

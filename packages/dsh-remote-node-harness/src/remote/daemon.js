@@ -956,23 +956,6 @@ echo written
   }
 
   /**
-   * Remove a bundle from the node's package list.
-   *
-   * Only the resolution is dropped; the directory stays until npm prunes it, because a
-   * half-deleted package is worse than an unused one and the bundle list is what decides
-   * composition anyway.
-   * @param {readonly string[]} bundles
-   */
-  async uninstallPlugins(bundles) {
-    if (bundles.length === 0) return
-    await this.connection.exec({
-      argv: ['sh', '-c', `cd ${this.layout.profile} && npm uninstall --no-audit --no-fund --loglevel=error ${bundles.map(name => `"${name}"`).join(' ')} 2>&1 || true`],
-      timeoutMs: 5 * 60_000,
-      maxBytes: 128 * 1024,
-    })
-  }
-
-  /**
    * Point the plugin's own profile at `bundles`, writing its manifest only when it
    * differs, and make sure a patch file exists for the host to hot-reload.
    *
@@ -1308,13 +1291,3 @@ export function parseWebUrl(text) {
     return undefined
   }
 }
-
-/** Categories that mean "this machine cannot host a resident DSH yet". */
-export const PROVISION_FAILURES = Object.freeze({
-  NO_NODE: 'no-node',
-  OLD_NODE: 'old-node',
-  NO_NPM: 'no-npm',
-  INSTALL_FAILED: 'install-failed',
-  START_FAILED: 'start-failed',
-  AUTH: SSH_FAILURE.AUTH,
-})

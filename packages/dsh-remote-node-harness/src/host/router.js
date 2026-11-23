@@ -20,7 +20,6 @@ import {
   decodeRemoteId,
   encodeRemoteId,
   isRemoteId,
-  remoteIterable,
   remapIds,
 } from './routing.js'
 
@@ -46,9 +45,6 @@ import {
  * is a promise; that asymmetry is inherent to routing, and no in-process caller here
  * ever passes a remote Agent.
  */
-
-/** Endpoint families whose arguments name a Session. */
-const SESSION_REQUEST_KEYS = Object.freeze(['request', 'sessionId', 'address'])
 
 /**
  * One Session identity as DSH mints it: `session-` followed by a uuid.
@@ -137,17 +133,6 @@ function sessionIdOf(request) {
   return undefined
 }
 
-/**
- * Pull the Workspace identity out of one request object.
- * @param {Record<string, unknown> | undefined} request
- * @returns {string | undefined}
- */
-function workspaceIdOf(request) {
-  if (request === undefined || request === null || typeof request !== 'object') return undefined
-  const direct = Reflect.get(request, 'workspaceId')
-  return typeof direct === 'string' ? direct : undefined
-}
-
 /** A failure shaped like the Gateway's own Remote failure, so the client sees one protocol. */
 class RoutedFailure extends Error {
   /**
@@ -165,12 +150,6 @@ class RoutedFailure extends Error {
 }
 
 /** Translate one gateway failure into a Remote failure. */
-function toFailure(error, endpoint) {
-  if (error instanceof RoutedFailure) return error
-  const code = typeof error?.code === 'string' ? error.code : 'rnh/unavailable'
-  const message = error instanceof Error ? error.message : String(error)
-  return new RoutedFailure(code, message, { endpoint })
-}
 
 /**
  * Everything the routing layer needs from the running Host.
@@ -391,23 +370,6 @@ export class Router {
   }
 
   /**
-   * Route one Workspace endpoint the same way.
-   * @param {string} endpoint
-   * @param {(request: Record<string, unknown>, signal?: AbortSignal) => unknown} local
-   */
-  workspaceEndpoint(endpoint, local) {
-    const router = this
-    return function routed(request, signal) {
-      const decoded = decodeRemoteId(workspaceIdOf(request))
-      if (decoded === undefined) return local(request, signal)
-      const payload = router.toRemote({ request: request ?? {} }, decoded.nodeId)
-      return router.call(decoded.nodeId, `workspace/${endpoint}`, payload, signal).then(
-        value => router.toLocalWorkspace(value, decoded.nodeId),
-      )
-    }
-  }
-
-  /**
    * Route one endpoint whose identity is an `agent: Agent` **first positional argument**.
    *
    * The Gateway resolves that argument from the wire's `agentId` before the body runs, and
@@ -495,27 +457,6 @@ export class Router {
       const decoded = decodeRemoteId(typeof id === 'string' ? id : undefined)
       if (decoded === undefined) return local(id, ...args)
       return router.call(decoded.nodeId, endpoint, { [field]: decoded.remoteId }).then(
-        value => router.toLocal(value, decoded.nodeId),
-      )
-    }
-  }
-
-  /**
-   * Route one Session *stream* endpoint by proxying frames.
-   * @param {string} endpoint
-   * @param {(request: Record<string, unknown>, signal?: AbortSignal) => AsyncIterable<unknown>} local
-   */
-  sessionStream(endpoint, local) {
-    const router = this
-    return function routed(request, signal) {
-      const decoded = decodeRemoteId(sessionIdOf(request))
-      if (decoded === undefined) return local(request, signal)
-      const payload = router.toRemote({ request: request ?? {} }, decoded.nodeId)
-      return remoteIterable(
-        router.node(decoded.nodeId).gateway,
-        `session/${endpoint}`,
-        payload,
-        signal,
         value => router.toLocal(value, decoded.nodeId),
       )
     }

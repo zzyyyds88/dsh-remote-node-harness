@@ -220,27 +220,6 @@ export function remoteIterable(gateway, endpoint, args, signal, transform) {
   }
 }
 
-/** One-shot wake-up latch used to coalesce change notifications. */
-export class ChangeSignal {
-  constructor() {
-    /** @type {() => void} */
-    this.resolve = () => {}
-    this.promise = new Promise(resolve => { this.resolve = resolve })
-  }
-
-  /** Await the next notification. */
-  wait() {
-    return this.promise
-  }
-
-  /** Release every waiter and arm a fresh latch. */
-  fire() {
-    const resolve = this.resolve
-    this.promise = new Promise(next => { this.resolve = next })
-    resolve()
-  }
-}
-
 /**
  * Decorate live Service methods without disturbing the Remote descriptor.
  *
