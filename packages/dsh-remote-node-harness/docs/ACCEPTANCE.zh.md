@@ -306,7 +306,7 @@ node packages\dsh-remote-node-harness\test\workspace-browse.mjs <base> <token>
 node packages\dsh-remote-node-harness\test\run-all.mjs --layer offline,contract
 ```
 
-单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 50 个套件与它们各自的依赖。
+单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 53 个套件与它们各自的依赖。
 **每个套件守的是哪条上游契约、DSH 升级后按什么顺序重跑**，见 [`UPGRADE.zh.md`](UPGRADE.zh.md) §二。
 
 ```powershell
@@ -739,9 +739,12 @@ bug，是同一类结构缺陷在长新 bug。设计文档与逐条实证见
 
 | 层 | 结果 |
 |---|---|
-| offline | **30 passed, 0 failed, 0 skipped** in 21.3s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`） |
-| contract | **3 passed, 0 failed** in 816ms |
-| e2e（真节点 `probe-93`） | **17 passed, 0 failed, 2 skipped**；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
+| offline | **33 passed, 0 failed, 0 skipped** in 23.2s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`/`merge-stream`/`registry`/`suite-registry`） |
+| contract | **3 passed, 0 failed** in 940ms |
+| e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 259.3s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
+
+e2e 里 17 个套件中有 2 个在这台部署上跳过，所以"passed"是 15 —— 这一栏写的是**实跑数**，
+套件总数（17）写在 `run-all.mjs --list` 与 README 里。两者的差就是那两个带原因的 SKIP。
 
 e2e 里有几条值得单独记：`e2e/artefact` 现在真的在节点上跑安装脚本 —— 新鲜安装是符号链接
 指向编号代、升级只留一代、坏校验和不动现役、提交点被 SIGKILL 后现役仍可启动、

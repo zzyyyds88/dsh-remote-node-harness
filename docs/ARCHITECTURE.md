@@ -1242,8 +1242,8 @@ provision 白名单、bundle 名。
 
 ## 七、测试
 
-共 50 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 30 个（纯逻辑 + 组合
-检查 + 真 POSIX shell 跑安装脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
+共 53 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 33 个（纯逻辑 + 组合
+检查 + 真 POSIX shell 跑安装脚本与目录列举脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
 （运行中的 Host + 连上的节点）。下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 
 | 脚本 | 验证什么 | 依赖 |
@@ -1274,6 +1274,26 @@ provision 白名单、bundle 名。
 | `waterfall-unit.mjs` | 审批/提问中继：允许的 waterfall 才发到浏览器、拒绝与超时各自结算、节点断开时卡片被取消、问题按自己的名字转发 | 无 |
 | `workspace-browse.mjs` | 加工作区对话框背后的两个接口：本机与节点用同一形状回答、节点列的是节点的盘（`/` 没有上级、隐藏目录不列）；**本机**不存在的目录仍报错，**节点**上合法但不存在的绝对路径返回 `exists: false` 的空层 | 运行中的 Host + 已连接节点 |
 | `picker-flow.mjs` | **手机**看节点这条路由：`/@rnh` 列出节点、`/@rnh/<id>/` 列出那台机器真实的根、每个 entry 都拼回命名空间、面包屑不越界、没记过的 id 报 `rnh/node-unknown`；节点上不存在的路径给出可确认的空层，拿它 `workspace/create` 之后节点上真有那个目录、桌面盘上那条幽灵链被清掉；已存在的路径同样建工区，且同目录下别人放的文件不动 | 同上 |
+| `node-status-unit.mjs` | 状态机：7 个 kind 的判别联合、22 个事件、6 条不变量（`phase` 只在 connecting、`serving` 只在 connected、`error` 只在 failed…）、`recovering` 对外仍报 `idle` | 无 |
+| `recovery-ladder-unit.mjs` | 假时钟上跑真阶梯：2 s → 4 s → 8 s → 2 min，漏掉的一级保持 `recovering` 而不报 `failed`，主动断开重置它，`dispose` 取消它 | 无 |
+| `registry-unit.mjs` | `nodes.json` 只坏一个字段时不整表清零：改名式备份、逐条跳过、`normalizeNode` 抛 `node-invalid` → HTTP 400 | 无 |
+| `capabilities-unit.mjs` | 能力注册表**自己**的逻辑：每条记录结构完整、三个 verdict 分支都真的会走（含 `optional`）、`*` 模式边界、保留集派生、凭据需求与推送的对照 | 无 |
+| `gate-mutation-unit.mjs` | 闸门**自己的**测试：五种真实漂移各让 `check-capabilities --strict` 非零退出并说出是哪一处（在临时副本上做，不动工作区） | 无 |
+| `browse-protocol-unit.mjs` | 目录列举的 `type\0value\0` 记录协议，在**真 POSIX shell** 上跑真脚本：marker 形状的目录名、含换行的名字、非 UTF-8 名字、缺 `find`、越界路径、`mkdir` 的单段校验 | 真 shell（WSL 或 `/bin/bash`），无则 SKIP |
+| `merge-stream-unit.mjs` | 合并流的**生命周期**（载荷策略各自不同，只测共用那层）：抛错以 rejection 到达消费者、`return()`/abort 恰好释放订阅一次、`prelude` 在首帧之前 | 无 |
+| `ws-frame-unit.mjs` | WS 帧纯编解码：控制帧载荷 ≤125 字节（超了就是损坏帧）、分片明确拒绝而不是拼错 | 无 |
+| `http-over-ssh-unit.mjs` | SSH 上的 HTTP：超时预算唯一（`asSocket.setTimeout` 已删）、响应体有上限、`Content-Length` 不符时明确失败 | 无（假 socket） |
+| `error-frame-unit.mjs` | 节点错误帧不被降级成正常结束：真 ws + 真 Gateway + 真 `AsyncQueue`，错误到达消费者 | 无（假 socket） |
+| `install-shell-unit.mjs` | 生成物是**真能跑**的 POSIX shell：新鲜安装是指向编号代的符号链接、升级只留一代、坏校验和不动现役、提交点被 SIGKILL 后现役仍可启动、每条退出路径都以一行 JSON 结束 | 真 shell 且能建符号链接（WSL ext4），否则 SKIP |
+| `packet-unit.mjs` | 一次 exec 请求就是一个 SSH 包：命令行超 128 KiB 在本地拒绝，不发出去让服务器损坏连接 | 无 |
+| `errors-unit.mjs` | 失败分类的顺序（显式 code → ssh 类别 → ssh2 字面量 → 阶段）、每个 code 的 `action`/`retryable`、节点日志脱敏与长度上限 | 无 |
+| `rnh-lifecycle-unit.mjs` | 节点生命周期：掉线变 `idle` 带时间戳、重连阶梯布防、主动断开取消它、首次主机密钥记录并回放、失败保留 phase、不可达节点保留工区行 | 无（假 connection/gateway） |
+| `generated-sync-unit.mjs` | 生成物 `brain-bundle.generated.js` 与磁盘上的源**逐字节**一致，且它派生的凭据清单等于 `capabilities.mjs` 派生的那份 | 无 |
+| `check-capabilities.mjs` | 能力单一真源的对账：组合行、预设行、保留包、删除包、provision 白名单、bundle 名，八个小节 | 无（`--strict` 是闸门） |
+| `fork-base-unit.mjs` | fork 出来的节点基座与上游发布版一致：版本、bundle 名、profile 模板 | 已安装的 DSH release |
+| `fork-runtime-unit.mjs` | 裁剪规则的两条载重规则：`@deepseek-ai/dsh-web-app` 的 manifest 必须留着；staging 清单只把 `@deepseek-ai/dsh` 列为依赖、其余进 `overrides` | 无 |
+| `node-patches-unit.mjs` | 台账完整：每个改过的上游文件都有对应 patch，每个 patch 都能单独读、单独弃用 | 无 |
+| `suite-registry-unit.mjs` | **矩阵自身的完整性**：磁盘上每个测试文件都被 `run-all` 调度、`run-all` 点名的每个文件都存在、每个条目都声明了 layer 且只用三个已知值。`registry-unit` 曾整批没被调度过而无人发现，这条是那件事的闸门 | 无 |
 | `picker-paths-unit.mjs` | `/@rnh` 命名空间的编解码（两种路径规范化器都能过、大小写、盘符、重复分隔符、完整 segment 才匹配）；影子目录清理**删不掉**任何有内容的目录，也拒绝命名空间之外的路径 | 无 |
 | `install-unit.mjs` | 安装清单自洽：`dsh.bundle.patch` 每个文件都存在且已声明、`engines.dsh` 是合法范围、`files` 覆盖所有运行物、`meta.detail` 指向真实文件、打包文件里没有内网地址与私钥 | 无 |
 | `autoconnect-unit.mjs` | 重启后不点「连接」也能连上：`autoConnect` 先取凭据再判断，有凭据就连、没凭据/被禁用的不连、凭据库抛错只记日志不外泄 | 无（内存注册表 + 内存凭据库） |
