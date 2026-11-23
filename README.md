@@ -118,9 +118,9 @@ dsh-client-ui-*    : 0
 web-runtime        : 0
 ```
 
-**测试**：47 个套件分三层（offline 27 / contract 3 / e2e 17），`test/run-all.mjs` 一次调度。
-最近一次三层全量：纯逻辑 **27 passed, 0 failed**；契约 **3 passed**；端到端在 `rnhtest` Host +
-真实 Linux 节点上 **15 passed, 0 failed, 2 skipped in 732.4s**（两个 skip 都带原因：这台桌面没有
+**测试**：50 个套件分三层（offline 30 / contract 3 / e2e 17），`test/run-all.mjs` 一次调度。
+最近一次三层全量：纯逻辑 **30 passed, 0 failed**；契约 **3 passed**；端到端在 `rnhtest` Host +
+真实 Linux 节点上 **17 passed, 0 failed, 2 skipped**（两个 skip 都带原因：这台桌面没有
 第三方插件可切换、没有开 `--remote-debugging-port` 的 Chrome）。跑不了的套件带原因记 SKIP，
 不记成通过；`--layer e2e` 一个都没跑成时非零退出。
 

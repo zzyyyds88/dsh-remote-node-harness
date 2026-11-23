@@ -368,10 +368,14 @@ src/
 
 **批 5：边界与协议（§七 + §八）**
 
-20. `http-over-duplex` 的超时/上限；`ws/frame` 纯编解码 + 控制帧长度修复；
-21. `browse` 结构化协议 + 路径策略下沉；
-22. 错误唯一出口 + 一张错误表；
-23. 合并流与四个 `Remote*` 骨架收敛。
+20. `http-over-duplex` 的超时/上限；`ws/frame` 纯编解码 + 控制帧长度修复 —— **已做**；
+21. `browse` 结构化协议 + 路径策略下沉 —— **已做**（`posix-path.js` 是唯一折叠处，
+    `browse.js` 换成 `type\0value\0` 记录 + NUL/base64 名字块，`browse-protocol-unit`
+    在真实 shell 上跑真实脚本，含 marker 形状的目录名、换行、非 UTF-8、缺 `find`）；
+22. 错误唯一出口 + 一张错误表 —— **只做了一半**：错误帧不再退化成 EOF（`error-frame-unit`），
+    但 `classifyFailure` 与 `PROVISION_FAILURES` 两套词汇仍在，后者没有消费者；
+23. 合并流与四个 `Remote*` 骨架收敛 —— **未做**（`decorators.js` 仍 1083 行、18 个
+    `decorate*`，与 `remote-control.js` 的合并流骨架约 150 行重复）。
 
 ## 十、验收判据
 

@@ -1215,13 +1215,24 @@ provision 白名单、bundle 名。
 - 节点 brain 没有独立版本号（它是以文件写入的，唯一戳是内容哈希），所以 `decideGate` 的
   brain 分支保持惰性 —— 代价是「节点被别的桌面装新了要拒绝」这条保护仍然不存在。
 - `remoteRoot` 仍不加引号插进 `sh -c`（入口是设置页，属本机可信输入，但仍是注入面）。
-- `browse.js` 的哨兵协议仍是「stdout + stderr 拼起来做无锚点正则」，路径合法性散在三处。
+- `decorators.js` 仍是单文件 1083 行、按命名空间分 18 个 `decorate*` 函数；`remote-control.js`
+  与它的合并流骨架有约 150 行重复。设计 §九 批 5 第 23 项未做。
+- 错误仍有两套词汇：`src/core/errors.js` 的 `classifyFailure` 与 `daemon.js` 的
+  `PROVISION_FAILURES`（后者今天没有消费者）。设计 §九 批 5 第 22 项只做了错误帧那一半。
+
+### 目录浏览的协议（F1/F2 修完之后）
+
+`browse.js` 不再解析文本：每个事实是 `type\0value\0` 记录，名字块 NUL 分隔 + base64 包裹，
+`find` 的退出码直接检查。名字因此不可能伪装成事实，非 UTF-8 名字带 `unrepresentable` 标记
+而不是被静默替换成 U+FFFD。路径合法性只有一处（`posix-path.js` 的 `normalizePosix`）：
+折叠 `//`、`.`、`..`，**越过根报错而不钳制**，`listRemote` / `makeRemoteDirectory` /
+`ensureRemoteDirectory` / `decodePickerPath` / `index.js` 的 `workspace/create` 全部走它。
 
 ---
 
 ## 七、测试
 
-共 47 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 27 个（纯逻辑 + 组合
+共 50 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 30 个（纯逻辑 + 组合
 检查 + 真 POSIX shell 跑安装脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
 （运行中的 Host + 连上的节点）。下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 

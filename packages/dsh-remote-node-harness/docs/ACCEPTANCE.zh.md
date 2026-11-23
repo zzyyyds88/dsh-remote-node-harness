@@ -306,7 +306,7 @@ node packages\dsh-remote-node-harness\test\workspace-browse.mjs <base> <token>
 node packages\dsh-remote-node-harness\test\run-all.mjs --layer offline,contract
 ```
 
-单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 47 个套件与它们各自的依赖。
+单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 50 个套件与它们各自的依赖。
 **每个套件守的是哪条上游契约、DSH 升级后按什么顺序重跑**，见 [`UPGRADE.zh.md`](UPGRADE.zh.md) §二。
 
 ```powershell
@@ -719,26 +719,34 @@ bug，是同一类结构缺陷在长新 bug。设计文档与逐条实证见
 
 **结构性改动**
 
-- `packages/rnh-brain/capabilities.mjs`：能力单一真源（20 个能力、`verdict` 三态、派生 6 个方向）。
+- `packages/rnh-brain/capabilities.mjs`：能力单一真源（21 个能力、`verdict` 三态、派生 6 个方向）。
+  其中 `web` 是独立记录：`tool-web` 挂两个工具，`web_search` 需要 `DEEPSEEK_API_KEY` 而
+  `web_fetch` 不需要，塞进 `agent-tools` 会让「搜索缺 key」把 bash 和文件工具一起拖下水。
+  凭据需求从「provision 白名单的副产物」变成 `capabilities.mjs` 里的声明（`credentials` 字段），
+  三处消费：离线对账、生成物派生一致性、连接期 `provision.unmet` 报告。
 - `src/host/node-status.js`：`idle|connecting|connected|recovering|failed|stopping|terminated`
   判别联合 + 22 个事件的纯 `reduce` + 8 个显式副作用 + 6 条可断言不变量。
+- `src/host/posix-path.js`：POSIX 路径折叠的唯一实现。`..` 越过根**报错而不钳制**
+  （`/../../etc` 钳成 `/etc` 等于把调用者问的路径换成一个他没问的），
+  `listRemote` / `makeRemoteDirectory` / `ensureRemoteDirectory` / `decodePickerPath` /
+  设置页的 `workspace/create` 全部走它。
 - 安装事务化：`runtime -> runtime.<n>` 符号链接 + **唯一提交语句** `ln -sfn`；
   shell↔JS 契约改为最后一行 JSON；进程身份用 `/proc/<pid>/{cmdline,stat}`。
 - 传输层补四个上限（HTTP 超时/响应体、ws 累计缓冲、multipart part 数）。
-- 生成物同步门禁 `generated` + 能力对账门禁 `capabilities`。
+- 生成物同步门禁 `generated` + 能力对账门禁 `capabilities` + 闸门自身的变异测试 `gate-mutation`。
 
 **三层验收（2026-11-23 实跑）**
 
 | 层 | 结果 |
 |---|---|
-| offline | **27 passed, 0 failed, 0 skipped** in 19.7s（新增 `node-status`/`recovery-ladder`/`capabilities`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`） |
-| contract | **3 passed, 0 failed** in 783ms |
-| e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 732.4s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
+| offline | **30 passed, 0 failed, 0 skipped** in 21.3s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`） |
+| contract | **3 passed, 0 failed** in 816ms |
+| e2e（真节点 `probe-93`） | **17 passed, 0 failed, 2 skipped**；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
 
 e2e 里有几条值得单独记：`e2e/artefact` 现在真的在节点上跑安装脚本 —— 新鲜安装是符号链接
 指向编号代、升级只留一代、坏校验和不动现役、提交点被 SIGKILL 后现役仍可启动、
 回滚答 `kept-current` 而不降级；`e2e/session`/`tool-parity`/`tool-git-image` 证明工具仍在
-节点上原生运行。
+节点上原生运行；`e2e/picker-flow`/`workspace-browse`/`workspace-flow` 在记录协议重写之后重跑通过。
 
 **这一轮没有验证到的**
 
@@ -749,3 +757,5 @@ e2e 里有几条值得单独记：`e2e/artefact` 现在真的在节点上跑安�
 - 真实浏览器里的失败态：客户端那部分只到源码 + mock 渲染层。
 - `dropPackages()` 的键空间不对称（规则按裸名、保留按全名）是已知债务，本轮**没有**改。
 - macOS（无 procfs）的进程身份降级路径只有代码与构造输入，未在 macOS 上执行。
+- `decorators.js` 与 `remote-control.js` 的合并流骨架重复（约 150 行）仍在；
+  错误词汇仍有两套（`classifyFailure` 与没有消费者的 `PROVISION_FAILURES`）。
