@@ -298,6 +298,42 @@ let corruptOriginal
   }
 }
 
+// ---- 8. remoteRoot is a path, not a shell fragment -------------------------
+// `remoteRoot` is interpolated into `sh -c` text in ~35 places, so an unvalidated value is a
+// remote command-injection surface. It used to be validated as "a non-empty string" and
+// nothing else. These cases are the injection attempts themselves, not proxies for them.
+{
+  const { normalizeRemoteRoot } = await import('../src/core/registry.js')
+  const allowed = ['~/.dsh-remote-node-harness', '/root/fleet', '~', '', undefined]
+  for (const value of allowed) {
+    check(normalizeRemoteRoot(value).ok === true,
+      `${JSON.stringify(value)} is accepted as a remote root`, JSON.stringify(normalizeRemoteRoot(value)))
+  }
+  const refused = [
+    '~/x; touch /tmp/pwned',
+    '/tmp/$(id)',
+    '/tmp/`id`',
+    '/tmp/a"b',
+    "~/it's",
+    '/tmp/a\nb',
+    '/tmp/a b',
+    '/tmp/a\\b',
+    'relative/path',
+    '/tmp/a/../b',
+    '/tmp/.',
+  ]
+  for (const value of refused) {
+    const result = normalizeRemoteRoot(value)
+    check(result.ok === false, `${JSON.stringify(value)} is refused as a remote root`,
+      JSON.stringify(result))
+  }
+  // The one shape that must still work: the default, because every existing node has it.
+  check(normalizeRemoteRoot('~/.dsh-remote-node-harness').root === '~/.dsh-remote-node-harness',
+    'the default root survives validation unchanged')
+  check(normalizeRemoteRoot('').root === '~/.dsh-remote-node-harness',
+    'and an absent one becomes the default rather than an error')
+}
+
 rmSync(sandbox, { recursive: true, force: true })
 if (failed > 0) {
   console.log(`\n[registry-unit] FAILED: ${String(failed)} check(s)`)

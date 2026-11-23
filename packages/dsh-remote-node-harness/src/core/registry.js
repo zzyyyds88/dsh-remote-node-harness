@@ -55,6 +55,60 @@ export function isNodeId(value) {
 }
 
 /**
+ * The characters a remote root may contain.
+ *
+ * `remoteRoot` is not just a path: it is interpolated into shell text in ~35 places
+ * (`mkdir -p <root>/run`, `cd <runtime>`, `rm -f <status>`, the launch line, the install
+ * script's `runtime="…"` assignment). The field used to be validated as "a non-empty string"
+ * and nothing else, which made it the plugin's one remote command-injection surface — the
+ * settings page is the entry point, but "a trusted local input" is not the same as "a
+ * validated one", and a `;`, a `$(…)` or a bare `"` in that field ran on the node.
+ *
+ * **Every allowed character is inert in an unquoted POSIX shell word**, and that is the whole
+ * design: it makes the ~35 existing interpolation sites correct without touching them, and it
+ * keeps being correct for the sites somebody adds next year. `~` is the one exception, and it
+ * is the exception that is wanted — a leading `~` is exactly how the default root is spelled,
+ * and unquoted is the only place a shell expands it.
+ *
+ * Spaces are **refused** even though a directory may contain one. Allowing them would leave
+ * `mkdir -p <root>/run` splitting into two arguments — not an injection, but a wrong
+ * directory, which is the same class of failure at a quieter volume. A root with a space in it
+ * is not a thing anyone types on purpose, and `artefact.js` quotes its own paths anyway.
+ */
+const REMOTE_ROOT_PATTERN = /^[A-Za-z0-9._\-/~+@,=:]+$/u
+
+/**
+ * Validate one remote root, or say why it is not usable.
+ *
+ * `~` is only meaningful as the first character (a shell expands it there and nowhere else),
+ * and a root may not contain a `.`/`..` segment, because both would resolve to something other
+ * than what the record says.
+ * @param {unknown} value
+ * @returns {{ ok: true, root: string } | { ok: false, reason: string }}
+ */
+export function normalizeRemoteRoot(value) {
+  if (value === undefined || value === null) return { ok: true, root: '~/.dsh-remote-node-harness' }
+  if (typeof value !== 'string') return { ok: false, reason: 'a remote root must be a string' }
+  const root = value.trim()
+  if (root.length === 0) return { ok: true, root: '~/.dsh-remote-node-harness' }
+  if (root.length > 200) return { ok: false, reason: 'a remote root must be at most 200 characters' }
+  if (!REMOTE_ROOT_PATTERN.test(root)) {
+    return {
+      ok: false,
+      reason: 'a remote root may contain only letters, digits and . _ - / ~ + @ , = :',
+    }
+  }
+  if (!root.startsWith('/') && !root.startsWith('~/') && root !== '~') {
+    return { ok: false, reason: 'a remote root must be absolute or start with ~/' }
+  }
+  if (root.indexOf('~', 1) !== -1) return { ok: false, reason: 'a remote root may use ~ only at the start' }
+  const segments = root.split('/')
+  if (segments.includes('..')) return { ok: false, reason: 'a remote root may not contain a .. segment' }
+  if (segments.at(-1) === '.') return { ok: false, reason: 'a remote root may not end in a . segment' }
+  return { ok: true, root }
+}
+
+/**
  * Validate and normalize one record read from disk or written by a client.
  *
  * Every rejection carries `code: 'node-invalid'` so a settings page can tell "the
@@ -78,9 +132,11 @@ export function normalizeNode(input) {
   if (authKind !== 'password' && authKind !== 'key' && authKind !== 'agent') {
     throw apiError('node-invalid', 'rnh: node auth kind must be password, key, or agent')
   }
-  const remoteRoot = typeof input.remoteRoot === 'string' && input.remoteRoot.trim().length > 0
-    ? input.remoteRoot.trim()
-    : '~/.dsh-remote-node-harness'
+  // Validated here, once, because this is the only place a record is created or edited — see
+  // `REMOTE_ROOT_PATTERN` for why an unvalidated root is a remote command-injection surface.
+  const root = normalizeRemoteRoot(input.remoteRoot)
+  if (!root.ok) throw apiError('node-invalid', `rnh: ${root.reason}`)
+  const remoteRoot = root.root
   return {
     id,
     name,
