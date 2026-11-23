@@ -23,10 +23,11 @@
  * @module @greatbaby/dsh-remote-node-harness/remote/daemon
  */
 import { createHash } from 'node:crypto'
-import { SSH_FAILURE, toSshError } from '../ssh/connection.js'
+import { SSH_FAILURE, classifySshError, quotePosixArgument, toSshError } from '../ssh/connection.js'
 import {
   BUILD_STAMP,
   FETCH_CEILING_SECONDS,
+  ROLLBACK_VERDICTS,
   artefactUrls,
   inspectRuntime,
   installScript,
@@ -162,12 +163,31 @@ export const REMOTE_LAYOUT = remoteLayout()
  * @returns {string}
  */
 export function pluginInstallScript({ profile, profileName, targets }) {
+  // The manifest is a **shell literal**, never a printf format.
+  //
+  // This line used to be `printf '{"name":…"dependencies":{}}\n'` written inside a JS
+  // template string. Two levels of escaping collapsed into each other: the shell received
+  // `{}}` followed by *two backslashes and an n*, printf turned that into one literal
+  // backslash plus `n`, and the file ended with the text `\n` rather than a newline. npm
+  // then refused the manifest with
+  // `EJSONPARSE … Unexpected non-whitespace character after JSON at position 65`, so every
+  // new node's **first** connect failed to install its plugins while the settings page just
+  // showed "the plugin did not take effect". The second connect only worked because
+  // `writeProfileBundles` had rewritten the manifest in the meantime.
+  //
+  // So the newline is not an escape at all here: `'%s\n'` is printf's *own* format (one
+  // backslash in the shell script), and the JSON rides as a single-quoted shell word, where
+  // `"`, `{}`, `/` and `$` are all literal. `quotePosixArgument` is this project's existing
+  // single-quote escaper (`'` → `'\''`), so a profile name containing a quote or a backslash
+  // still produces a valid JSON file instead of a truncated shell word. The profile name is
+  // sanitized to `[A-Za-z0-9-]` today, but the escaper must not depend on that.
+  const manifest = JSON.stringify({ name: `dsh-profile-${profileName}`, private: true, dependencies: {} })
   return `
 set -u
 mkdir -p ${profile}
 cd ${profile}
 if [ ! -f package.json ]; then
-  printf '{"name":"dsh-profile-${profileName}","private":true,"dependencies":{}}\\\\n' > package.json
+  printf '%s\\n' ${quotePosixArgument(manifest)} > package.json
 fi
 npm install --no-audit --no-fund --loglevel=error --legacy-peer-deps ${targets.map(target => `"${target}"`).join(' ')} 2>&1
 echo "RNH_NPM_EXIT=$?"
@@ -329,10 +349,12 @@ export class RemoteHost {
    * the same pinned release, so a desktop upgrade has no artefact until this project rebuilds
    * one. The connect then fails with the URLs it tried — a decidable failure, on purpose.
    *
-   * A broken artefact is still a different thing from a missing one: exit codes 4 and 5 mean
-   * the bytes arrived but did not survive the checksum, the unpack or the shape check. Those
-   * roll the previous runtime back and **throw**, so a node keeps the release it had instead of
-   * a mixture of two.
+   * A broken artefact is still a different thing from a missing one: exit codes 4, 5, 6 and 7
+   * mean the bytes arrived but did not survive the checksum, the unpack, the shape check or the
+   * executable-bit check. All four happen **before** the live tree is replaced, so the failure
+   * keeps the release the node already had and then **throws**; the previous tree is only used
+   * when the live one cannot start (see `#rollbackAfterFailure`). A transport failure is judged
+   * the same way and reported with the same verdict line.
    *
    * The URL is built here rather than by the caller because it needs the **node's**
    * platform, which only the probe knows. A runtime packed on Windows carries
@@ -417,32 +439,54 @@ export class RemoteHost {
         total: await totalBytes(this.connection, urls),
         onUpdate: progress => options.onTransfer?.(progress),
       })
-    const attempt = await this.connection.exec({
-      argv: ['sh', '-c', script],
-      // Must outlast the download ceiling, or a slow-but-healthy link gets killed by the SSH
-      // layer while curl is still making progress — and `channel.close()` does not reap the
-      // remote `curl`, measured in the `budget-recovery` probe. The ceiling is 1800 s, so
-      // this leaves a minute for unpack, the `--version` check and the stamp write.
-      timeoutMs: (FETCH_CEILING_SECONDS + 60) * 1000,
-      maxBytes: 1024 * 1024,
-    }).finally(() => {
-      stopWatch()
-      // Cleared, not left at 100%: the phase has moved on, and a stale bar under "starting
-      // the resident host" would say the install is still running.
-      options.onTransfer?.(undefined)
-    })
+    let attempt
+    try {
+      attempt = await this.connection.exec({
+        argv: ['sh', '-c', script],
+        // Must outlast the download ceiling, or a slow-but-healthy link gets killed by the SSH
+        // layer while curl is still making progress — and `channel.close()` does not reap the
+        // remote `curl`, measured in the `budget-recovery` probe. The ceiling is 1800 s, so
+        // this leaves a minute for unpack, the `--version` check and the stamp write.
+        timeoutMs: (FETCH_CEILING_SECONDS + 60) * 1000,
+        maxBytes: 1024 * 1024,
+      }).finally(() => {
+        stopWatch()
+        // Cleared, not left at 100%: the phase has moved on, and a stale bar under "starting
+        // the resident host" would say the install is still running.
+        options.onTransfer?.(undefined)
+      })
+    } catch (error) {
+      // **No exit code exists here**, so the branch below cannot run at all: a timeout or a
+      // dropped channel rejects instead of resolving. That used to be the one failure path with
+      // no rollback judgement and no context — the rejection simply flew out of `install()`.
+      // The remote `sh` may already have renamed the staging tree into place before the channel
+      // died, so the same judgement is asked for; with a healthy live tree it answers
+      // `kept-current` and changes nothing.
+      const reason = error instanceof Error ? error.message : String(error)
+      // The original category is kept rather than flattened to `network`: a timeout is worth
+      // retrying and a protocol refusal is not, and `toSshError` already reads a mark the caller
+      // set. Only an unclassifiable transport error falls back to `network`, which is what it is.
+      const marked = classifySshError(error)
+      const rollback = await this.#rollbackAfterFailure(`the transfer of the runtime failed (${reason})`)
+      throw toSshError(new Error(
+        `installing the resident host failed: the transfer failed (${reason})\n${rollback}`,
+        marked === SSH_FAILURE.UNKNOWN ? SSH_FAILURE.NETWORK : marked,
+      ))
+    }
     if (attempt.code === 0) {
       return { version: attempt.stdout.trim().split('\n').at(-1) ?? this.version, via: 'artefact' }
     }
     const detail = (attempt.stderr || attempt.stdout).trim()
     if (!detail.includes('ARTEFACT_UNAVAILABLE')) {
-      // The download worked but the unpack or verify did not: roll back so the node keeps
-      // the release it had, then report rather than leaving a half-swapped directory.
-      await this.connection.exec({
-        argv: ['sh', '-c', rollbackScript(this.layout.runtime)],
-        timeoutMs: 120_000,
-      }).catch(() => undefined)
-      throw toSshError(new Error(`installing the resident host failed: ${detail.slice(-600)}`))
+      // The download worked but the unpack or verify did not. Exit codes 4/5/6/7 all happen
+      // **before** the rename, so the live tree is intact and the rollback judgement keeps it;
+      // only a tree that cannot start is replaced by the previous release. The verdict is
+      // always acted on and always reported: a rollback that silently failed is the worst
+      // outcome of the three, and it must not read like an ordinary install error.
+      const rollback = await this.#rollbackAfterFailure(`installing the resident host failed: ${detail.slice(-600)}`)
+      throw toSshError(new Error(
+        `installing the resident host failed: ${detail.slice(-600)}\n${rollback}`,
+      ))
     }
     failures.push(
       `artefact: no source served dsh-${this.version}-${platform} (tried ${String(urls.length)}):\n`
@@ -450,6 +494,55 @@ export class RemoteHost {
     )
     this.log(`no source served the ${platform} artefact`)
     return undefined
+  }
+
+  /**
+   * Ask the node what a failed install left behind, and turn the answer into one log line and
+   * one report line.
+   *
+   * The rollback itself must never throw: it runs while the caller is already handling an
+   * install failure, and an exception from here would replace a diagnosable failure with an
+   * anonymous one. It also must never be silent — the old code was `.catch(() => undefined)`,
+   * so a rollback that itself failed left no trace anywhere. That is the worst of the three
+   * outcomes: the node may now be on a tree that does not start, and nobody is told. So every
+   * path here produces a sentence, and the caller appends it to the error it throws.
+   *
+   * @param {string} context - what had already failed, for the log.
+   * @returns {Promise<string>} one line describing what the rollback did.
+   */
+  async #rollbackAfterFailure(context) {
+    let verdict
+    try {
+      const result = await this.connection.exec({
+        argv: ['sh', '-c', rollbackScript(this.layout.runtime, this.layout.cli)],
+        timeoutMs: 120_000,
+      })
+      verdict = result.stdout.trim().split('\n').at(-1)?.trim() ?? ''
+      if (result.code !== 0 || verdict === '') {
+        const why = (result.stderr || result.stdout).trim().slice(-300) || `exit ${String(result.code)}`
+        this.log(`${context}; the rollback did not report a verdict (${why})`)
+        return 'rollback did not report a verdict — the node may be on a broken tree; connect again and read the resident host log'
+      }
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error)
+      this.log(`${context}; the rollback itself failed: ${why}`)
+      return `rollback could not run (${why}) — the node may be on a broken tree; connect again and read the resident host log`
+    }
+    if (verdict === ROLLBACK_VERDICTS.KEPT_CURRENT) {
+      // The good news case, and it is worth a log line: it says the failure cost nothing.
+      this.log(`${context}; rollback=kept-current — the live runtime still starts and was left as it was`)
+      return 'rollback: kept the runtime that was already installed (it still starts), so nothing was changed'
+    }
+    if (verdict === ROLLBACK_VERDICTS.ROLLED_BACK) {
+      this.log(`${context}; rollback=rolled-back — the live runtime did not start, so the previous release was restored`)
+      return 'rollback: the live runtime could not start, so the previous release was restored'
+    }
+    if (verdict === ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK) {
+      this.log(`${context}; rollback=nothing-to-roll-back — no previous runtime to fall back to`)
+      return 'rollback: there was no previous runtime to restore, and the live one did not start'
+    }
+    this.log(`${context}; the rollback answered an unknown verdict ${JSON.stringify(verdict)}`)
+    return `rollback reported ${JSON.stringify(verdict)}, which this build does not understand — inspect the node`
   }
 
   /** Read the installed resident version, or `undefined` when absent. */

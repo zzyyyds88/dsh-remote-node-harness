@@ -10,7 +10,7 @@
  * Run: `node test/version-unit.mjs`
  */
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import {
@@ -23,6 +23,7 @@ import {
 import {
   ARTEFACT_EXECUTABLE_NAMES,
   BUILD_STAMP,
+  ROLLBACK_VERDICTS,
   RUNTIME_BUILD,
   artefactExecutableFind,
   artefactName,
@@ -55,6 +56,25 @@ const failures = []
 const check = (ok, label, detail) => {
   log(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail === undefined ? '' : ` — ${detail}`}`)
   if (!ok) failures.push(label)
+}
+
+/**
+ * Run a generated shell script the way a node does: as a **file**, not as `-c` text.
+ *
+ * This matters on the machine running the tests. The `sh`/`bash` here is an MSYS2 binary
+ * (Git for Windows), and its command-line-to-argv conversion rewrites backslashes inside a
+ * `-c` argument — `we'ird\name` arrives as `we'irdname`. Writing the bytes the plugin would
+ * send to a file and executing that file removes the conversion from the comparison, so a
+ * check about the script's own quoting is about the script.
+ *
+ * @param {string} shell - the interpreter found by the caller.
+ * @param {string} directory - a scratch directory; the file is written there.
+ * @param {string} text - the generated script.
+ */
+const runShellScript = (shell, directory, text) => {
+  const path = join(directory, 'rnh-check.sh')
+  writeFileSync(path, `${text}\n`)
+  return spawnSync(shell, [path.split('\\').join('/')], { encoding: 'utf8' })
 }
 
 // ---- semver precedence, including the pre-release rules DSH actually uses ------
@@ -235,10 +255,41 @@ const check = (ok, label, detail) => {
   check(script.includes('.incoming'), 'it unpacks into a staging directory')
 
   const rollback = rollbackScript('/root/.dsh-remote-node-harness/runtime')
+  // Old semantics: `.previous` existed → restore it. That is still one of the answers, but it is
+  // no longer the *first* question. The script must ask whether the **live** tree still starts
+  // before it touches anything — otherwise a failed download (checksum, unpack, shape,
+  // executable-bit checks all happen before the rename) downgrades a healthy node to the
+  // release before it. Measured on a real node: runtime=v2-good, runtime.previous=v1-old, one
+  // rollback later the node ran v1-old.
+  check(rollback.includes('node "$cli" --version'),
+    'the rollback starts the live tree before deciding anything', rollback.split('\n').find(line => line.includes('--version')))
+  check(rollback.indexOf('node "$cli" --version') < rollback.indexOf('rm -rf "$runtime"'),
+    'and it decides before it removes the live tree — that ordering is the whole fix')
   check(rollback.includes('.previous') && rollback.includes('rolled-back'),
-    'a failed install can be rolled back')
+    'a failed install that did replace the tree can still be rolled back')
   check(rollback.includes('nothing-to-roll-back'),
     'and reports when there was nothing to roll back to')
+  // The third answer is the ordinary one now: the live tree was never touched, so the failure
+  // cost nothing. JS needs to tell the three apart to say which happened, hence ROLLBACK_VERDICTS.
+  check(rollback.includes('kept-current'),
+    'and reports when the live tree was kept because it still runs')
+  for (const [name, value] of Object.entries(ROLLBACK_VERDICTS)) {
+    check(rollback.includes(value), `the ${name} verdict is the string daemon.js branches on`, value)
+  }
+  const verdicts = Object.values(ROLLBACK_VERDICTS)
+  check(new Set(verdicts).size === verdicts.length,
+    'the three verdicts are distinct, so the caller cannot confuse them', verdicts.join(' '))
+
+  // The other half of A1 is on the install side: `.previous` must not be created or overwritten
+  // before the last verification, or a rejected archive still leaves a rollback that "restores"
+  // an older tree over a live one. Exit codes 4/5/6/7 all come before the swap.
+  const swapAt = script.indexOf('rm -rf "$previous"')
+  const lastCheckAt = script.indexOf('ARTEFACT_NOT_EXECUTABLE')
+  check(swapAt > 0 && lastCheckAt > 0 && swapAt > lastCheckAt,
+    'the previous tree is only replaced after every verification has passed',
+    `${String(lastCheckAt)} < ${String(swapAt)}`)
+  check(script.indexOf('mv "$staging" "$runtime"') > swapAt,
+    'and the live tree is only moved aside at the swap itself')
 }
 
 // ---- files that must be executable after unpack -----------------------------
@@ -351,6 +402,15 @@ const check = (ok, label, detail) => {
 // tree. Measured: one plugin install put `dsh-session@0.2.0-rc.2` beside a 0.2.2-rc.3
 // runtime, and the resident host then refused to activate rows and printed no URL — a
 // node that looks connected from the desktop and is dead on the machine.
+//
+// The other defect here is the manifest itself (B5, reproduced on a real node): the
+// `printf` that writes `package.json` was written inside a JS template string, so the
+// escaping collapsed and the file got the literal characters `\` `n` instead of a newline.
+// `npm install` answered `EJSONPARSE … Unexpected non-whitespace character after JSON at
+// position 65`, so the first connect of every new node failed to install its plugins and
+// only the *second* connect worked — because `writeProfileBundles` had rewritten the file.
+// These checks are about that one line, because nothing else in the script can make a
+// manifest that is not JSON.
 {
   const script = pluginInstallScript({
     profile: '/root/.dsh/profiles/rnh',
@@ -365,6 +425,93 @@ const check = (ok, label, detail) => {
     'every target is quoted, so a spec with a range cannot be split by the shell')
   check(script.includes('RNH_NPM_EXIT=$?'),
     'and the exit status is reported separately from npm output, which `2>&1` interleaves')
+
+  // The shape of the line, asserted as text first: the old form was `…{}}` followed by four
+  // backslashes and an `n`, and no amount of reading it as shell makes that a newline.
+  const manifestLine = script.split('\n').find(line => line.includes('package.json') && line.includes('printf'))
+  check(manifestLine !== undefined, 'the script writes the profile manifest', script.split('\n').find(line => line.includes('> package.json')))
+  check(manifestLine?.includes("printf '%s\\n'") === true,
+    'the newline comes from printf`s own format, not from an escape inside the JSON',
+    manifestLine)
+  check(manifestLine?.includes("}}\\\\n'") !== true && manifestLine?.includes('}}') === true,
+    'the manifest is no longer a printf format string ending in a literal backslash-n',
+    manifestLine)
+  // One backslash before the n in the *script text*: printf expands it to one newline. Four
+  // would reach the shell as four, which is exactly the bug.
+  check(!/[^\\]\\\\{2,}n/u.test(manifestLine ?? ''),
+    'the format carries exactly one backslash-n, which printf turns into a newline',
+    JSON.stringify(manifestLine))
+
+  // A syntactically valid script is the cheapest proof that the quoting is balanced, and
+  // `sh -n` needs no node, no npm and no network. The interpreter is looked for rather than
+  // assumed; when none exists the check is skipped out loud instead of passing silently.
+  const shell = ['sh', 'bash']
+    .concat(process.platform === 'win32'
+      ? [join(process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'bin', 'bash.exe')]
+      : [])
+    .find(candidate => {
+      const probe = spawnSync(candidate, ['-n'], { input: 'echo ok\n', encoding: 'utf8' })
+      return probe.status === 0
+    })
+  if (shell !== undefined) {
+    const syntax = spawnSync(shell, ['-n'], { input: `${script}\n`, encoding: 'utf8' })
+    check(syntax.status === 0, 'the generated install script parses as shell',
+      syntax.stderr?.trim().split('\n').at(-1) ?? '')
+    // The syntax check has to be able to fail, or it proves nothing.
+    const broken = spawnSync(shell, ['-n'], { input: "if [ -f x ]; then\n", encoding: 'utf8' })
+    check(broken.status !== 0, 'and that check does reject an unterminated if')
+    // Run the manifest half for real and parse the result: this is the actual defect, and a
+    // string assertion alone would still pass on a file that is one character short.
+    const scratch = mkdtempSync(join(tmpdir(), 'rnh-plugin-'))
+    try {
+      const profile = scratch.split('\\').join('/')
+      const own = pluginInstallScript({ profile, profileName: 'rnh', targets: ['dsh-pet@1'] })
+      const head = own.split('\n').slice(0, own.split('\n').findIndex(line => line.startsWith('npm install'))).join('\n')
+      const ran = runShellScript(shell, scratch, head)
+      const written = ran.status === 0 ? readFileSync(join(scratch, 'package.json'), 'utf8') : ''
+      check(ran.status === 0, 'the manifest-writing half of the script runs', ran.stderr.trim().split('\n').at(-1))
+      let parsed
+      try { parsed = JSON.parse(written) } catch { parsed = undefined }
+      check(parsed !== undefined, 'and the file it leaves is valid JSON, not JSON plus a literal \\n',
+        JSON.stringify(written.slice(-14)))
+      check(parsed?.name === 'dsh-profile-rnh' && parsed?.dependencies !== undefined,
+        'with the name and dependency map npm needs', JSON.stringify(parsed))
+      check(written.endsWith('\n') && !written.endsWith('\\n'),
+        'the file ends with a real newline and not with backslash-n', JSON.stringify(written.slice(-8)))
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  } else {
+    log('skip the shell checks of pluginInstallScript: no POSIX shell on this machine')
+  }
+
+  // A profile name is `[A-Za-z0-9-]` today, derived from the node's root. The escaper must not
+  // depend on that: a quote or a backslash in the name must not truncate the shell word.
+  //
+  // The script is written to a file and executed from there rather than passed with `-c`: on
+  // Windows the `sh`/`bash` available to this test is an MSYS2 binary, and its startup parsing
+  // eats backslashes out of a `-c` argument, which would make this check fail for a reason that
+  // does not exist on a Linux node. Running the generated text is the faithful comparison.
+  const hostile = "we'ird\\name"
+  const quoted = pluginInstallScript({ profile: '/p', profileName: hostile, targets: ['x'] })
+  check(quoted.includes("'\\''"),
+    'a quote in the profile name is escaped the POSIX way, not left to break the word')
+  if (shell !== undefined) {
+    const scratch = mkdtempSync(join(tmpdir(), 'rnh-plugin-quote-'))
+    try {
+      const profile = scratch.split('\\').join('/')
+      const own = pluginInstallScript({ profile, profileName: hostile, targets: ['x'] })
+      const head = own.split('\n').slice(0, own.split('\n').findIndex(line => line.startsWith('npm install'))).join('\n')
+      const ran = runShellScript(shell, scratch, head)
+      let parsed
+      try { parsed = JSON.parse(readFileSync(join(scratch, 'package.json'), 'utf8')) } catch { parsed = undefined }
+      check(ran.status === 0 && parsed?.name === `dsh-profile-${hostile}`,
+        'and a hostile profile name still writes a correct manifest',
+        `${String(ran.status)} ${JSON.stringify(parsed?.name)}`)
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+    }
+  }
 }
 
 // ---- per-plugin switches ---------------------------------------------------
@@ -645,13 +792,18 @@ const check = (ok, label, detail) => {
   }
   const attempt = async (options, installFacts = facts) => {
     const connection = stub({ 'ARTEFACT-UNAVAILABLE-NEVER-MATCHES': { code: 0 }, ...options.answers })
-    const host = new RemoteHost({ connection, version: '0.2.2-rc.3', log: () => {} })
+    /** @type {string[]} */
+    const logs = []
+    const host = new RemoteHost({ connection, version: '0.2.2-rc.3', log: message => logs.push(message) })
     let error
     let result
     try { result = await host.install(installFacts, options.install ?? {}) } catch (caught) { error = caught }
-    return { error, result, calls: connection.calls }
+    return { error, result, calls: connection.calls, logs }
   }
   const ranNpm = calls => calls.some(call => call.includes('npm install'))
+  // The rollback judgement is the one command that probes the live tree. Counting it is how
+  // these tests tell "the rollback ran" from "the rollback was skipped", which is the defect.
+  const rollbacks = calls => calls.filter(call => call.includes('node "$cli" --version'))
 
   // 1. A successful download is the whole install, and it never touches a registry.
   const installed = await attempt({})
@@ -684,14 +836,25 @@ const check = (ok, label, detail) => {
     'and none starts at GitHub directly')
 
   // 4. A checksum mismatch is *not* the same thing. The bytes arrived and were wrong, so the
-  //    previous runtime is rolled back and the failure is reported.
+  //    rollback judgement runs and the failure is reported. Every check the install script does
+  //    (checksum, unpack, shape, executable bit) happens **before** the rename, so the live tree
+  //    is intact and the judgement must keep it — restoring `$runtime.previous` here would
+  //    downgrade the node by one release. Measured on a real node: runtime=v2-good,
+  //    runtime.previous=v1-old, one old-style rollback later the node ran v1-old.
   const mismatch = await attempt({
     answers: { 'ARTEFACT_CHECKSUM_MISMATCH': { code: 4, stderr: 'ARTEFACT_CHECKSUM_MISMATCH a b' } },
   })
-  check(mismatch.calls.some(call => call.includes('.previous')),
-    'a bad checksum rolls the previous runtime back')
+  check(rollbacks(mismatch.calls).length === 1,
+    'a bad checksum asks for the rollback judgement exactly once',
+    String(rollbacks(mismatch.calls).length))
+  check(mismatch.calls.some(call => call.includes('node "$cli" --version')),
+    'and that judgement starts the live tree instead of moving `.previous` in blindly')
   check(String(mismatch.error?.message).includes('installing the resident host failed'),
     'and reports the checksum rather than the source list')
+  // The verdict is part of the thrown message, not just a log line: a rollback that failed is
+  // the worst outcome of the three and must not read like an ordinary install error.
+  check(String(mismatch.error?.message).includes('rollback'),
+    'and the error text carries what the rollback did', String(mismatch.error?.message).split('\n').at(-1))
   check(!ranNpm(mismatch.calls), 'so a broken artefact is never retried through a registry')
 
   // 4b. An archive that arrived without its `.sha256` is also a failure, and it must *not* read
@@ -703,11 +866,89 @@ const check = (ok, label, detail) => {
     answers: { 'ARTEFACT_CHECKSUM_UNAVAILABLE': { code: 6, stderr: 'ARTEFACT_CHECKSUM_UNAVAILABLE' } },
   })
   check(noSidecar.error !== undefined, 'an archive with no checksum fails the connect')
-  check(noSidecar.calls.some(call => call.includes('.previous')),
-    'and rolls back rather than leaving an unverified tree in place')
+  check(rollbacks(noSidecar.calls).length === 1,
+    'and asks for the rollback judgement rather than leaving an unverified tree in place')
   check(!String(noSidecar.error?.message).includes('no source served'),
     'it is not reported as a missing artefact, because the bytes did arrive')
   check(!ranNpm(noSidecar.calls), 'and it never reaches for a registry')
+
+  // 4c. The verdict the node reports decides the sentence, and each of the three is surfaced.
+  for (const [verdict, expected] of [
+    [ROLLBACK_VERDICTS.KEPT_CURRENT, 'nothing was changed'],
+    [ROLLBACK_VERDICTS.ROLLED_BACK, 'previous release was restored'],
+    [ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK, 'no previous runtime'],
+  ]) {
+    const answer = await attempt({
+      answers: {
+        'ARTEFACT_SHAPE_UNEXPECTED': { code: 5, stderr: 'ARTEFACT_SHAPE_UNEXPECTED' },
+        'node "$cli" --version': { code: 0, stdout: `${verdict}\n` },
+      },
+    })
+    check(String(answer.error?.message).includes(expected),
+      `a ${verdict} verdict reaches the thrown error`, String(answer.error?.message).split('\n').at(-1))
+    check(answer.logs.some(line => line.includes(`rollback=${verdict}`)),
+      `and is logged, not swallowed (${verdict})`, answer.logs.at(-1))
+  }
+
+  // 4d. A rollback that itself fails also has to be reported: the old `.catch(() => undefined)`
+  //     left no trace at all, which is exactly the case where the node is left on a tree that
+  //     does not start and nobody is told.
+  {
+    /** @type {string[]} */
+    const logs = []
+    const connection = stub({
+      'ARTEFACT_SHAPE_UNEXPECTED': { code: 5, stderr: 'ARTEFACT_SHAPE_UNEXPECTED' },
+      'node "$cli" --version': { code: 0, stdout: `${ROLLBACK_VERDICTS.KEPT_CURRENT}\n` },
+    })
+    connection.exec = (request => {
+      const script = request.argv.at(-1) ?? ''
+      if (script.includes('node "$cli" --version')) return Promise.reject(new Error('ssh exec timed out after 120000ms'))
+      connection.calls.push(request.argv.join(' '))
+      return Promise.resolve({ code: 5, stdout: '', stderr: 'ARTEFACT_SHAPE_UNEXPECTED' })
+    })
+    const host = new RemoteHost({ connection, version: '0.2.2-rc.3', log: message => logs.push(message) })
+    let error
+    try { await host.install(facts, {}) } catch (caught) { error = caught }
+    check(String(error?.message).includes('rollback could not run'),
+      'a rollback that cannot run is named in the thrown error', String(error?.message).split('\n').at(-1))
+    check(logs.some(line => line.includes('rollback itself failed')),
+      'and it is logged, not swallowed like the old `.catch(() => undefined)`', logs.at(-1))
+  }
+
+  // 4e. **A transport failure has no exit code at all.** A timeout or a dropped channel makes
+  //     `exec` reject, so the `code === 0` check and the rollback branch used to be skipped
+  //     entirely and the rejection flew straight out of `install()`. The remote `sh` may already
+  //     have swapped the tree in before the channel died, so the same judgement is asked for
+  //     and the failure is reported with context.
+  {
+    let rollbackCalls = 0
+    /** @type {string[]} */
+    const logs = []
+    const connection = {
+      calls: [],
+      async exec(request) {
+        const script = request.argv.at(-1) ?? ''
+        if (script.includes('node "$cli" --version')) {
+          rollbackCalls += 1
+          return { code: 0, stdout: `${ROLLBACK_VERDICTS.KEPT_CURRENT}\n`, stderr: '' }
+        }
+        connection.calls.push(request.argv.join(' '))
+        throw Object.assign(new Error('ssh exec timed out after 1860000ms'), { sshCategory: 'timeout' })
+      },
+    }
+    const host = new RemoteHost({ connection, version: '0.2.2-rc.3', log: message => logs.push(message) })
+    let error
+    try { await host.install(facts, {}) } catch (caught) { error = caught }
+    check(error !== undefined, 'a rejected install exec is still a reported failure')
+    check(rollbackCalls === 1, 'and it still asks the rollback judgement, which is what makes a timeout safe',
+      String(rollbackCalls))
+    check(String(error?.message).includes('the transfer failed'),
+      'the error says what failed', String(error?.message).slice(0, 100))
+    check(String(error?.message).includes('nothing was changed'),
+      'and carries the rollback verdict, so a node left intact is stated as such',
+      String(error?.message).split('\n').at(-1))
+    check(error?.sshCategory === 'timeout', 'with the transport category kept for the caller', error?.sshCategory)
+  }
 
   // 5. A machine that cannot download cannot install, and says which tool is missing. This
   //    used to be a machine that upgraded itself through npm; it is now a machine that has

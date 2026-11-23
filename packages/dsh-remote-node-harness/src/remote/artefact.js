@@ -636,6 +636,11 @@ if [ -n "$broken" ]; then
   exit 7
 fi
 
+# The swap. Deliberately the ONLY place the previous directory is created or overwritten: every
+# check above exits before this line, so a rejected archive (exit 4/5/6/7) leaves both the live
+# tree and the previous one exactly as they were. Together with the liveness probe in
+# rollbackScript that is what makes a failed install cost nothing — without this ordering a
+# rollback after a download failure would downgrade the node to an older release.
 rm -rf "$previous"
 if [ -d "$runtime" ]; then mv "$runtime" "$previous"; fi
 mv "$staging" "$runtime"
@@ -732,23 +737,68 @@ export function inspectRuntime({ version, build, wantedVersion }) {
 }
 
 /**
- * Roll a failed install back to the tree that was there before.
+ * The three answers {@link rollbackScript} can give, as the caller-visible contract.
  *
- * Called when the download succeeded but the unpack or the verification did not, so the
- * node keeps the release it had instead of a half-swapped directory.
- * @param {string} runtime
+ * They exist because "a rollback ran" and "a rollback did something" are different facts, and
+ * the one that matters to a user is the second. `kept-current` is the ordinary answer after a
+ * failed install: the live tree was never touched, so the node is still on the release it had.
  */
-export function rollbackScript(runtime) {
+export const ROLLBACK_VERDICTS = Object.freeze({
+  /** The live runtime still starts; nothing was changed. */
+  KEPT_CURRENT: 'kept-current',
+  /** The live runtime could not start; `$runtime.previous` took its place. */
+  ROLLED_BACK: 'rolled-back',
+  /** The live runtime could not start and there was no previous tree to use. */
+  NOTHING_TO_ROLL_BACK: 'nothing-to-roll-back',
+})
+
+/**
+ * Decide what a failed install leaves behind: the live tree, or the previous one.
+ *
+ * **Why the live tree is started before anything is removed.** Every failure {@link
+ * installScript} reports with exit 4, 5, 6 or 7 happens *before* the rename, so at that moment
+ * `$runtime` is the healthy release the node has been serving and `$runtime.previous` is one
+ * release **older**. A rollback that unconditionally did `rm -rf "$runtime"` and then moved
+ * `.previous` into place therefore *downgraded* a node whose download had merely failed:
+ * measured on a real node by planting `runtime=v2-good` / `runtime.previous=v1-old` and running
+ * the old script, the node came back running v1-old. A failed install must leave what it did
+ * not touch alone, and the only thing that cannot lie about a tree is starting it — so the
+ * `node … --version` probe decides. Only a live tree that cannot run is replaced.
+ *
+ * `set -u` rather than `set -eu`: a failed probe is an answer here, not a reason to abort
+ * without printing a verdict at all.
+ *
+ * @param {string} runtime - the live runtime directory.
+ * @param {string} [cli] - the CLI inside that directory; defaults to the path the installer
+ *   writes. `RemoteHost` passes its own layout value so the two can never disagree.
+ * @returns {string}
+ */
+export function rollbackScript(runtime, cli = `${runtime}/node_modules/@deepseek-ai/dsh/lib/bin.js`) {
   return `
-set -eu
+set -u
 runtime="${shellPath(runtime)}"
-if [ -d "$runtime.previous" ]; then
-  rm -rf "$runtime"
-  mv "$runtime.previous" "$runtime"
-  echo rolled-back
-else
-  echo nothing-to-roll-back
+cli="${shellPath(cli)}"
+previous="$runtime.previous"
+staging="$runtime.incoming"
+if [ -f "$cli" ] && node "$cli" --version >/dev/null 2>&1; then
+  # The live tree still runs, so the failed install never got as far as replacing it. Leave it
+  # exactly as it is and say so: this is the difference between "nothing happened" and "the
+  # node went backwards one release".
+  rm -rf "$staging"
+  echo ${ROLLBACK_VERDICTS.KEPT_CURRENT}
+  exit 0
 fi
-rm -rf "$runtime.incoming"
+if [ -d "$previous" ]; then
+  # The live tree is not runnable (a rename happened and the new tree is bad). The previous
+  # tree was accepted by this same installer when it was installed, which makes it the best
+  # candidate there is; if it too cannot start, the next connect reports a real install error.
+  rm -rf "$runtime"
+  mv "$previous" "$runtime"
+  rm -rf "$staging"
+  echo ${ROLLBACK_VERDICTS.ROLLED_BACK}
+  exit 0
+fi
+rm -rf "$staging"
+echo ${ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK}
 `.trim()
 }

@@ -232,12 +232,18 @@ check(again.code === 0 && (again.stdout.trim().split('\n').at(-1) ?? '').include
 const previous = await nodeExec(`test -d ${runtime}.previous && echo kept || echo none`)
 check(previous.trim() === 'kept', 'the replaced tree is kept for rollback', previous.trim())
 
-// ---- rollback restores it ------------------------------------------------
+// ---- rollback keeps the live tree when it still runs -----------------------
+// The old assertion here was "rollback reports rolled-back". That was the defect in one line:
+// after a *successful* second install the live tree starts perfectly, so a rollback must keep it.
+// Unconditionally moving `.previous` in downgraded the node one release, and every failed
+// download (checksum, unpack, shape, executable bit — all before the rename) did exactly that.
 const rolled = await nodeRun(`sh -c '${shellQuote(rollbackScript(runtime))}'`)
-check(rolled.code === 0 && rolled.stdout.trim().includes('rolled-back'), 'rollback reports what it did',
-  rolled.code === 0 ? rolled.stdout.trim() : `exit ${String(rolled.code)}: ${rolled.stderr.trim()}`)
+check(rolled.code === 0 && rolled.stdout.trim().includes('kept-current'),
+  'rollback keeps a live runtime that still starts', rolled.code === 0 ? rolled.stdout.trim() : `exit ${String(rolled.code)}: ${rolled.stderr.trim()}`)
 const stillThere = await nodeExec(`test -f ${cli} && node ${cli} --version`)
-check(stillThere.trim().includes(version), 'and the runtime still runs after it', stillThere.trim())
+check(stillThere.trim().includes(version), 'and the runtime is still the one that was installed', stillThere.trim())
+const previousAfter = await nodeExec(`test -d ${runtime}.previous && echo kept || echo none`)
+check(previousAfter.trim() === 'kept', 'with the older tree untouched beside it', previousAfter.trim())
 
 await nodeExec(`rm -rf ${root}`)
 log(`cleaned ${root}`)
