@@ -24,6 +24,7 @@ import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sta
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  RELAY_EDITS,
   RELAY_MARKER,
   RELAY_PACKAGE,
   applyRelayPatch,
@@ -255,10 +256,46 @@ const clean = root => { try { rmSync(root, { recursive: true, force: true }) } c
   if (!existsSync(file)) {
     process.stdout.write('[relay-patch-unit] ok   (no live relay on this machine; the anchor check is skipped)\n')
   } else {
-    const plan = planPatch(readFileSync(file, 'utf8'))
-    check(plan.missing.length === 0,
-      'this machine\'s installed relay still matches every anchor', JSON.stringify(plan.missing))
-    check(plan.applied.length === 3, 'so a real Host start would patch it', plan.applied.join(','))
+    // **The anchors are checked against the pristine copy, not the live bundle.** Once this
+    // plugin has patched the file, the three anchors are *gone by construction* — checking
+    // `planPatch` on the patched text therefore reports `hits: 0` for every anchor and reads
+    // as "the anchors drifted", which is the exact opposite of what happened. The live bundle
+    // is validated the other way round: it must carry the marker, and its hash must be the one
+    // the sidecar recorded. Measured: the anchor check failed on a machine whose relay was
+    // correctly patched at 0.6.7, which is the bug this comment exists to prevent.
+    const sidecarFile = `${file}.rnh-patch.json`
+    const origFile = `${file}.rnh-orig`
+    const sidecar = existsSync(sidecarFile)
+      ? JSON.parse(readFileSync(sidecarFile, 'utf8'))
+      : undefined
+    const liveText = readFileSync(file, 'utf8')
+    if (sidecar === undefined) {
+      // Not patched yet: the live bundle is the pristine one, so the anchors must apply to it.
+      const plan = planPatch(liveText)
+      check(plan.missing.length === 0,
+        'this machine\'s installed relay still matches every anchor', JSON.stringify(plan.missing))
+      check(plan.applied.length === RELAY_EDITS.length,
+        'so a real Host start would patch it', plan.applied.join(','))
+    } else {
+      const liveSha = createHash('sha256').update(liveText).digest('hex')
+      check(liveText.includes(RELAY_MARKER),
+        'this machine\'s installed relay carries the patch marker')
+      check(liveSha === sidecar.patchedSha256,
+        'and its bytes are the ones the sidecar recorded', `${liveSha.slice(0, 12)} vs ${String(sidecar.patchedSha256).slice(0, 12)}`)
+      // The pristine copy is the only place the anchors still exist; it is what a revert
+      // restores, and what a later relay upgrade has to be re-checked against.
+      if (existsSync(origFile)) {
+        const pristine = planPatch(readFileSync(origFile, 'utf8'))
+        check(pristine.missing.length === 0,
+          'the pristine copy this patch was built from still matches every anchor',
+          JSON.stringify(pristine.missing))
+        check(pristine.applied.length === RELAY_EDITS.length,
+          'so the same edit reproduces on a fresh install of this relay',
+          pristine.applied.join(','))
+      } else {
+        process.stdout.write('[relay-patch-unit] ok   (patched relay has no .rnh-orig to compare against)\n')
+      }
+    }
   }
 }
 
