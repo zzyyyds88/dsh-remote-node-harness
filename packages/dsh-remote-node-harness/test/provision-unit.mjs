@@ -137,6 +137,48 @@ const oddRef = credentialRefsOf([{
 }])
 check(oddRef.includes('custom_key_name'), 'an unusual explicit ref is still honoured', oddRef.join(','))
 
+// ---- 2b. the search gap: a capability's credential, versus what gets pushed ---
+// `web_search` is mounted by every preset (`tool-web`) and authenticates with
+// `DEEPSEEK_API_KEY`. The refs pushed are derived from the rows this desktop *copies*, so a
+// desktop whose model provider is not DeepSeek pushes nothing — and the node then advertises a
+// tool whose every call answers "no credential". That is the office defect's shape one
+// capability over: a declaration and a runtime dependency that nothing compared.
+//
+// The declaration now lives in `capabilities.mjs` (`web.credentials`), which is what makes this
+// assertable at all: the two sides are (a) what a capability says it needs, (b) what the
+// whitelist can derive. Measured before: (b) was `[]` for that desktop and nothing noticed.
+{
+  const capabilities = await import(new URL('../../rnh-brain/capabilities.mjs', import.meta.url).href)
+  const declared = capabilities.credentialRefsOfCapabilities()
+  check(declared.includes('DEEPSEEK_API_KEY'),
+    'a capability declares the search credential', declared.join(','))
+
+  const nonDeepSeek = {
+    configuration: () => [
+      {
+        entry: { options: { id: 'llm-pi-ai', name: '@deepseek-ai/dsh-llm-pi-ai' } },
+        inherited: {},
+        override: { baseURL: 'https://other.example.test/v1' },
+      },
+      {
+        entry: { options: { id: 'agent-default-model', name: '@deepseek-ai/dsh-agent-default-model' } },
+        inherited: {},
+        override: { model: 'm' },
+      },
+    ],
+  }
+  const pushed = credentialRefsOf(copyableRows(nonDeepSeek))
+  check(!pushed.includes('DEEPSEEK_API_KEY'),
+    'a desktop on another provider pushes no DeepSeek key — the case that used to fail silently',
+    pushed.join(',') || '(none)')
+  const unmet = capabilities.unmetCredentialRequirements(pushed)
+  check(unmet.some(gap => gap.capability === 'web' && gap.missing.includes('DEEPSEEK_API_KEY')),
+    'and the gap is reportable from the declaration alone, not inferred from a row list',
+    JSON.stringify(unmet))
+  check(capabilities.unmetCredentialRequirements(['DEEPSEEK_API_KEY']).length === 0,
+    'while the DeepSeek desktop this project runs satisfies it')
+}
+
 // ---- 3. the overlay carries configuration, never composition --------------
 // The bundle list is owned by @local/rnh-brain. If this overlay also tried to
 // switch browser rows off, there would be two writers for "which plugins run on a

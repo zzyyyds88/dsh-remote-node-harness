@@ -39,7 +39,7 @@ import { classifyFailure } from '../core/errors.js'
 import { GATE, decideGate } from '../core/version.js'
 import { SshConnection } from '../ssh/connection.js'
 import { RemoteHost, remoteLayout, MINIMUM_NODE_MAJOR } from '../remote/daemon.js'
-import { BRAIN_FILES, BRAIN_PACKAGE } from './brain-bundle.generated.js'
+import { BRAIN_CREDENTIAL_REFS, BRAIN_FILES, BRAIN_PACKAGE } from './brain-bundle.generated.js'
 import { NODE_BASE_BUNDLES } from '../core/plugin-sync.js'
 import { NodeLog } from './node-log.js'
 import { Provisioner } from './provision.js'
@@ -703,6 +703,24 @@ export class Rnh {
           runtime.provision.error = messageOf(error)
           this.log(`[${runtime.record.name}] could not push credentials: ${runtime.provision.error}`)
         }
+        // **A capability that names a credential the node did not receive is reported, not
+        // swallowed.** `web_search` is the case that taught this: `tool-web` is mounted by every
+        // preset and needs `DEEPSEEK_API_KEY`, but the refs pushed are derived from the rows
+        // this desktop copies — so a desktop whose model provider is not DeepSeek pushes
+        // nothing, and the node advertises a tool whose every call answers "no credential".
+        // The requirement is declared once, in `capabilities.mjs`, and reaches this file through
+        // the generated `BRAIN_CREDENTIAL_REFS` (the plugin cannot import that module at
+        // runtime). This is where the declaration and the pushed refs meet. It is a warning
+        // rather than a refusal because the rest of the node works, and `web_fetch` needs no key.
+        const missing = BRAIN_CREDENTIAL_REFS.filter(ref => !runtime.provision.refs.includes(ref))
+        if (missing.length > 0) {
+          runtime.provision.unmet = missing
+          this.log(
+            `[${runtime.record.name}] this node did not receive ${missing.join(', ')}, which a `
+            + 'composed capability declares it needs — that tool will refuse every call until a '
+            + 'matching provider row is on this desktop',
+          )
+        }
         // A recovery that reaches here is the end of the ladder; the `recovering` status (with
         // its rung) is gone with the success. The counter is what lets the card say "came back
         // twice since the app started".
@@ -1013,6 +1031,21 @@ export class Rnh {
           if (runtime.provision !== undefined) {
             runtime.provision.rows = plan.rows.length
             runtime.provision.refs = report.refs
+          }
+          // The same declaration-versus-delivery check as the connect path: a desktop that
+          // changes its model provider can *lose* a credential the node's capabilities need,
+          // and a sync that silently stopped pushing it would leave a working-looking node
+          // whose search tool fails on the first call.
+          const missingRefs = BRAIN_CREDENTIAL_REFS.filter(ref => !report.refs.includes(ref))
+          if (missingRefs.length > 0) {
+            report.unmet = missingRefs
+            if (runtime.provision !== undefined) runtime.provision.unmet = missingRefs
+            this.log(
+              `[${runtime.record.name}] config synced but ${missingRefs.join(', ')} is no longer `
+              + 'provided by this desktop — a composed capability needs it',
+            )
+          } else if (runtime.provision !== undefined) {
+            delete runtime.provision.unmet
           }
           this.log(`[${runtime.record.name}] config synced after ${reason}`
             + `${report.changed ? '' : ' (node already current)'}`)

@@ -48,6 +48,13 @@
  *                    imported (`@deepseek-ai/dsh-web-app`);
  * - `replaces`     — an upstream row this capability substitutes (only `remote-host` does);
  * - `host`         — prerequisites on the **node** (never on the build machine);
+ * - `credentials`  — credential refs the capability cannot work without. This is the field the
+ *                    office defect's twin needed: `web_search` is mounted by every preset and
+ *                    needs `DEEPSEEK_API_KEY`, and nothing anywhere said so, so a desktop whose
+ *                    model provider is not DeepSeek shipped a node that advertised a tool whose
+ *                    every call answered "no credential". A requirement stated here is checked
+ *                    twice — statically against the provisioning whitelist (`check-capabilities`)
+ *                    and at connect time against the refs actually pushed (`rnh.js`);
  * - `dropRules`    — the `DROP_RULES` regex sources that implement this record. A rule is a
  *                    mechanism; it has to name the capability it serves, or it is a guess
  *                    with a regular expression;
@@ -147,6 +154,7 @@ function matchesPattern(pattern, name) {
  *   manifestOnly: readonly string[],
  *   replaces: Readonly<Record<string, string>>,
  *   host: Readonly<Record<string, unknown>>,
+ *   credentials?: readonly string[],
  *   dropRules: readonly string[],
  *   offReason: string,
  * }>}
@@ -345,7 +353,7 @@ export const CAPABILITIES = Object.freeze([
   {
     id: 'agent-tools',
     verdict: 'required',
-    summary: 'the tools an agent works with: shell, files, jobs, the clock, goals, search, todos',
+    summary: 'the tools an agent works with: shell, files, jobs, the clock, goals, todos',
     rows: [
       'tool-bash',
       'tool-pwsh',
@@ -353,7 +361,6 @@ export const CAPABILITIES = Object.freeze([
       'tool-fs-search',
       'tool-jobs',
       'tool-todo',
-      'tool-web',
       'tool-goal',
       'command-goal',
     ],
@@ -368,7 +375,6 @@ export const CAPABILITIES = Object.freeze([
         'command-goal',
         'tool-goal',
         'tool-todo',
-        'tool-web',
       ],
       ptc: [
         'tool-bash',
@@ -380,7 +386,6 @@ export const CAPABILITIES = Object.freeze([
         'command-goal',
         'tool-goal',
         'tool-todo',
-        'tool-web',
       ],
       cordis: [
         'tool-bash',
@@ -392,7 +397,6 @@ export const CAPABILITIES = Object.freeze([
         'command-goal',
         'tool-goal',
         'tool-todo',
-        'tool-web',
       ],
       minimal: ['tool-fs'],
     },
@@ -403,6 +407,46 @@ export const CAPABILITIES = Object.freeze([
     host: Object.freeze({}),
     dropRules: [],
     offReason: 'the model would have no way to touch the node',
+  },
+
+  // ── 3b. the web tools: one row, two tools, one credential ───────────────────
+  {
+    id: 'web',
+    verdict: 'required',
+    summary: 'the model-facing web tools: `web_fetch` over plain HTTP, and `web_search` through the DeepSeek auxiliary-search endpoint',
+    /**
+     * `tool-web` mounts **two** tools with different prerequisites, which is why it is its own
+     * record rather than part of `agent-tools`: `web_fetch` needs nothing but a network, while
+     * `web_search` authenticates with `DEEPSEEK_API_KEY`
+     * (`@deepseek-ai/dsh-web-search-deepseek`'s `apiKeyEnv` default). Folding it into
+     * `agent-tools` would make a missing search key take bash and the filesystem away with it —
+     * the wrong blast radius for a field whose whole job is to name a narrow truth.
+     *
+     * The provider row (`web-search-deepseek`) lives in `dsh-base`, so this record names no
+     * package: only the composition row and the credential.
+     */
+    rows: ['tool-web'],
+    presetRows: {
+      standard: ['tool-web'],
+      ptc: ['tool-web'],
+      cordis: ['tool-web'],
+    },
+    packages: [],
+    platformPackages: {},
+    manifestOnly: [],
+    replaces: {},
+    host: Object.freeze({}),
+    /**
+     * Stated here so it is a declared fact, not an inference from whichever rows the
+     * provisioning whitelist happens to copy. The whitelist copies `llm-*` rows plus two fixed
+     * ids, and a desktop whose model provider is not DeepSeek derives **no** refs at all —
+     * measured: `credentialRefsOf(copyableRows(nonDeepSeekDesktop))` is `[]` while `tool-web`
+     * is composed. On such a desktop the node used to advertise `web_search` and fail every
+     * call; with this field the mismatch is reported at connect time and asserted offline.
+     */
+    credentials: Object.freeze(['DEEPSEEK_API_KEY']),
+    dropRules: [],
+    offReason: 'the model could read no page and search nothing, which is a silent loss of a tool the profile advertises',
   },
   {
     id: 'skills',
@@ -912,6 +956,53 @@ export function keptPackages(env = {}) {
     }
   }
   return keep
+}
+
+/**
+ * Every credential ref the capabilities of this environment cannot work without.
+ *
+ * The list exists so a credential requirement is a **declared fact** rather than an inference
+ * from whichever rows the provisioning whitelist happens to copy. The two are checked against
+ * each other: `check-capabilities` asserts that the provisioning whitelist covers every ref
+ * here, and `rnh.js` compares the same list with what the node actually received at connect
+ * time — so "advertised a tool that cannot authenticate" becomes a visible report instead of a
+ * first-call failure.
+ *
+ * Duplicates are removed in declaration order; `DEEPSEEK_API_KEY` is named by one record today
+ * and would be named by several the moment another capability needs the same key.
+ * @param {{ platform?: string, nodeMajor?: number, executables?: readonly string[] }} [env]
+ * @returns {string[]}
+ */
+export function credentialRefsOfCapabilities(env = {}) {
+  const refs = []
+  for (const entry of enabledCapabilities(env)) {
+    if (entry.state === 'off') continue
+    for (const ref of entry.capability.credentials ?? []) {
+      if (!refs.includes(ref)) refs.push(ref)
+    }
+  }
+  return refs
+}
+
+/**
+ * The capabilities whose credential requirement is not met by a given set of pushed refs.
+ *
+ * Returns the capability id and the refs it is missing, for the connect path to report. A
+ * capability with no `credentials` field never appears here, and an empty `pushed` list means
+ * "nothing was pushed", which is exactly the case that used to be silent.
+ * @param {readonly string[]} pushed - refs the provisioning step actually wrote on the node.
+ * @param {{ platform?: string, nodeMajor?: number, executables?: readonly string[] }} [env]
+ * @returns {Array<{ capability: string, missing: string[] }>}
+ */
+export function unmetCredentialRequirements(pushed, env = {}) {
+  const have = new Set(pushed)
+  const out = []
+  for (const entry of enabledCapabilities(env)) {
+    if (entry.state === 'off') continue
+    const missing = (entry.capability.credentials ?? []).filter(ref => !have.has(ref))
+    if (missing.length > 0) out.push({ capability: entry.capability.id, missing })
+  }
+  return out
 }
 
 /**

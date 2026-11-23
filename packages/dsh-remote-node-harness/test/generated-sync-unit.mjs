@@ -56,12 +56,27 @@ const carried = text => text.replace(/\r\n/gu, '\n')
 // ---- the generated module ---------------------------------------------------
 // Imported rather than parsed, because the node really imports it too: a fix that only
 // makes the file *text* match (a hand edit that the generator would undo) is not a fix.
-const { BRAIN_FILES, BRAIN_PACKAGE } = await import(`file://${GENERATED.replaceAll('\\', '/')}`)
+const { BRAIN_CREDENTIAL_REFS, BRAIN_FILES, BRAIN_PACKAGE } = await import(`file://${GENERATED.replaceAll('\\', '/')}`)
 
 check(typeof BRAIN_FILES === 'object' && BRAIN_FILES !== null,
   'the bundle exports a file table (BRAIN_FILES)')
 check(typeof BRAIN_PACKAGE === 'string' && BRAIN_PACKAGE.length > 0,
   'the bundle names the package a node profile lists', BRAIN_PACKAGE)
+
+// ---- 0. the capability facts are derived, not restated ----------------------
+// The plugin cannot import `capabilities.mjs` at runtime (it ships inside the app), so the
+// generator emits the facts it needs. That makes the generated list a **second copy**, and a
+// second copy is exactly the drift this rewrite removed — unless it is checked against the
+// source it claims to derive from. It is.
+{
+  const capabilities = await import(new URL('../../rnh-brain/capabilities.mjs', import.meta.url).href)
+  const expected = capabilities.credentialRefsOfCapabilities()
+  const actual = Array.isArray(BRAIN_CREDENTIAL_REFS) ? [...BRAIN_CREDENTIAL_REFS] : undefined
+  check(actual !== undefined, 'the bundle exports the credential refs a capability needs')
+  check(actual !== undefined && actual.join(',') === expected.join(','),
+    'and they are exactly what capabilities.mjs derives',
+    `${String(actual?.join(',') ?? '(missing)')} vs ${expected.join(',') || '(none)'}`)
+}
 
 const embedded = Object.keys(BRAIN_FILES)
 log(`embedded entries: ${String(embedded.length)}`)

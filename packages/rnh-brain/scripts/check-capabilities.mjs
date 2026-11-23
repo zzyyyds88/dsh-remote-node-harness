@@ -47,6 +47,7 @@ import {
   DEFAULT_PLATFORM,
   capabilityOfPackage,
   composedRowIds,
+  credentialRefsOfCapabilities,
   declaredDropRules,
   isForeignEngine,
   keptPackages,
@@ -58,6 +59,29 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const RNH = resolve(HERE, '..')
 const REPO = resolve(RNH, '..', '..')
 const PLUGIN = resolve(REPO, 'packages', 'dsh-remote-node-harness')
+
+/**
+ * The rows a **DeepSeek** desktop composes, as `configEditor.configuration()` reports them.
+ *
+ * Deliberately the case that works: the coverage check asks whether the whitelist *can* derive
+ * a declared ref at all. The case that used to fail — a desktop on some other provider — is the
+ * unit test's job (`test/provision-unit.mjs`), because it is about a desktop this project does
+ * not run and must not be the shape the gate assumes.
+ */
+const SYNTHETIC_DESKTOP = {
+  configuration: () => [
+    {
+      entry: { options: { id: 'llm-deepseek', name: '@deepseek-ai/dsh-llm-deepseek-api-key' } },
+      inherited: {},
+      override: { baseURL: 'http://llm.invalid/v1', models: [{ id: 'm' }] },
+    },
+    {
+      entry: { options: { id: 'agent-default-model', name: '@deepseek-ai/dsh-agent-default-model' } },
+      inherited: {},
+      override: { model: 'm' },
+    },
+  ],
+}
 
 /**
  * Differences that are **known and deliberately left for a later batch**, keyed by the check
@@ -320,6 +344,32 @@ log('5. provisioning: provision.js COPIED_ROW_IDS / PROVIDER_ROW vs the model-pl
     check(inComposition.length === 0,
       'the model plane\'s rows come from the base bundle, not from this patch',
       inComposition.length === 0 ? undefined : `${inComposition.join(', ')} — one row would then have two owners`)
+    // **The coverage half.** A capability that names a credential the provisioning whitelist
+    // cannot derive is a node that advertises a tool nobody can authenticate. `web_search` was
+    // exactly that: mounted by every preset, needing `DEEPSEEK_API_KEY`, and reachable only
+    // through `llm-*` rows — so a desktop whose provider is not DeepSeek pushed nothing.
+    // Measured before this check existed: `credentialRefsOf(copyableRows(nonDeepSeek))` is `[]`
+    // while `tool-web` is composed, and no test could see it.
+    //
+    // Imported here rather than at module scope: `capabilities.mjs` must stay importable from a
+    // tree with no plugin beside it (the trim script runs inside the fork build), while this
+    // section is about the plugin. A dynamic import keeps that separation readable.
+    const { credentialRefsOf, copyableRows } = await import(
+      new URL(`file://${join(PLUGIN, 'src', 'host', 'provision.js').replaceAll('\\', '/')}`).href
+    )
+    const declared = credentialRefsOfCapabilities()
+    const reachable = new Set(credentialRefsOf(copyableRows(SYNTHETIC_DESKTOP)))
+    const unreachable = declared.filter(ref => !reachable.has(ref))
+    check(unreachable.length === 0,
+      'every credential a capability names is one the provisioning whitelist can derive',
+      unreachable.length === 0
+        ? `${declared.join(', ') || '(none declared)'}`
+        : `${unreachable.join(', ')} — a node would advertise the tool and fail every call`)
+    // The other direction: a whitelist that derives a ref no capability declares is a key
+    // pushed to every node for no stated reason. Not fatal, but it has to be visible.
+    const undeclared = [...reachable].filter(ref => !declared.includes(ref))
+    check(undeclared.length === 0, 'and nothing is pushed that no capability asked for',
+      undeclared.length === 0 ? undefined : `extra refs: ${undeclared.join(', ')}`)
   }
 }
 
