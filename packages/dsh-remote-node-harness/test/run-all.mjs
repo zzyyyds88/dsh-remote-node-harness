@@ -169,6 +169,19 @@ const SUITES = [
     proves: 'version gate branches, artefact URLs, install script, per-node layout, switch semantics',
   },
   {
+    name: 'install-shell',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'install-shell-unit.mjs'],
+    runtime: 'node',
+    // The one suite here that executes the generated script instead of reading it: a real
+    // `ln -sfn`, a real `tar`, a real `sha256sum`, a real `node --version` on the unpacked
+    // tree, and a script really killed at the commit point. It needs a shell that can create
+    // a symlink, which on Windows means WSL (Git Bash has no symlink privilege) — without one
+    // it exits 3 and is reported as a SKIP, never as a pass.
+    timeoutMs: 300_000,
+    proves: 'the install and rollback scripts run for real in a POSIX shell: a fresh install is a symlink to a numbered generation, an upgrade keeps exactly one previous generation and prunes the rest, a rejected archive leaves the live symlink and its tree untouched, a script killed at the commit point still leaves a runtime that starts, a pre-symlink directory is migrated rather than lost, and every exit path — including a signal — ends in one parseable JSON line',
+  },
+  {
     name: 'fork-runtime',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'fork-runtime-unit.mjs'],
@@ -199,6 +212,27 @@ const SUITES = [
     runtime: 'node',
     timeoutMs: 60_000,
     proves: 'a dropped socket becomes idle with a timestamp, the reconnect ladder arms and a deliberate disconnect cancels it, the first host key is recorded and handed back, a failed connect keeps its phase, and an unreachable node keeps its workspace rows',
+  },
+  {
+    name: 'node-status',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'node-status-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // The state machine itself: no Host, no node, no clock. Every transition, every effect and
+    // all six cross-field invariants (from both directions: a hand-built illegal status is
+    // caught, and nothing `reduce` produces is illegal).
+    proves: 'the node lifecycle is one discriminated union: every event transitions it legally, the six cross-field invariants hold in both directions, and the reconnect ladder is data the reducer emits (2/4/8/120 s, a rearm never resets the rung)',
+  },
+  {
+    name: 'recovery-ladder',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'recovery-ladder-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // Batch 0 added this suite and it was never registered here, so the offline layer could go
+    // green while D1/D2 regressed. It drives the real `Rnh` with a fake `setTimeout`.
+    proves: 'the real ladder on a fake clock: six failed reconnects walk 2 s → 4 s → 8 s → 2 min, a missed rung stays quiet (recovering, not failed), a deliberate disconnect resets it, dispose cancels it, and a changed host or a failed config sync is no longer invisible',
   },
   {
     name: 'errors',

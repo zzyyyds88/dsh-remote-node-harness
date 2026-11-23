@@ -30,8 +30,10 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { apiError, describeFailure, readJsonBody, sendJson } from './core/http-error.js'
+import { classifyFailure } from './core/errors.js'
 import { decideGate } from './core/version.js'
 import { Rnh, BRAIN_BUNDLES } from './host/rnh.js'
+import { NODE_STATUS_KIND, STATUS_EVENT } from './host/node-status.js'
 import { RnhControl } from './host/rnh-control.js'
 import {
   ensureRemoteDirectory,
@@ -275,7 +277,23 @@ export function apply(ctx, config = {}) {
           return
         }
         if (action === 'probe') {
-          runtime.facts = await runtime.host.probe()
+          // A probe is a **fact about the machine**, not a lifecycle event of its own: it
+          // refreshes the cached `facts` either way, and only a failure has to change what the
+          // card says. Dispatching it instead of assigning a field is what keeps `state` from
+          // saying "green" after the machine stopped answering (the old route left it unchanged
+          // and answered 500, so the card kept a green dot over an unreachable host).
+          try {
+            runtime.facts = await runtime.host.probe()
+            runtime.dispatch({ type: STATUS_EVENT.PROBE_FINISHED, ok: true })
+          } catch (error) {
+            runtime.dispatch({
+              type: STATUS_EVENT.PROBE_FINISHED,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error),
+              failure: classifyFailure(error, { phase: 'probe' }),
+            })
+            throw error
+          }
           sendJson(res, 200, { ok: true, node: runtime.describe() })
           return
         }
@@ -290,32 +308,59 @@ export function apply(ctx, config = {}) {
           return
         }
         if (action === 'reinstall') {
-          runtime.phase = 'install'
-          try {
-            runtime.facts = await runtime.host.probe()
-            // Same gate as a connect: a reinstall is a forced provisioning, not a
-            // way to bypass the version check.
-            const installed = await runtime.host.inspectRuntime()
-            const decision = decideGate({
-              hostVersion: version,
-              hostBrain: brainVersion,
-              nodeVersion: installed.version,
-              nodeBrain: runtime.provision?.brainVersion,
-              nodeRuntime: installed.usable ? undefined : installed.reason,
-              nodeVia: installed.via,
-            })
-            runtime.gate = decision
-            if (decision.action === 'ahead' || decision.action === 'unknown') {
-              throw apiError('node-ahead', decision.message, 409)
+          // **Events only, and inside the serial queue.** The reinstall used to write
+          // `runtime.phase` from here, outside the queue and without the phase clock or a
+          // publish — so the settings page could read `connecting`/`install` with no start time,
+          // or miss the whole thing, a failed reinstall left no failure on the card (A3's status
+          // half), and a concurrent connect raced it. Every fact this route learns is now an
+          // event the state machine owns, delivered where the connect path delivers its own.
+          const node = await rnh.serial(runtime, async () => {
+            const wasConnected = runtime.status.kind === NODE_STATUS_KIND.CONNECTED
+            const started = runtime.dispatch({ type: STATUS_EVENT.REINSTALL_REQUESTED })
+            await Promise.allSettled(started.pending)
+            try {
+              runtime.facts = await runtime.host.probe()
+              // Same gate as a connect: a reinstall is a forced provisioning, not a
+              // way to bypass the version check.
+              const installed = await runtime.host.inspectRuntime()
+              const decision = decideGate({
+                hostVersion: version,
+                hostBrain: brainVersion,
+                nodeVersion: installed.version,
+                // No independent brain version on the node: see the long note in
+                // `host/rnh.js` (the bundle is written as files, its stamp is a content digest).
+                nodeBrain: undefined,
+                nodeRuntime: installed.usable ? undefined : installed.reason,
+                nodeVia: installed.via,
+              })
+              runtime.dispatch({ type: STATUS_EVENT.GATE_DECIDED, gate: decision })
+              if (decision.action === 'ahead' || decision.action === 'unknown') {
+                throw apiError('node-ahead', decision.message, 409)
+              }
+              const reinstalled = await runtime.host.install(runtime.facts, {
+                sources: config.sources,
+              })
+              runtime.dispatch({ type: STATUS_EVENT.RUNTIME_ROUTE_KNOWN, via: reinstalled.via })
+              // **The running resident host is the old tree.** Replacing the files on disk while
+              // the process keeps running is the A3 defect: `serving` names a pid whose modules
+              // were already removed, so the node looks connected and serves nothing. A connected
+              // node is therefore restarted onto the tree that was just installed, and the new
+              // endpoint travels with the finish event.
+              const service = wasConnected
+                ? await runtime.host.ensureServing({ force: true })
+                : undefined
+              runtime.dispatch({ type: STATUS_EVENT.REINSTALL_FINISHED, service })
+            } catch (error) {
+              runtime.dispatch({
+                type: STATUS_EVENT.REINSTALL_FAILED,
+                error: error instanceof Error ? error.message : String(error),
+                failure: classifyFailure(error, { phase: 'install' }),
+              })
+              throw error
             }
-            const reinstalled = await runtime.host.install(runtime.facts, {
-              sources: config.sources,
-            })
-            runtime.runtimeVia = reinstalled.via
-          } finally {
-            runtime.phase = undefined
-          }
-          sendJson(res, 200, { ok: true, node: runtime.describe() })
+            return runtime.describe()
+          })
+          sendJson(res, 200, { ok: true, node })
           return
         }
         throw apiError('action-not-found', `unknown node action ${action}`, 404)

@@ -19,6 +19,8 @@
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
+// The tool-facing projection of a node snapshot: one definition, shared with `describe()`.
+import { describeForTool } from './rnh.js'
 
 /** Expand a leading `~` so a key path can be written the way a person writes it. */
 function expandHome(path) {
@@ -98,29 +100,23 @@ function isNodeId(value) {
 /**
  * One node as a tool result carries it.
  *
- * Written against the object `NodeRuntime.describe()` returns rather than the runtime,
- * so the two callers — a live runtime and the snapshot `rnh.connect` already took —
- * produce the same shape. No field here can hold authentication material: the record's
- * `auth` is a kind, and the secret lives in the credential store.
+ * **This is a thin adapter, not a second definition of a node snapshot.** It used to re-shape
+ * `describe()` by hand and, in doing so, cut `failure` (the machine-readable code plus the one
+ * action worth offering), `phase`, `transfer`, `serving` and `droppedAt` — so an agent asking
+ * `status` got one English sentence where the settings page had "which step failed, can it be
+ * retried, how far the download got, and how many rungs of the reconnect ladder have run". A
+ * tool result is not a place to lose the answer.
+ *
+ * The projection itself now lives in `host/rnh.js` (`describeForTool`), next to the snapshot it
+ * projects, so "what a node looks like" has exactly one definition. No field here can hold
+ * authentication material: the record's `auth` is a kind, and the secret lives in the
+ * credential store — `describeForTool` also drops `provision`, which names credential refs.
  *
  * @param {Record<string, unknown>} described
  * @returns {Record<string, unknown>}
  */
 function shapeNode(described) {
-  return {
-    id: described.id,
-    name: described.name,
-    host: described.host,
-    port: described.port,
-    username: described.username,
-    authKind: described.authKind,
-    credentialsReady: described.credentialsReady === true,
-    enabled: described.enabled !== false,
-    remoteRoot: described.remoteRoot,
-    state: described.state,
-    ...(typeof described.error === 'string' ? { error: described.error } : {}),
-    ...(described.remote === null || typeof described.remote !== 'object' ? {} : { remote: described.remote }),
-  }
+  return describeForTool(described)
 }
 
 /**
@@ -207,7 +203,10 @@ export class RnhControl {
       ...(typeof patch?.enabled === 'boolean' ? { enabled: patch.enabled } : {}),
     })
     const notes = []
-    if (updated.state === 'connected') notes.push('this node is connected; disconnect and reconnect for the change to take effect')
+    // Read the **snapshot**, not the runtime: the runtime no longer has a `state` field (it is
+    // one discriminated-union status now), and `updated.state` would silently always be
+    // `undefined` — the note below would simply stop appearing.
+    if (updated.describe().state === 'connected') notes.push('this node is connected; disconnect and reconnect for the change to take effect')
     return { node: shapeNode(updated.describe()), notes }
   }
 

@@ -27,6 +27,7 @@ const sandbox = mkdtempSync(join(tmpdir(), 'rnh-lifecycle-'))
 process.env.DSH_HOME = sandbox
 
 const { Rnh, NODE_STATE } = await import('../src/host/rnh.js')
+const { STATUS_EVENT, NODE_STATUS_KIND } = await import('../src/host/node-status.js')
 const { classifyFailure } = await import('../src/core/errors.js')
 const { RemoteWorkspaces } = await import('../src/host/remote-workspaces.js')
 
@@ -41,6 +42,23 @@ const check = (ok, label, detail) => {
 }
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** The resident endpoint `ensureServing` returns, for fixtures. */
+const SERVICE = Object.freeze({ port: 1234, token: 't', pid: 1, version: '0.0.0-test' })
+
+/**
+ * Put one runtime into `connected` through the **state machine**.
+ *
+ * This used to be `node.state = NODE_STATE.CONNECTED; node.serving = …`. Those two fields no
+ * longer exist: they were part of the fifteen independent lifecycle variables batch 4 replaced
+ * with one discriminated union, so a fixture that assigns them would be testing a shape that is
+ * gone. Dispatching the same events `connect()` dispatches is what a real connect does.
+ */
+const markConnected = (node, service = SERVICE) => {
+  node.dispatch({ type: STATUS_EVENT.CONNECT_REQUESTED, phase: 'probe' })
+  node.dispatch({ type: STATUS_EVENT.SERVICE_STARTED, service })
+  node.dispatch({ type: STATUS_EVENT.CONNECT_SUCCEEDED, service })
+}
 
 /** A credential store that answers from memory. */
 function memoryCredentials() {
@@ -63,24 +81,36 @@ function memoryCredentials() {
   const node = await runtime
 
   // Pretend a connect succeeded.
-  node.state = NODE_STATE.CONNECTED
-  node.serving = { port: 1234, token: 't', pid: 1, version: '0.0.0-test' }
+  markConnected(node)
 
   // The connection reports a drop the way `SshConnection` does.
   node.connection.target.onDrop?.()
 
-  check(node.state === NODE_STATE.IDLE, 'a drop takes the node out of `connected`', node.state)
-  check(typeof node.droppedAt === 'number' && node.droppedAt > 0,
-    'and records when it happened, so the card can say "since …"', String(node.droppedAt))
-  check(node.serving === undefined, 'the resident host is forgotten, because nothing can reach it')
+  check(node.describe().state === NODE_STATE.IDLE, 'a drop takes the node out of `connected`',
+    node.describe().state)
+  check(node.status.kind === NODE_STATUS_KIND.RECOVERING,
+    'and the lossless `kind` says it is recovering', String(node.status.kind))
+  check(typeof node.describe().droppedAt === 'number' && node.describe().droppedAt > 0,
+    'and records when it happened, so the card can say "since …"', String(node.describe().droppedAt))
+  check(node.describe().serving === undefined,
+    'the resident host is forgotten, because nothing can reach it')
   check(node.describe().droppedAt !== undefined, 'the snapshot carries it to the settings page')
   check(node.describe().failure === undefined,
     'and a drop is not reported as a failure — nothing is misconfigured')
   // The card can only say "attempt 2 of 3" if the rung is in the snapshot. Without it the
   // difference between the first try and the tenth is invisible, and those are the two cases
-  // a person acts differently on.
-  check(typeof node.recoveryAttempts === 'number', 'the rung the ladder will use is tracked',
-    String(node.recoveryAttempts))
+  // a person acts differently on. The rung is a payload of `recovering` now (`status.attempt`);
+  // the snapshot keeps omitting `recoveryAttempts` while it is 0, exactly as before.
+  check(node.status.attempt === 0,
+    'the ladder starts at rung 0', String(node.status.attempt))
+  node.dispatch({ type: STATUS_EVENT.RECOVERY_ATTEMPT_STARTED })
+  check(node.describe().recoveryAttempts === 1,
+    'and the snapshot reports the rung once an attempt has started',
+    String(node.describe().recoveryAttempts))
+  node.dispatch({ type: STATUS_EVENT.RECOVERY_ATTEMPT_FAILED, error: 'unreachable' })
+  check(node.describe().recoveryAttempts === 1 && node.describe().lastError === 'unreachable',
+    'a missed rung keeps its number and its reason',
+    `${String(node.describe().recoveryAttempts)} / ${String(node.describe().lastError)}`)
   check(node.recoveryTimer !== undefined, 'the reconnect ladder is armed')
   rnh.dispose()
   node.recoveryTimer = undefined
@@ -91,8 +121,7 @@ function memoryCredentials() {
 {
   const rnh = new Rnh({ credentials: memoryCredentials(), version: '0.0.0-test', log: () => {} })
   const node = await rnh.put({ id: 'n0000000000ab', name: 'fake', host: 'example.test', username: 'root', auth: { kind: 'password' } })
-  node.state = NODE_STATE.CONNECTED
-  node.serving = { port: 1, token: 't', pid: 1, version: '0.0.0-test' }
+  markConnected(node)
   node.connection.target.onDrop?.()
   check(node.recoveryTimer !== undefined, 'the ladder is armed after a drop')
 
@@ -100,8 +129,9 @@ function memoryCredentials() {
   check(node.recoveryTimer === undefined,
     'pressing Disconnect cancels it — otherwise the node comes back two seconds later',
     String(node.recoveryTimer))
-  check(node.state === NODE_STATE.IDLE, 'and the node stays down', node.state)
-  check(node.droppedAt === undefined, 'a deliberate disconnect is not a drop', String(node.droppedAt))
+  check(node.describe().state === NODE_STATE.IDLE, 'and the node stays down', node.describe().state)
+  check(node.describe().droppedAt === undefined, 'a deliberate disconnect is not a drop',
+    String(node.describe().droppedAt))
   rnh.dispose()
 }
 
@@ -160,15 +190,26 @@ function memoryCredentials() {
   check(node.describe().transfer === undefined, 'and no transfer numbers')
   check(node.describe().recoveryAttempts === undefined, 'and no ladder rung while it is healthy')
 
-  node.phase = 'install'
-  node.phaseStartedAt = 1_700_000_000_000
-  check(node.describe().phaseStartedAt === 1_700_000_000_000,
+  // **Changed fixture shape, same behaviour.** A phase and a transfer used to be two fields
+  // written straight onto the runtime; they are payloads of the `connecting` status now, so
+  // the fixture dispatches the events a real connect dispatches.
+  node.dispatch({ type: STATUS_EVENT.CONNECT_REQUESTED, phase: 'install' })
+  check(typeof node.describe().phaseStartedAt === 'number',
     'a phase carries the moment it began, so the card can show elapsed time',
     String(node.describe().phaseStartedAt))
+  check(node.describe().phase === 'install', 'and the step it names', String(node.describe().phase))
 
-  node.transfer = { bytes: 12 * 1024 * 1024, total: 58 * 1024 * 1024, bytesPerSecond: 2 * 1024 * 1024 }
+  node.dispatch({
+    type: STATUS_EVENT.TRANSFER_UPDATED,
+    transfer: { bytes: 12 * 1024 * 1024, total: 58 * 1024 * 1024, bytesPerSecond: 2 * 1024 * 1024 },
+  })
   check(node.describe().transfer?.bytes === 12 * 1024 * 1024,
     'live transfer numbers reach the card', JSON.stringify(node.describe().transfer))
+  // A transfer belongs to the phase that was downloading: moving on clears it, so a bar can
+  // never appear under a step that is not downloading anything.
+  node.dispatch({ type: STATUS_EVENT.PHASE_ENTERED, phase: 'provision' })
+  check(node.describe().transfer === undefined,
+    'and they are dropped when the phase moves on, so a stale bar cannot be shown')
   rnh.dispose()
 }
 
