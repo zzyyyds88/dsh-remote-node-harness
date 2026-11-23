@@ -20,6 +20,24 @@ import { upgradeWebSocket } from './ws.js'
 /** Endpoint that answers with the browser cookie when given the launch token. */
 const TOKEN_PATH = token => `/?token=${encodeURIComponent(token)}`
 
+/**
+ * The transport bounds a caller passed, in the shape `httpOverSsh` reads.
+ *
+ * Copied field by field rather than spread: an `undefined` value must stay absent, so
+ * the transport's own defaults apply, and a caller's unrelated option cannot leak into
+ * an HTTP request object.
+ * @param {{ signal?: AbortSignal, timeoutMs?: number, maxResponseBytes?: number }} init
+ * @returns {{ signal?: AbortSignal, timeoutMs?: number, maxResponseBytes?: number }}
+ */
+function transportBounds(init) {
+  /** @type {{ signal?: AbortSignal, timeoutMs?: number, maxResponseBytes?: number }} */
+  const bounds = {}
+  if (init.signal !== undefined) bounds.signal = init.signal
+  if (init.timeoutMs !== undefined) bounds.timeoutMs = init.timeoutMs
+  if (init.maxResponseBytes !== undefined) bounds.maxResponseBytes = init.maxResponseBytes
+  return bounds
+}
+
 /** Failure codes this client can produce before the remote even answers. */
 export const GATEWAY_FAILURE = Object.freeze({
   OFFLINE: 'rnh/offline',
@@ -43,6 +61,8 @@ class LogicalStream {
     this.closed = false
     /** Whether the uplink was already half-closed, so it is not sent twice. */
     this.uplinkEnded = false
+    /** What ended this stream, for a caller that only sees the settled handle. */
+    this.outcome = /** @type {'end' | 'error' | 'cancelled' | undefined} */ (undefined)
   }
 
   /** Send one uplink item on this stream, if the carrier is still writable. */
@@ -64,25 +84,48 @@ class LogicalStream {
     } catch { /* the carrier is already gone */ }
   }
 
-  close() {
+  /**
+   * End this stream exactly once, whatever the reason.
+   *
+   * Every path out of a logical stream — the node's own `end`, its `error`, and this
+   * side cancelling it — converges here, because the alternative is what produced the
+   * worst bug in this file: `finish()` called `onEnd()` with no failure, and the error
+   * frame then called `onEnd(error)` on an already-closed stream. The consumer's queue
+   * had been told "clean end" first and dropped the error, so a node-side failure
+   * reached the browser as an ordinary end of stream.
+   *
+   * `kind` is `'end'` (node finished), `'error'` (node failed, payload is why) or
+   * `'cancelled'` (this side stopped reading). Only the first call has any effect.
+   *
+   * @param {'end' | 'error' | 'cancelled'} kind
+   * @param {unknown} [payload] - the failure, for `kind: 'error'`.
+   */
+  settle(kind, payload) {
     if (this.closed) return
     this.closed = true
-    // Telling the node this stream is done matters for anything that holds a
-    // resource on its side (a terminal attachment, a live follow). Without it the
-    // node keeps the attachment until its own heartbeat gives up.
-    if (this.carrier !== undefined) {
+    this.outcome = kind
+    if (kind === 'cancelled' && this.carrier !== undefined) {
+      // Telling the node this stream is done matters for anything that holds a resource
+      // on its side (a terminal attachment, a live follow). Without it the node keeps the
+      // attachment until its own heartbeat gives up.
       try {
         this.carrier.send(JSON.stringify({ type: 'cancel', streamId: this.id }))
       } catch { /* the carrier is already gone */ }
     }
-    this.handlers.onEnd()
+    try {
+      if (kind === 'error') this.handlers.onEnd(payload)
+      else this.handlers.onEnd()
+    } catch { /* a consumer's handler must not break teardown */ }
+  }
+
+  /** Stop reading and tell the node to release its side. */
+  close() {
+    this.settle('cancelled')
   }
 
   /** The node ended this stream itself: drop it locally without telling it back. */
   finish() {
-    if (this.closed) return
-    this.closed = true
-    this.handlers.onEnd()
+    this.settle('end')
   }
 }
 
@@ -147,15 +190,26 @@ export class RemoteGateway {
    * with a v1 browser cookie. That cookie — not an API operator credential — is
    * what `authorizeIndex` and the `/api` interceptor accept, so every later
    * request carries it.
+   *
+   * `init` carries the per-call transport bounds (`signal`, `timeoutMs`,
+   * `maxResponseBytes`). They are forwarded rather than owned here: a caller that
+   * aborts or has its own deadline must be able to stop the cookie exchange too, and
+   * a connection attempt and a data call can want different budgets.
+   *
+   * @param {boolean} [force]
+   * @param {{ signal?: AbortSignal, timeoutMs?: number, maxResponseBytes?: number }} [init]
    * @returns {Promise<string>}
    */
-  async cookie(force = false) {
+  async cookie(force = false, init = {}) {
     if (!force && this.cookieValue !== undefined) return this.cookieValue
     const serving = this.serving()
     if (serving === undefined) {
       throw Object.assign(new Error('this node is not serving yet'), { code: GATEWAY_FAILURE.OFFLINE })
     }
-    const response = await httpOverSsh(this.connection, serving.port, { path: TOKEN_PATH(serving.token) })
+    const response = await httpOverSsh(this.connection, serving.port, {
+      path: TOKEN_PATH(serving.token),
+      ...transportBounds(init),
+    })
     const cookies = cookiesOf(response.headers)
     if (cookies.length === 0) {
       throw Object.assign(
@@ -170,20 +224,28 @@ export class RemoteGateway {
   /**
    * One unary Gateway call, retried once against a fresh cookie when the remote
    * rejects the cached one.
+   *
+   * `signal` stays a positional argument because the routing layer passes it that way;
+   * the rest of the transport bounds ride in `init`. Both reach `httpOverSsh`, so an
+   * aborted call and a call with its own deadline are stoppable at every wait, not only
+   * before the request is written.
+   *
    * @param {string} endpoint - e.g. `session/list`.
    * @param {Record<string, unknown>} args
    * @param {AbortSignal} [signal]
+   * @param {{ timeoutMs?: number, maxResponseBytes?: number }} [init]
    * @returns {Promise<{ ok: true, value: unknown } | { ok: false, error: { code: string, message: string, details?: unknown } }>}
    */
-  async call(endpoint, args = {}, signal) {
+  async call(endpoint, args = {}, signal, init = {}) {
+    const bounds = transportBounds({ ...init, ...(signal === undefined ? {} : { signal }) })
     let lastError
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const serving = this.serving()
       if (serving === undefined) {
         throw Object.assign(new Error('this node is not serving yet'), { code: GATEWAY_FAILURE.OFFLINE })
       }
-      signal?.throwIfAborted()
-      const cookie = await this.cookie(attempt > 0)
+      bounds.signal?.throwIfAborted()
+      const cookie = await this.cookie(attempt > 0, bounds)
       const payload = JSON.stringify({
         type: 'client-request',
         rpcId: `rnh-${randomUUID()}`,
@@ -199,6 +261,7 @@ export class RemoteGateway {
           cookie,
         },
         body: payload,
+        ...bounds,
       })
       if (response.status === 401) {
         lastError = Object.assign(new Error(`the remote rejected the call to ${endpoint} (HTTP 401)`), {
@@ -288,13 +351,19 @@ export class RemoteGateway {
   }
 
   /**
-   * The live stream carrier, opening it on first use.
+   * The live carrier, opening it on first use.
+   *
+   * `init` bounds only the **opening**: once the carrier is live, its lifetime is the
+   * connection's, not a call's. An already-open carrier is returned regardless of the
+   * bounds, because a subscriber asking for a short deadline must not be handed a
+   * different socket from the one its sibling streams are already on.
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [init]
    * @returns {Promise<import('./ws.js').WebSocketClient>}
    */
-  async carrierClient() {
+  async carrierClient(init = {}) {
     if (this.#carrierUsable()) return this.carrier
     if (this.carrierPending !== undefined) return this.carrierPending
-    this.carrierPending = this.#openCarrier()
+    this.carrierPending = this.#openCarrier(init)
     try {
       return await this.carrierPending
     } finally {
@@ -302,7 +371,7 @@ export class RemoteGateway {
     }
   }
 
-  async #openCarrier() {
+  async #openCarrier(init = {}) {
     const serving = this.serving()
     if (serving === undefined) {
       throw Object.assign(new Error('this node is not serving yet'), { code: GATEWAY_FAILURE.OFFLINE })
@@ -313,8 +382,11 @@ export class RemoteGateway {
     // and "this Host believes the node has no event bus".
     let lastError
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const cookie = await this.cookie(attempt > 0)
-      const channel = await openChannel(this.connection, serving.port)
+      const cookie = await this.cookie(attempt > 0, init)
+      // The deadline belongs to the whole opening, but a dead channel has to be dropped
+      // before that deadline: `openChannel` cannot see the carrier's connect timer, and
+      // the upgrade timer cannot close a channel it never received.
+      const channel = await openChannel(this.connection, serving.port, init.signal)
       let client
       // Generation guard: a carrier that closes late must not tear down the one that replaced
       // it. Without this, the corpse of a previous socket reports `close` after the retry has
@@ -327,6 +399,11 @@ export class RemoteGateway {
           path: '/api/remote.mux',
           origin: `http://127.0.0.1:${String(serving.port)}`,
           cookie,
+          ...(init.timeoutMs === undefined ? {} : { connectTimeoutMs: init.timeoutMs }),
+          // The carrier is the one place a protocol violation must be visible: a frame
+          // this client cannot decode ends the socket, and the reason has to reach this
+          // plugin's log or the node looks silent.
+          log: message => this.log(message),
         }, {
           onText: text => this.#onCarrierText(text),
           onClose: () => {
@@ -367,13 +444,23 @@ export class RemoteGateway {
     }
     if (frame.type === 'end') {
       this.streams.delete(frame.streamId)
-      stream?.finish()
+      stream?.settle('end')
       return
     }
     if (frame.type === 'error') {
+      // One call, and it is the failing one: settling with the error is what lets the
+      // consumer's queue reject. Finishing first and reporting the error second was the
+      // bug — the queue had already been closed cleanly, and `fail()` on a closed queue
+      // dropped the error, so an ordinary end of stream reached the browser.
       this.streams.delete(frame.streamId)
-      stream?.finish()
-      stream?.handlers.onEnd(frame.error)
+      if (stream === undefined) {
+        // A failure for a stream this Host has already dropped (a closed tab, a cancelled
+        // follow). There is no consumer left to fail, but the node said something went
+        // wrong and it belongs in the log rather than nowhere.
+        this.log(`the node reported a failure for stream ${String(frame.streamId)}: ${JSON.stringify(frame.error)}`)
+        return
+      }
+      stream.settle('error', frame.error)
     }
   }
 
@@ -384,18 +471,22 @@ export class RemoteGateway {
    * method that is itself a stream (`terminal/attach`, for instance) takes its
    * uplink items from this Host's own mux and has to hand them to the node instead
    * of consuming them locally. `send`/`endUplink` are that direction.
+   *
+   * `init` bounds the opening only (`signal`, `timeoutMs`). A stream that is already
+   * open is not re-bounded: its lifetime is the carrier's.
    * @param {string} endpoint
    * @param {Record<string, unknown>} args
    * @param {{ onFrame: (value: unknown) => void, onEnd: (failure?: unknown) => void }} handlers
+   * @param {{ signal?: AbortSignal, timeoutMs?: number }} [init]
    * @returns {Promise<{ close: () => void, send: (value: unknown) => boolean, endUplink: () => void }>}
    */
-  async openStream(endpoint, args, handlers) {
+  async openStream(endpoint, args, handlers, init = {}) {
     // One retry on a fresh carrier: a socket that looked writable can still be the corpse of
     // the connection to a host that has since gone away, and the failure mode there is a
     // silently empty stream rather than an error. Reopening costs one round trip and turns
     // "this Session shows nothing" into "it shows everything".
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const carrier = await this.carrierClient()
+      const carrier = await this.carrierClient(init)
       const stream = new LogicalStream(endpoint, handlers, carrier)
       this.streams.set(stream.id, stream)
       const sent = carrier.send(JSON.stringify({ type: 'open', streamId: stream.id, endpoint, payload: { args } }))

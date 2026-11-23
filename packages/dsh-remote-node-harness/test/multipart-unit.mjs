@@ -10,7 +10,7 @@
  *
  * Usage: node test/multipart-unit.mjs
  */
-import { decodeGatewayAnswer } from '../src/host/multipart.js'
+import { DEFAULT_MAX_BYTES as MAX_BYTES, DEFAULT_MAX_PARTS as MAX_PARTS, decodeGatewayAnswer } from '../src/host/multipart.js'
 
 const log = message => process.stderr.write(`[multipart-unit] ${message}\n`)
 const failures = []
@@ -132,6 +132,82 @@ const errored = decodeGatewayAnswer(
 )
 check(errored.ok === false && errored.error.code === 'workspace-file/not-found',
   'a Gateway error keeps its code', errored.error?.code)
+
+// ---- 6. the decoder is bounded -------------------------------------------
+// A node answers with as many parts, and as many bytes, as it likes; nothing above this
+// function counted either. The three limits are checked one at a time so a failure names
+// which one stopped working.
+{
+  const coded = (label, fn) => {
+    try {
+      fn()
+      check(false, label, 'no error thrown')
+      return undefined
+    } catch (error) {
+      check(true, label)
+      return error
+    }
+  }
+
+  check(typeof MAX_PARTS === 'number' && typeof MAX_BYTES === 'number',
+    'the limits are exported rather than buried in the decoder',
+    `${String(MAX_PARTS)} parts / ${String(MAX_BYTES)} bytes`)
+
+  /** A valid answer with `count` byte attachments of `size` bytes each. */
+  const withAttachments = (count, size) => {
+    const items = Array.from({ length: count }, (_unused, index) => ({ name: `a${String(index)}`, data: null }))
+    return multipart(
+      {
+        type: 'server-response',
+        rpcId: 'r6',
+        result: { ok: true, value: { items } },
+        attachments: items.map((item, index) => ({
+          path: ['items', index, 'data'],
+          codec: 'bytes',
+          part: `bytes-${String(index)}`,
+        })),
+      },
+      items.map((_item, index) => ({ name: `bytes-${String(index)}`, bytes: Buffer.alloc(size, 0x41) })),
+    )
+  }
+
+  // The exact boundary is allowed: `maxParts` counts parts, and the answer still needs
+  // its metadata part, so `maxParts - 1` attachments is the largest legal answer.
+  const boundary = decodeGatewayAnswer(
+    withAttachments(3, 4),
+    `multipart/form-data; boundary=${BOUNDARY}`,
+    { maxParts: 4 },
+  )
+  check(boundary.value.items.length === 3 && boundary.value.items[0].data instanceof Uint8Array,
+    'an answer exactly at the part limit decodes')
+
+  const tooMany = coded('more parts than the limit is refused', () => {
+    decodeGatewayAnswer(withAttachments(4, 4), `multipart/form-data; boundary=${BOUNDARY}`, { maxParts: 4 })
+  })
+  check(tooMany?.code === 'rnh/too-large', 'and the refusal carries a code', String(tooMany?.code))
+
+  // One part over the byte limit.
+  const oneHuge = coded('a single oversized part is refused', () => {
+    decodeGatewayAnswer(withAttachments(1, 2_000), `multipart/form-data; boundary=${BOUNDARY}`, { maxBytes: 1_000 })
+  })
+  check(oneHuge?.code === 'rnh/too-large', 'the single-part refusal carries a code', String(oneHuge?.code))
+
+  // Several parts that are each small but together exceed the limit: the total counts too.
+  const combined = coded('parts whose total exceeds the limit are refused', () => {
+    decodeGatewayAnswer(withAttachments(4, 400), `multipart/form-data; boundary=${BOUNDARY}`, { maxBytes: 1_000 })
+  })
+  check(combined?.code === 'rnh/too-large', 'the total-bytes refusal carries a code', String(combined?.code))
+
+  // The limits are per call and default to the exported ceiling, not to "no limit".
+  let defaultRefusal
+  try {
+    decodeGatewayAnswer(withAttachments(MAX_PARTS + 1, 4), `multipart/form-data; boundary=${BOUNDARY}`)
+  } catch (error) {
+    defaultRefusal = error
+  }
+  check(defaultRefusal?.code === 'rnh/too-large', 'the default part limit applies without being asked for',
+    String(defaultRefusal?.code))
+}
 
 if (failures.length > 0) {
   log(`FAILED: ${failures.join(', ')}`)

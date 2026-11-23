@@ -23,14 +23,40 @@
 const BOUNDARY_PATTERN = /boundary=(?:"([^"]+)"|([^;]+))/iu
 
 /**
+ * How many parts one answer may carry.
+ *
+ * The Gateway writes one metadata part plus one part per byte attachment, so the
+ * count is bounded by the attachments of a single result. Anything past this is not
+ * a result this client produced, and decoding it costs one buffer per part.
+ */
+export const DEFAULT_MAX_PARTS = 64
+
+/**
+ * How many bytes each part may carry — and, therefore, how many the whole body may.
+ *
+ * The same ceiling as the response body itself (`httpOverSsh`'s
+ * `DEFAULT_MAX_RESPONSE_BYTES`), stated here too because this function is also
+ * reachable with a body a caller read some other way. A part larger than the whole
+ * body can be is a corrupt answer, not a large one.
+ */
+export const DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+
+const codedError = (code, message) => Object.assign(new Error(message), { code })
+
+/**
  * Split one multipart body into its raw parts.
  * @param {Buffer} body
  * @param {string} boundary
+ * @param {{ maxParts?: number, maxBytes?: number }} [options]
  * @returns {Array<{ name: string, body: Buffer }>}
  */
-function splitParts(body, boundary) {
+function splitParts(body, boundary, options = {}) {
+  const maxParts = options.maxParts ?? DEFAULT_MAX_PARTS
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
   const delimiter = Buffer.from(`--${boundary}`, 'latin1')
   const parts = []
+  /** Summed across every part: one huge part and many medium ones are the same risk. */
+  let total = 0
   let cursor = body.indexOf(delimiter)
   if (cursor === -1) return parts
   cursor += delimiter.length
@@ -48,7 +74,29 @@ function splitParts(body, boundary) {
     // The CRLF before the next delimiter belongs to the delimiter, not the body.
     const end = next >= 2 && body.subarray(next - 2, next).toString('latin1') === '\r\n' ? next - 2 : next
     const name = /name="([^"]*)"/iu.exec(headers)?.[1]
-    if (name !== undefined) parts.push({ name, body: body.subarray(start, end) })
+    const size = end - start
+    if (size > maxBytes) {
+      throw codedError(
+        'rnh/too-large',
+        `a multipart part is ${String(size)} bytes; the limit is ${String(maxBytes)}`,
+      )
+    }
+    total += size
+    if (total > maxBytes) {
+      throw codedError(
+        'rnh/too-large',
+        `the multipart parts total ${String(total)} bytes; the limit is ${String(maxBytes)}`,
+      )
+    }
+    if (name !== undefined) {
+      if (parts.length >= maxParts) {
+        throw codedError(
+          'rnh/too-large',
+          `the answer carries more than ${String(maxParts)} multipart parts`,
+        )
+      }
+      parts.push({ name, body: body.subarray(start, end) })
+    }
     cursor = next + delimiter.length
   }
   return parts
@@ -59,10 +107,11 @@ function splitParts(body, boundary) {
  *
  * @param {Buffer} body
  * @param {string | undefined} contentType - the response `content-type`.
+ * @param {{ maxParts?: number, maxBytes?: number }} [limits]
  * @returns {{ ok: boolean, value?: unknown, error?: { code: string, message: string, details?: unknown } }}
  * @throws {TypeError} when a multipart answer is malformed.
  */
-export function decodeGatewayAnswer(body, contentType) {
+export function decodeGatewayAnswer(body, contentType, limits = {}) {
   const type = (contentType ?? '').toLowerCase()
   if (!type.startsWith('multipart/form-data')) {
     const parsed = JSON.parse(body.toString('utf8'))
@@ -75,7 +124,7 @@ export function decodeGatewayAnswer(body, contentType) {
 
   const boundary = BOUNDARY_PATTERN.exec(contentType)?.[1] ?? BOUNDARY_PATTERN.exec(contentType)?.[2]
   if (boundary === undefined) throw new TypeError('the remote answered multipart without a boundary')
-  const parts = splitParts(body, boundary)
+  const parts = splitParts(body, boundary, limits)
   const metadataPart = parts.find(part => part.name === 'metadata')
   if (metadataPart === undefined) throw new TypeError('the remote answered multipart without metadata')
   const envelope = JSON.parse(metadataPart.body.toString('utf8'))

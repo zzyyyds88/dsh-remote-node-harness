@@ -7,43 +7,24 @@
  * enough of the protocol for the carrier — text frames, ping/pong, close — and
  * nothing else. No extensions, no fragmentation on send, no permessage-deflate.
  *
+ * Frame encoding and decoding live in `ws-frame.js` as pure functions; what stays
+ * here is the state a live connection has: the stream, the handler pair, the
+ * partial frame buffer, and the single terminal event.
+ *
  * @module @greatbaby/dsh-remote-node-harness/host/ws
  */
 import { randomBytes } from 'node:crypto'
+import {
+  CONTROL_MAX_PAYLOAD,
+  DEFAULT_MAX_BUFFER_BYTES,
+  DEFAULT_MAX_FRAME_BYTES,
+  OPCODE,
+  decodeFrames,
+  encodeFrame,
+} from './ws-frame.js'
 
-const OPCODE = Object.freeze({ TEXT: 0x1, BINARY: 0x2, CLOSE: 0x8, PING: 0x9, PONG: 0xa })
-
-/** Encode one client-to-server text frame, masked as the protocol requires. */
-function encodeText(text) {
-  const payload = Buffer.from(text, 'utf8')
-  const length = payload.length
-  let header
-  if (length < 126) {
-    header = Buffer.from([0x81, 0x80 | length])
-  } else if (length < 65_536) {
-    header = Buffer.alloc(4)
-    header[0] = 0x81
-    header[1] = 0x80 | 126
-    header.writeUInt16BE(length, 2)
-  } else {
-    header = Buffer.alloc(10)
-    header[0] = 0x81
-    header[1] = 0x80 | 127
-    header.writeBigUInt64BE(BigInt(length), 2)
-  }
-  const mask = randomBytes(4)
-  const masked = Buffer.allocUnsafe(length)
-  for (let index = 0; index < length; index += 1) masked[index] = payload[index] ^ mask[index % 4]
-  return Buffer.concat([header, mask, masked])
-}
-
-/** Encode a small control frame (close/pong) with a masked empty or given payload. */
-function encodeControl(opcode, payload = Buffer.alloc(0)) {
-  const mask = randomBytes(4)
-  const masked = Buffer.allocUnsafe(payload.length)
-  for (let index = 0; index < payload.length; index += 1) masked[index] = payload[index] ^ mask[index % 4]
-  return Buffer.concat([Buffer.from([0x80 | opcode, 0x80 | payload.length]), mask, masked])
-}
+/** Close-frame payload: 1000 (normal closure), two bytes big-endian. */
+const CLOSE_NORMAL = Buffer.from([0x03, 0xe8])
 
 /**
  * A live carrier connection.
@@ -56,11 +37,15 @@ export class WebSocketClient {
   /**
    * @param {import('node:stream').Duplex} stream - an already-upgraded duplex.
    * @param {{ onText: (text: string) => void, onClose: (reason?: string) => void }} handlers
+   * @param {{ log?: (message: string) => void, maxFrameBytes?: number, maxBufferBytes?: number }} [options]
    */
-  constructor(stream, handlers) {
+  constructor(stream, handlers, options = {}) {
     this.stream = stream
     this.handlers = handlers
+    this.log = options.log ?? (() => {})
     this.closed = false
+    this.maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES
+    this.maxBufferBytes = options.maxBufferBytes ?? DEFAULT_MAX_BUFFER_BYTES
     /** @type {Buffer} */
     this.buffer = Buffer.alloc(0)
     this.onData = chunk => this.#consume(chunk)
@@ -71,11 +56,16 @@ export class WebSocketClient {
     stream.on('error', this.onStreamError)
   }
 
-  /** Send one text frame. A closed socket drops the write instead of throwing. */
+  /**
+   * Send one text frame. A closed socket drops the write instead of throwing, and an
+   * encoding refusal is reported on the same path: `encodeFrame` throws only for a frame
+   * this client would have emitted damaged, and continuing to the next frame is the
+   * caller's decision, not this one's.
+   */
   send(text) {
     if (this.closed) return false
     try {
-      this.stream.write(encodeText(text))
+      this.stream.write(encodeFrame(OPCODE.TEXT, text))
       return true
     } catch {
       this.#finish('the carrier write failed')
@@ -86,7 +76,7 @@ export class WebSocketClient {
   /** Send a close frame and destroy the stream. */
   close() {
     if (this.closed) return
-    try { this.stream.write(encodeControl(OPCODE.CLOSE, Buffer.from([0x03, 0xe8]))) } catch { /* closing anyway */ }
+    try { this.stream.write(encodeFrame(OPCODE.CLOSE, CLOSE_NORMAL)) } catch { /* closing anyway */ }
     this.#finish('closed by this plugin')
   }
 
@@ -100,45 +90,51 @@ export class WebSocketClient {
     try { this.handlers.onClose(reason) } catch { /* a listener must not break teardown */ }
   }
 
-  /** Parse as many complete frames as the buffer holds. */
+  /**
+   * Parse as many complete frames as the buffer holds.
+   *
+   * Both limits are enforced by `decodeFrames`: a declared frame over the per-frame
+   * budget, and retained bytes over the buffer budget. The second one is the reason the
+   * old code could be driven out of memory — it concatenated first and checked later, so a
+   * peer that announced a huge length and then trickled bytes grew the buffer forever.
+   */
   #consume(chunk) {
     this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk])
-    while (this.buffer.length >= 2) {
-      const opcode = this.buffer[0] & 0x0f
-      const second = this.buffer[1]
-      const masked = (second & 0x80) !== 0
-      let length = second & 0x7f
-      let offset = 2
-      if (length === 126) {
-        if (this.buffer.length < 4) return
-        length = this.buffer.readUInt16BE(2)
-        offset = 4
-      } else if (length === 127) {
-        if (this.buffer.length < 10) return
-        const wide = this.buffer.readBigUInt64BE(2)
-        if (wide > BigInt(64 * 1024 * 1024)) {
-          this.#finish('the carrier sent an oversized frame')
-          return
+    let decoded
+    try {
+      decoded = decodeFrames(this.buffer, {
+        maxFrameBytes: this.maxFrameBytes,
+        maxBufferBytes: this.maxBufferBytes,
+      })
+    } catch (error) {
+      // A protocol violation is terminal, and the reason has to say which one: a
+      // fragmented message used to arrive here as half a JSON document that the
+      // Gateway silently dropped, which reads as "the node has no events".
+      this.log(`ws: ${error instanceof Error ? error.message : String(error)}`)
+      this.#finish(error instanceof Error ? error.message : String(error))
+      return
+    }
+    this.buffer = decoded.rest
+    for (const frame of decoded.frames) {
+      if (frame.opcode === OPCODE.TEXT) {
+        try {
+          this.handlers.onText(frame.payload.toString('utf8'))
+        } catch (error) {
+          // The listener is the caller's code; a throw there used to leave no trace at
+          // all, so a failing frame router looked like a node that sent nothing.
+          this.log(`ws: a text listener threw: ${error instanceof Error ? error.message : String(error)}`)
         }
-        length = Number(wide)
-        offset = 10
-      }
-      const maskBytes = masked ? 4 : 0
-      if (this.buffer.length < offset + maskBytes + length) return
-      let payload = this.buffer.subarray(offset + maskBytes, offset + maskBytes + length)
-      if (masked) {
-        const mask = this.buffer.subarray(offset, offset + 4)
-        const unmasked = Buffer.allocUnsafe(length)
-        for (let index = 0; index < length; index += 1) unmasked[index] = payload[index] ^ mask[index % 4]
-        payload = unmasked
-      }
-      this.buffer = this.buffer.subarray(offset + maskBytes + length)
-
-      if (opcode === OPCODE.TEXT) {
-        try { this.handlers.onText(payload.toString('utf8')) } catch { /* listener fault */ }
-      } else if (opcode === OPCODE.PING) {
-        try { this.stream.write(encodeControl(OPCODE.PONG, payload)) } catch { /* closing */ }
-      } else if (opcode === OPCODE.CLOSE) {
+      } else if (frame.opcode === OPCODE.PING) {
+        // RFC 6455 §5.5.3 requires the PONG to echo the PING payload. A PING may carry up
+        // to 125 bytes and a PONG may carry no more, so an oversized PING cannot be echoed
+        // faithfully; the spec's answer is to fail the connection. Truncating is the lesser
+        // evil here: the echo still proves liveness, whereas failing would drop a working
+        // carrier over a frame the peer should not have sent.
+        const echo = frame.payload.length > CONTROL_MAX_PAYLOAD
+          ? frame.payload.subarray(0, CONTROL_MAX_PAYLOAD)
+          : frame.payload
+        try { this.stream.write(encodeFrame(OPCODE.PONG, echo)) } catch { /* closing */ }
+      } else if (frame.opcode === OPCODE.CLOSE) {
         this.#finish('the carrier closed')
         return
       }
@@ -149,7 +145,7 @@ export class WebSocketClient {
 /**
  * Perform a WebSocket upgrade over one duplex and hand back the live client.
  * @param {import('node:stream').Duplex} stream
- * @param {{ host: string, path: string, origin: string, cookie?: string, headers?: Record<string, string>, connectTimeoutMs?: number }} options
+ * @param {{ host: string, path: string, origin: string, cookie?: string, headers?: Record<string, string>, connectTimeoutMs?: number, log?: (message: string) => void, maxFrameBytes?: number, maxBufferBytes?: number }} options
  * @param {{ onText: (text: string) => void, onClose: (reason?: string) => void }} handlers
  * @returns {Promise<WebSocketClient>}
  */
@@ -204,7 +200,11 @@ export function upgradeWebSocket(stream, options, handlers) {
       }
       settled = true
       cleanup()
-      const client = new WebSocketClient(stream, handlers)
+      const client = new WebSocketClient(stream, handlers, {
+        log: options.log,
+        maxFrameBytes: options.maxFrameBytes,
+        maxBufferBytes: options.maxBufferBytes,
+      })
       const rest = head.subarray(end + 4)
       resolve(client)
       if (rest.length > 0) stream.emit('data', rest)

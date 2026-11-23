@@ -92,7 +92,7 @@ export class AsyncQueue {
   constructor() {
     /** @type {unknown[]} */
     this.values = []
-    /** @type {Array<(result: IteratorResult<unknown>) => void>} */
+    /** @type {Array<{ resolve: (result: IteratorResult<unknown>) => void, reject: (error: unknown) => void }>} */
     this.waiters = []
     this.closed = false
     /** @type {unknown} */
@@ -103,7 +103,7 @@ export class AsyncQueue {
     if (this.closed) return
     const waiter = this.waiters.shift()
     if (waiter !== undefined) {
-      waiter({ done: false, value })
+      waiter.resolve({ done: false, value })
       return
     }
     this.values.push(value)
@@ -112,11 +112,35 @@ export class AsyncQueue {
   end() {
     if (this.closed) return
     this.closed = true
-    for (const waiter of this.waiters.splice(0)) waiter({ done: true, value: undefined })
+    // Settling happens on the next microtask, not inline, and that delay is the fix.
+    //
+    // The callers of this class reported the end of a stream and the reason for it as two
+    // separate calls in the same tick (`onEnd()` then `onEnd(error)`). Resolving the
+    // pending waiter inline settled that race before the reason was known: the consumer
+    // saw `done: true`, its `for await` stopped, and the error — recorded a moment later —
+    // had no one left to reach. Deferring the settle lets a failure reported in the same
+    // tick turn the waiter into a rejection instead, which is the only way a pending read
+    // can hear it.
+    const waiters = this.waiters.splice(0)
+    if (waiters.length === 0) return
+    queueMicrotask(() => {
+      for (const waiter of waiters) {
+        if (this.error === undefined) waiter.resolve({ done: true, value: undefined })
+        else waiter.reject(this.error)
+      }
+    })
   }
 
   fail(error) {
-    if (this.closed) return
+    if (this.closed) {
+      // The stream was already closed when the real reason arrived. That is the shape of
+      // the worst bug in this file's callers: the end path runs first and the failure is
+      // reported second, so the queue had already been told "clean end" and the failure was
+      // discarded on the floor. Keep the first error — `next()` drains whatever is buffered
+      // and then rejects with it, which is strictly more informative than an EOF.
+      if (this.error === undefined) this.error = error
+      return
+    }
     this.error = error
     this.end()
   }
@@ -129,7 +153,13 @@ export class AsyncQueue {
         ? Promise.resolve({ done: true, value: undefined })
         : Promise.reject(this.error)
     }
-    return new Promise(resolve => this.waiters.push(resolve))
+    const pending = new Promise((resolve, reject) => this.waiters.push({ resolve, reject }))
+    // A consumer can abandon a pending read (an iterator nobody advances again). Rejecting
+    // that waiter with the stream's failure is the whole point of this class, and a
+    // rejection nobody handles would terminate the Host — so the failure is claimed here
+    // too. The consumer that *is* waiting still receives it.
+    pending.catch(() => {})
+    return pending
   }
 }
 
