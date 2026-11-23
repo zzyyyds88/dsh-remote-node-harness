@@ -57,6 +57,10 @@ export class SecretStore {
   /**
    * Replace one node's secret. An empty value removes it, which is how "switch
    * from a password to a key" clears the field it no longer needs.
+   *
+   * An `agent` secret is the exception: it has no value to store, and the record itself is
+   * the fact that says "authenticate through this machine's SSH agent" rather than "no
+   * credential has been entered yet". It is therefore always written, never deleted.
    * @param {string} id
    * @param {{ kind: 'password' | 'key' | 'agent', password?: string, privateKey?: string, passphrase?: string }} secret
    */
@@ -74,7 +78,16 @@ export class SecretStore {
         ? { passphrase: secret.passphrase }
         : {}),
     }
-    const hasValue = Object.keys(payload).length > 2
+    // **What counts as "has a value" is explicit, not a key count.** Counting keys made
+    // `{ kind: 'agent' }` look empty (only `version` + `kind`), so writing an agent record
+    // deleted it — and then `authFromSecret()` returned `undefined`, `credentialsReady()` was
+    // permanently false, and every agent node failed with `credential-missing` even though
+    // `rnh-control.js` had just promised it would use the SSH agent. An agent record is a
+    // complete secret on its own: the kind *is* the credential.
+    const hasValue = secret.kind === 'agent'
+      || payload.password !== undefined
+      || payload.privateKey !== undefined
+      || payload.passphrase !== undefined
     if (!hasValue) {
       await this.credentials.deleteRecord(recordKeyFor(id))
       return

@@ -16,6 +16,7 @@ import { GATE, decideGate } from '../core/version.js'
 import { SshConnection } from '../ssh/connection.js'
 import { RemoteHost, remoteLayout, MINIMUM_NODE_MAJOR } from '../remote/daemon.js'
 import { BRAIN_FILES, BRAIN_PACKAGE } from './brain-bundle.generated.js'
+import { NODE_BASE_BUNDLES } from '../core/plugin-sync.js'
 import { NodeLog } from './node-log.js'
 import { Provisioner } from './provision.js'
 import { RemoteGateway } from './remote-gateway.js'
@@ -26,8 +27,12 @@ import { RemoteGateway } from './remote-gateway.js'
  * `dsh-base` is the shared core; the brain bundle is that core plus a Host and the
  * Remote API, with the browser surface removed. Upstream's `dsh-web-app` is
  * deliberately absent: a node serves no window, so it never even loads that layer.
+ *
+ * The list itself lives in `core/plugin-sync.js` because `sync-switches.js` filters a person's
+ * switches against the same list, and two independent literals had already drifted apart
+ * once. Re-exported here under the name the connect path has always used.
  */
-export const BRAIN_BUNDLES = Object.freeze(['@deepseek-ai/dsh-base', BRAIN_PACKAGE])
+export const BRAIN_BUNDLES = NODE_BASE_BUNDLES
 
 /**
  * How long to wait before each reconnect attempt after a drop, in order.
@@ -41,6 +46,28 @@ const RECOVERY_LADDER_MS = Object.freeze([2_000, 4_000, 8_000])
 
 /** The interval between reconnect attempts once the quick ladder is exhausted. */
 const RECOVERY_INTERVAL_MS = 120_000
+
+/**
+ * How long rung `attempt` of the reconnect ladder waits, in milliseconds.
+ *
+ * Exported as a pure function because the ladder itself is private: without this the only
+ * way to observe a delay was to drive a whole recovery through real timers and a fake
+ * node. `attempt` is **the rung the next attempt will use** (0-based), which is exactly the
+ * meaning `NodeRuntime.recoveryAttempts` carries — see `#scheduleRecovery`.
+ *
+ * Negative or fractional values are not meaningful. A rung past the end of the quick ladder
+ * falls back to the steady interval (so a long outage keeps retrying every two minutes
+ * rather than wrapping back to two seconds); a malformed one falls back to the first delay so
+ * `setTimeout` never receives `NaN`.
+ *
+ * @param {number} attempt
+ * @returns {number}
+ */
+export function recoveryDelayMs(attempt) {
+  if (!Number.isInteger(attempt) || attempt < 0) return RECOVERY_LADDER_MS[0]
+  return attempt < RECOVERY_LADDER_MS.length ? RECOVERY_LADDER_MS[attempt] : RECOVERY_INTERVAL_MS
+}
+
 /** Connection lifecycle of one node, as a settings surface shows it. */
 export const NODE_STATE = Object.freeze({
   IDLE: 'idle',
@@ -305,6 +332,15 @@ export class Rnh {
     this.runtimes = new Map()
     /** @type {Set<(nodes: NodeRuntime[]) => void>} */
     this.listeners = new Set()
+    /**
+     * Set by `dispose()`, and never cleared.
+     *
+     * The reconnect ladder is a `setTimeout` chain that outlives the plugin object unless it
+     * is cancelled: unloading the plugin used to leave a timer that fired into a disposed
+     * `Rnh`, opened an SSH connection nobody owned, and kept the process awake. Every entry
+     * point that could revive a node (`connect`, `#scheduleRecovery`) checks this latch.
+     */
+    this.disposed = false
   }
 
   /** Every runtime, creating one per stored record. */
@@ -343,15 +379,26 @@ export class Rnh {
     const record = this.registry.put(input)
     const runtime = this.#runtimeOf(record)
     runtime.record = record
-    if (typeof input.password === 'string' || typeof input.privateKey === 'string'
-      || typeof input.passphrase === 'string') {
+    // **An `agent` node needs a record too.** The kind alone is the whole credential, so
+    // `secrets.write({ kind: 'agent' })` is what makes "this node authenticates through the
+    // SSH agent" distinguishable from "nobody has entered a credential yet". Skipping the
+    // write here left `SecretStore.read()` empty, `credentialsReady()` false forever, and
+    // `connect()` threw `credential-missing` — while `rnh-control.js` told the user the node
+    // would use the agent. The two cases (`kind === 'agent'` with no value fields, and a
+    // password/key node whose value fields are all absent) are otherwise indistinguishable.
+    const carriesValue = typeof input.password === 'string' || typeof input.privateKey === 'string'
+      || typeof input.passphrase === 'string'
+    if (carriesValue || record.auth.kind === 'agent') {
       await this.secrets.write(record.id, {
         kind: record.auth.kind,
         ...(typeof input.password === 'string' ? { password: input.password } : {}),
         ...(typeof input.privateKey === 'string' ? { privateKey: input.privateKey } : {}),
         ...(typeof input.passphrase === 'string' ? { passphrase: input.passphrase } : {}),
       })
-      runtime.connection.invalidate()
+      // Only a **new value** changes the handshake. An agent record is the same record on every
+      // `put()` (a rename, "forget host key"), so invalidating for it would drop a healthy
+      // connection and start the ladder on nothing but a label edit.
+      if (carriesValue) runtime.connection.invalidate()
     }
     await this.#adoptSecret(runtime)
     this.#publish()
@@ -385,6 +432,9 @@ export class Rnh {
    * @param {{ force?: boolean, recovering?: boolean }} [options]
    */
   async connect(runtime, options = {}) {
+    // Unloading the plugin must not be undone by a queued caller (the settings page polls, the
+    // ladder fires): a disposed `Rnh` owns no connection and has no registry to write to.
+    if (this.disposed) return runtime.describe()
     return await this.serial(runtime, async () => {
       if (runtime.state === NODE_STATE.CONNECTED && runtime.serving !== undefined && options.force !== true) {
         return runtime.describe()
@@ -440,7 +490,14 @@ export class Rnh {
         })
         runtime.gate = gate
         if (gate.action === GATE.AHEAD || gate.action === GATE.UNKNOWN) {
-          throw new Error(gate.message)
+          // **Tag it, don't just throw the sentence.** `classifyFailure()` prefers an explicit
+          // `code`, then the SSH category, then the phase — and a plain `Error` here fell
+          // through to the phase (`install`), so a node that is *ahead* rendered as
+          // `runtime-install` with a Retry button: the one case where retrying is exactly
+          // wrong. Both codes exist in `ERROR_CODES` (`node-ahead` → `upgrade-desktop`,
+          // retryable false), so the card can name the action instead of guessing.
+          const code = gate.action === GATE.AHEAD ? 'node-ahead' : 'node-unknown-version'
+          throw Object.assign(new Error(gate.message), { code })
         }
         // `install` is the only action that touches the runtime. `refresh` means the
         // runtime is right but this plugin's own brain bundle is behind, and that is
@@ -472,7 +529,11 @@ export class Rnh {
         runtime.phaseStartedAt = Date.now()
         this.#publish()
         const wanted = [...this.nodeBundles()]
-        const extras = wanted.filter(name => name !== BRAIN_PACKAGE && name !== '@deepseek-ai/dsh-base')
+        // A switch is a bundle *beyond* the fixed composition. Asking the fixed list beats
+        // naming its entries again: this filter used to spell `@deepseek-ai/dsh-base` and the
+        // brain package itself, so a change to the composition left a stale exception behind
+        // that would quietly install `dsh-base` as if it were a plugin.
+        const extras = wanted.filter(name => !NODE_BASE_BUNDLES.includes(name))
         // A bundle only composes when the Loader can resolve it from the profile, so the
         // switched-on plugins have to exist on the node before the list names them. Doing
         // it here (not in the settings handler) keeps "the node is connected" and "the node
@@ -545,10 +606,40 @@ export class Rnh {
         runtime.failure = undefined
         runtime.droppedAt = undefined
         runtime.registryError = undefined
+        // **A successful connect ends the ladder, wherever it was started from.** Clearing the
+        // rung is one of the two ways it may go back to 0 (the other is `disconnect()`); without
+        // it a node that came back on rung 3 would keep using the 120 s interval forever.
+        runtime.recoveryAttempts = 0
         this.registry.recordOutcome(runtime.record.id, { ok: true, version: runtime.facts.nodeVersion })
         this.#publish()
         return runtime.describe()
       } catch (error) {
+        if (options.recovering === true) {
+          // **A failed reconnect rung is not a failure the person should see.** The ladder is a
+          // quiet state by design: `idle` + `droppedAt`, rendered as "已断线，正在重连". Reporting
+          // it as `failed` made the card go red and show the last attempt's sentence after the
+          // very first miss — the opposite of what the quiet ladder is for, and misleading
+          // (`failed` promises the app stopped trying, while it is about to try again). The
+          // reason is still worth keeping, but only in this node's own log: it names why the
+          // machine did not answer without pretending the node is misconfigured.
+          runtime.state = NODE_STATE.IDLE
+          runtime.error = undefined
+          runtime.failure = undefined
+          runtime.serving = undefined
+          runtime.transfer = undefined
+          // The attempt may have opened a carrier before it failed; nothing reads it after this.
+          runtime.gateway.reset()
+          // The phase belonged to this one attempt, not to the node: a stale "install" row on a
+          // card that is merely waiting would read as if it were stuck there.
+          runtime.phase = undefined
+          runtime.phaseStartedAt = undefined
+          // `droppedAt` is deliberately kept: it is what makes the card say "reconnecting since
+          // …" instead of looking like a node nobody asked to connect. The reason itself is
+          // logged by `#scheduleRecovery`, which already knows this was a ladder attempt — no
+          // second line here, or every miss would appear twice in the node's log.
+          this.#publish()
+          throw error
+        }
         runtime.state = NODE_STATE.FAILED
         // The phase is **kept**. It used to be cleared here, which threw away the single most
         // useful fact about the failure: which step it happened at. Measured: a node that
@@ -577,6 +668,11 @@ export class Rnh {
       // A deliberate disconnect must not be reported as a drop, and must not start the
       // reconnect ladder: cancel it before the socket goes away.
       this.#cancelRecovery(runtime)
+      // **The rung is reset here, explicitly.** It used to happen inside `#cancelRecovery`,
+      // which is also called when the ladder merely rearms itself — that is what zeroed the
+      // ladder (D1). "The person said stop" is one of only two things allowed to forget the
+      // rung; the other is a successful connect.
+      runtime.recoveryAttempts = 0
       runtime.gateway.reset()
       runtime.serving = undefined
       runtime.state = NODE_STATE.IDLE
@@ -627,26 +723,32 @@ export class Rnh {
   }
 
   /**
-   * One attempt at bringing a dropped node back, and the next delay when it fails.
+   * Rearm the ladder for one node at the rung `runtime.recoveryAttempts` names.
    *
-   * The first three delays are short because the overwhelmingly common drop is a machine that
-   * restarted; after that the interval settles at two minutes, because continuing to hammer a
-   * machine that has been gone for a minute is pointless and every attempt costs a handshake.
+   * **Cancelling the previous timer must not touch the rung.** `#cancelRecovery` used to reset
+   * `recoveryAttempts` to 0, and this method calls it first — so line 2 read 0 on every rerun and
+   * every delay was `RECOVERY_LADDER_MS[0]`: 2 s, forever, against a machine that is simply
+   * switched off. Measured offline before the fix: six consecutive schedules gave
+   * `2000, 2000, 2000, 2000, 2000, 2000` instead of `2000, 4000, 8000, 120000, 120000, 120000`.
+   * The rung is reset only by a successful connect or by `disconnect()` — both are explicit
+   * statements that the ladder's history is over.
    */
   #scheduleRecovery(runtime) {
+    if (this.disposed) return
     this.#cancelRecovery(runtime)
     const attempt = runtime.recoveryAttempts ?? 0
-    const delay = attempt < RECOVERY_LADDER_MS.length
-      ? RECOVERY_LADDER_MS[attempt]
-      : RECOVERY_INTERVAL_MS
+    const delay = recoveryDelayMs(attempt)
     const timer = setTimeout(() => {
       runtime.recoveryTimer = undefined
+      if (this.disposed) return
       if (runtime.state === NODE_STATE.CONNECTED) return
       if (!runtime.record.enabled) return
       runtime.recoveryAttempts = (runtime.recoveryAttempts ?? 0) + 1
       void this.connect(runtime, { recovering: true })
         .then(() => {
           runtime.recoveries += 1
+          // `connect()` already resets the rung on success; kept here as well so the two
+          // success paths (manual and ladder) cannot drift apart.
           runtime.recoveryAttempts = 0
           runtime.droppedAt = undefined
           this.log(`[${runtime.record.name}] reconnected after a drop`)
@@ -655,6 +757,7 @@ export class Rnh {
         .catch(error => {
           // Silent by design: a machine that is simply off is not an error the person needs to
           // read every two minutes. The card already says "已断线"; the log keeps the reason.
+          if (this.disposed) return
           this.log(
             `[${runtime.record.name}] reconnect attempt ${String(runtime.recoveryAttempts)} failed: `
             + `${error instanceof Error ? error.message : String(error)}`,
@@ -667,13 +770,19 @@ export class Rnh {
     runtime.recoveryTimer = timer
   }
 
-  /** Stop the reconnect ladder for one node. */
+  /**
+   * Stop the reconnect ladder for one node: clear the timer, nothing else.
+   *
+   * Deliberately **does not reset `runtime.recoveryAttempts`**. The rung is the ladder's memory,
+   * and "rearm the timer" is not "the ladder is over" — see `#scheduleRecovery`. Reset belongs to
+   * a successful connect (`connect()`) and to a deliberate `disconnect()`, which does it
+   * explicitly.
+   */
   #cancelRecovery(runtime) {
     if (runtime.recoveryTimer !== undefined) {
       clearTimeout(runtime.recoveryTimer)
       runtime.recoveryTimer = undefined
     }
-    runtime.recoveryAttempts = 0
   }
 
   /**
@@ -732,7 +841,9 @@ export class Rnh {
           // Plugin switches first: the bundle list is written from what is installed, so a
           // package has to be on the node before the list can name it.
           const wanted = [...this.nodeBundles()]
-          const extras = wanted.filter(name => name !== BRAIN_PACKAGE && name !== '@deepseek-ai/dsh-base')
+          // Same exception as the connect path, and now the same expression: the fixed
+          // composition is asked, not re-spelled.
+          const extras = wanted.filter(name => !NODE_BASE_BUNDLES.includes(name))
           let composed = wanted
           if (extras.length > 0) {
             const install = await this.#installPlugins(runtime, extras)
@@ -856,9 +967,19 @@ export class Rnh {
     })
   }
 
-  /** Release every connection and gateway. */
+  /**
+   * Release every connection and gateway, and stop every reconnect ladder.
+   *
+   * **The timers have to be cancelled here, not just forgotten.** `#scheduleRecovery` arms a
+   * `setTimeout` per dropped node; nothing else clears it when the plugin is unloaded, so a
+   * timer fired into a disposed `Rnh`, opened a fresh SSH connection nobody was going to close,
+   * and kept the process alive. `disposed` is set first and checked by `connect()` and
+   * `#scheduleRecovery`, so a timer that has already fired cannot rearm the chain either.
+   */
   dispose() {
+    this.disposed = true
     for (const runtime of this.runtimes.values()) {
+      try { this.#cancelRecovery(runtime) } catch { /* already gone */ }
       try { runtime.gateway.reset() } catch { /* already gone */ }
       try { runtime.connection.dispose() } catch { /* already gone */ }
     }
