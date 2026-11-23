@@ -70,8 +70,9 @@
  * Every capability here is `required` or `never`, and that is a finding rather than an
  * omission: `office` became unconditional the day the artefact started shipping its engine
  * (see the record), and nothing else is conditional yet. `optional` is implemented and is
- * exercised by `check-capabilities.mjs` with synthetic records, so the branch stays real
- * instead of aspirational.
+ * exercised by `test/capabilities-unit.mjs` with a synthetic record, so the branch stays real
+ * instead of aspirational — a branch no shipped record reaches would otherwise be code claiming
+ * to be a guarantee.
  *
  * @module @local/rnh-brain/capabilities
  */

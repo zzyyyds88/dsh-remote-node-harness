@@ -324,6 +324,31 @@ const SUITES = [
     proves: 'every place that declares what a node can do agrees with capabilities.mjs: rows, presets, kept and dropped packages, the provisioning whitelist, the bundle names',
   },
   {
+    name: 'capabilities-logic',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'capabilities-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 60_000,
+    // `capabilities` compares the registry against the files on disk, so a broken branch inside
+    // the registry passes it: both sides of that comparison come from the same module. This one
+    // tests the registry itself — the three verdict branches, the `*` pattern rules, the keep
+    // set, the credential requirement — including the `optional` path, which no shipped
+    // capability exercises and which would otherwise be untested code claiming to be a guarantee.
+    proves: 'the capability registry\'s own logic: every record well formed, each verdict branch real, patterns and keep sets derived correctly, credential requirements reported against what was pushed',
+  },
+  {
+    name: 'gate-mutation',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'gate-mutation-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 180_000,
+    // The gate's own test. `capabilities` passing means nothing unless a single-site drift
+    // actually turns it red, so this copies the tree to a temp directory, introduces five
+    // realistic drifts one at a time and asserts a non-zero exit naming each one. It mutates a
+    // copy, never the working tree: a test that can corrupt the source it guards is not a test.
+    proves: 'the reconciliation gate really fails: five single-site drifts — a dropped row, an invented preset row, a drifted bundle name, an underivable credential, an orphan drop rule — each make it exit non-zero and say which',
+  },
+  {
     name: 'packet',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'packet-unit.mjs'],
