@@ -39,17 +39,47 @@ const RATE_WINDOW = 5
 const quote = text => `'${text.replaceAll("'", `'\\''`)}'`
 
 /**
+ * Turn a layout path into an **absolute** path on the node.
+ *
+ * The layout is written the way a person types it (`~/.dsh-remote-node-harness/runtime`),
+ * and `~` is expanded by a shell — but only when it is unquoted. Every path this module
+ * sends is single-quoted (see {@link quote}), which is what keeps a quote in a path from
+ * becoming script syntax, and the two requirements cannot both hold for the same string:
+ * `'~/…/runtime-x.tar.gz'` is a literal tilde, so `stat` answered "no such file" forever and
+ * the progress bar read `0 B` for a download that was running perfectly.
+ *
+ * So the expansion happens **here**, in JS, once the node's home is known from the probe.
+ * `home` must be an absolute path as the node reports it (`/root`, `/home/deploy`); when it
+ * is missing the answer is `undefined` rather than a path with a `~` in it, because a wrong
+ * path is worse than no progress: the caller then reports bytes without a percentage instead
+ * of reporting zero.
+ *
+ * @param {string} path - a layout path, possibly `~`-rooted.
+ * @param {string | undefined} home - the node's home, as `probe()` reported it.
+ * @returns {string | undefined}
+ */
+export function resolveRemotePath(path, home) {
+  if (!path.startsWith('~/')) return path
+  if (typeof home !== 'string' || !home.startsWith('/')) return undefined
+  return `${home.replace(/\/+$/u, '')}/${path.slice(2)}`
+}
+
+/**
  * The archive path the install script writes.
  *
  * Derived from the layout the same way `installScript` derives it (`$(dirname "$runtime")`),
- * so the watcher cannot look at a path the download never touches.
+ * so the watcher cannot look at a path the download never touches — and then made absolute
+ * with the node's own `$HOME`, because the install script's `$base` is already absolute and
+ * a `~` in the quoted `stat` path matches nothing. See {@link resolveRemotePath}.
  *
  * @param {{ runtime: string }} layout
  * @param {string} version
- * @returns {string}
+ * @param {string | undefined} home - the node's home, from `probe()`.
+ * @returns {string | undefined} `undefined` when the layout is `~`-rooted and the home is unknown.
  */
-export function archiveFor(layout, version) {
-  const runtime = layout.runtime
+export function archiveFor(layout, version, home) {
+  const runtime = resolveRemotePath(layout.runtime, home)
+  if (runtime === undefined) return undefined
   const at = runtime.lastIndexOf('/')
   const base = at < 0 ? runtime : runtime.slice(0, at)
   return `${base}/runtime-${version}.tar.gz`
@@ -69,12 +99,23 @@ export function archiveFor(layout, version) {
 export async function totalBytes(connection, urls, options = {}) {
   const url = urls[0]
   if (url === undefined) return undefined
+  // `-L` is not optional. The artefact source is CNB, and an anonymous `GET` of a release
+  // asset answers **302** to a signed URL: `curl -sI` without `-L` stops at the redirect and
+  // prints no `content-length`, so every install from that source showed bytes and no
+  // percentage — the one case the total exists for. With `-L` the header block of the final
+  // response is what gets read.
+  //
+  // `--max-time 15` still bounds it: a redirect chain that does not finish gives no total,
+  // and **no total is a supported answer** (see the module comment) — the transfer then
+  // reports bytes with no ETA rather than a made-up denominator. This flag does not change
+  // that tradeoff; it only removes the false negative.
+  //
   // `tr -d '\r'` because a HEAD reply is CRLF-terminated even over SSH, and `awk` because
   // `content-length` may sit at any position in the header block.
   const script = `
 set -u
 if command -v curl >/dev/null 2>&1; then
-  curl -sI --connect-timeout 8 --max-time 15 ${quote(url)} 2>/dev/null \\
+  curl -sIL --connect-timeout 8 --max-time 15 ${quote(url)} 2>/dev/null \\
     | tr -d '\\r' | awk 'tolower($1) == "content-length:" { print $2; exit }'
 fi
 `.trim()
@@ -157,7 +198,9 @@ export function summarise(samples, total) {
  *
  * @param {import('../ssh/connection.js').SshConnection} connection
  * @param {object} options
- * @param {string} options.archive
+ * @param {string | undefined} options.archive - the absolute archive path; `undefined` when the
+ *   node's home could not be resolved (see {@link resolveRemotePath}), in which case the watch
+ *   is a no-op rather than a `stat` on a path with a `~` in it.
  * @param {number} [options.total]
  * @param {(progress: { bytes: number, total?: number, bytesPerSecond?: number, etaMs?: number }) => void} options.onUpdate
  * @param {number} [options.intervalMs]
@@ -166,6 +209,7 @@ export function summarise(samples, total) {
  */
 export function watchTransfer(connection, options) {
   const { archive, onUpdate } = options
+  if (archive === undefined) return () => {}
   const total = options.total
   const intervalMs = options.intervalMs ?? TRANSFER_INTERVAL_MS
   const now = options.now ?? (() => Date.now())

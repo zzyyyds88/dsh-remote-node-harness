@@ -51,7 +51,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, st
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyPatches, checkForkBase } from './node-patches.mjs'
-import { ARTEFACT_RESIDUE, ARTEFACT_RESIDUE_KEEP, dropPackages, foreignPlatformResidue, stripResidue } from './trim-fork-runtime.mjs'
+import { ARTEFACT_RESIDUE, ARTEFACT_RESIDUE_KEEP, RETAINED, dropPackages, foreignPlatformResidue, stripResidue, unresolvedInTree } from './trim-fork-runtime.mjs'
 import { isArtefactExecutable } from '../src/remote/artefact.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -429,6 +429,29 @@ process.stdout.write(
   `trimmed ${mib(before.bytes)} MiB → ${mib(after.bytes)} MiB unpacked`
   + ` (${String(dropped.dropped.length)} packages, ${mib(dropped.bytes + stripped.bytes)} MiB removed)\n`,
 )
+
+// **The trim rules cannot see what they broke.** Drop rules are matched by name and residue
+// rules by path; neither knows whether the composition the node actually loads still resolves
+// the packages it names. The defect that made this check necessary shipped a tree where
+// `dsh-office-kit` was kept and `@deepseek-ai/libreoffice-kit` was dropped: the gate said
+// "in step", and every Office tool call threw `LibreOffice Kit is not installed.` on the node.
+//
+// The probe asks the **staged tree** — not this checkout, and not the build machine's own
+// `node_modules` — whether every package `RETAINED` names is still there after the trim. That
+// is the one question the rules above cannot answer about their own output, and it runs before
+// packing, so a broken tree is a build failure instead of a published archive.
+{
+  const kept = [...new Set(RETAINED)]
+  const unresolved = unresolvedInTree(staging, kept).missing
+  if (unresolved.length > 0) {
+    throw new Error(
+      `the staged tree cannot resolve ${String(unresolved.length)} package(s) RETAINED keeps, `
+      + 'so a node built from it would fail at the first tool call that needs them:\n'
+      + unresolved.map(name => `  ${name}`).join('\n'),
+    )
+  }
+  process.stdout.write(`kept composition resolves: ${String(kept.length)} package(s) present in the staged tree\n`)
+}
 
 const built = archive(staging, version)
 

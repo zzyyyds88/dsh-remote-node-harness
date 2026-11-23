@@ -28,11 +28,14 @@ import {
   BUILD_STAMP,
   FETCH_CEILING_SECONDS,
   ROLLBACK_VERDICTS,
+  SCRIPT_CODES,
   artefactUrls,
   inspectRuntime,
   installScript,
+  parseScriptResult,
   platformTag,
   rollbackScript,
+  shellPath,
 } from './artefact.js'
 import { archiveFor, totalBytes, watchTransfer } from './transfer-progress.js'
 
@@ -100,7 +103,24 @@ export function remoteLayout(root = DEFAULT_REMOTE_ROOT) {
   const profile = profileNameFor(base)
   return Object.freeze({
     root: base,
+    /**
+     * The live runtime, and it is a **symlink** to `runtime.<n>`.
+     *
+     * Kept under the same name because every read of it — the launch line, the CLI path,
+     * `inspectRuntime`, the build stamp — must go through the symlink: resolving a
+     * generation at read time would let two readers disagree about which tree is live.
+     * `node <runtime>/node_modules/…/bin.js` works unchanged through a symlink, and
+     * `cd <runtime>` follows it, so nothing that reads this path needed to change.
+     *
+     * The install script owns the generations (`runtime.<n>`, one previous kept). See
+     * `artefact.js` `installScript`.
+     */
     runtime: `${base}/runtime`,
+    /** The live symlink and the generation directories, spelled separately where a
+     * caller has to tell them apart (a liveness probe must not follow into a broken
+     * target and call it alive). */
+    runtimeLink: `${base}/runtime`,
+    generationPrefix: `${base}/runtime.`,
     run: `${base}/run`,
     log: `${base}/run/host.log`,
     status: `${base}/run/status.json`,
@@ -318,14 +338,118 @@ export class RemoteHost {
     }
   }
 
-  /** Whether one recorded pid is still alive. */
-  async isAlive(pid) {
+  /**
+   * Whether one recorded process command line was launched for this node's profile.
+   *
+   * The comparison is anchored on both sides: `--profile <name>` must be followed by a space or
+   * the end of the command line. A bare `includes('--profile rnh')` also accepts
+   * `--profile rnh-dsh-fleet`, which is a **different node on the same machine** — the exact
+   * collision this per-root profile naming exists to prevent.
+   *
+   * @param {string} cmdline - the process's command line, `/proc` NUL bytes already turned to
+   *   spaces (or `ps -o command=`).
+   * @param {string} profile - the profile name this node launches.
+   * @returns {boolean}
+   */
+  #hasProfile(cmdline, profile) {
+    if (cmdline === '' || profile === '') return false
+    return cmdline.includes(`--profile ${profile} `) || cmdline.endsWith(`--profile ${profile}`)
+  }
+
+  /**
+   * What a pid *is*, not merely that it exists.
+   *
+   * `kill -0 <pid>` answers one question — "does this pid exist" — and that is not the
+   * question a resident host needs answered. A pid is reused after a reboot (PID 1…32768
+   * wraps), so a `status.json` read back from a machine that rebooted pointed at whatever
+   * now holds that number, and the old code called that host "alive". Two facts are needed
+   * to tell a live host from a coincidence:
+   *
+   * - the command line, which must carry `--profile <our profile>` (the profile name is
+   *   derived from the node's `remoteRoot`, so it is unique per node on that machine);
+   * - the process **start time**, which must equal the one recorded beside the pid. Two
+   *   different processes never share a pid *and* a start time, so the pair identifies the
+   *   launch rather than the number.
+   *
+   * **`/proc` is not portable and the fallback is deliberate.** Linux gives both facts from
+   * `/proc/<pid>/cmdline` and `/proc/<pid>/stat`; macOS has no `/proc`, so the command line
+   * comes from `ps -p <pid> -o command=` and the start time is unavailable. On that platform
+   * the judgement degrades to "the command line names our profile", which is the strongest
+   * fact available there — weaker than the pair, and named as such here so it is not mistaken
+   * for equal. The probe reports which one answered (`proc=yes|no`).
+   *
+   * @param {number} pid
+   * @returns {Promise<{alive: boolean, cmdline: string, starttime: string | undefined, proc: boolean}>}
+   */
+  async #processProbe(pid) {
+    const script = `
+set -u
+pid=${String(pid)}
+alive=no
+if kill -0 "$pid" 2>/dev/null; then alive=yes; fi
+if [ "$alive" = no ]; then
+  printf 'alive=no\\nproc=unknown\\ncmdline=\\nstarttime=\\n'
+  exit 0
+fi
+if [ -r "/proc/$pid/cmdline" ]; then
+  printf 'alive=yes\\nproc=yes\\n'
+  printf 'cmdline=%s\\n' "$(tr '\\0' ' ' < "/proc/$pid/cmdline")"
+  printf 'starttime=%s\\n' "$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')"
+else
+  # No procfs (darwin). The command line is still available; the start time is not.
+  printf 'alive=yes\\nproc=no\\n'
+  printf 'cmdline=%s\\n' "$(ps -p "$pid" -o command= 2>/dev/null | tr '\\n' ' ')"
+  printf 'starttime=\\n'
+fi
+`.trim()
+    const result = await this.connection.exec({ argv: ['sh', '-c', script], timeoutMs: 15_000, maxBytes: 8192 })
+    /** @type {Record<string, string>} */
+    const facts = {}
+    for (const line of result.stdout.split('\n')) {
+      const at = line.indexOf('=')
+      if (at <= 0) continue
+      facts[line.slice(0, at)] = line.slice(at + 1).trim()
+    }
+    return {
+      alive: facts.alive === 'yes',
+      cmdline: facts.cmdline ?? '',
+      starttime: facts.starttime === undefined || facts.starttime === '' ? undefined : facts.starttime,
+      proc: facts.proc === 'yes',
+    }
+  }
+
+  /**
+   * Whether one recorded pid is still the resident host this root started.
+   *
+   * The answer is "yes" only when all three hold: the pid exists, its command line names
+   * this node's profile, and — where the platform can tell — the start time recorded in
+   * `status.json` is the one the process has now. A pid that exists but fails either of the
+   * other two is **not** our host, and treating it as one is what made a rebooted machine
+   * look connected.
+   *
+   * A `status.json` written before start times were recorded has none; those records are
+   * accepted on the command line alone and upgraded in place the next time the host is
+   * adopted (see `ensureServing`). Refusing them instead would restart every node once for
+   * a cosmetic upgrade, and a restart of a serving host is a visible interruption.
+   *
+   * @param {number} pid
+   * @param {{ profile?: string, starttime?: string | number }} [expected] - what the record says.
+   * @returns {Promise<boolean>}
+   */
+  async isAlive(pid, expected = {}) {
     if (!Number.isInteger(pid) || pid <= 0) return false
-    const result = await this.connection.exec({
-      argv: ['sh', '-c', `kill -0 ${String(pid)} 2>/dev/null && echo alive || echo dead`],
-      timeoutMs: 15_000,
-    })
-    return result.stdout.includes('alive')
+    const probe = await this.#processProbe(pid)
+    if (!probe.alive) return false
+    const profile = expected.profile ?? this.layout.profileName
+    // The profile has to appear as `--profile <name>`, and the name has to end there: a bare
+    // substring match would also accept `--profile rnh-dsh-fleet`, which is a different node.
+    if (!this.#hasProfile(probe.cmdline, profile)) return false
+    if (probe.proc && expected.starttime !== undefined && probe.starttime !== undefined) {
+      return String(probe.starttime) === String(expected.starttime)
+    }
+    // Either the platform has no procfs or the record predates start times: the command
+    // line is all the evidence there is. Documented here rather than silently weakened.
+    return true
   }
 
   /**
@@ -435,7 +559,11 @@ export class RemoteHost {
     const stopWatch = options.onTransfer === undefined
       ? () => {}
       : watchTransfer(this.connection, {
-        archive: archiveFor(this.layout, this.version),
+        // The **absolute** path, resolved against the node's own `$HOME` from the probe.
+        // The install script's `$(dirname "$runtime")` is expanded by the shell after
+        // `$HOME` substitution, so it is absolute there; a `~` kept in a single-quoted
+        // `stat` path matches nothing and the bar would read `0 B` forever.
+        archive: archiveFor(this.layout, this.version, facts.home),
         total: await totalBytes(this.connection, urls),
         onUpdate: progress => options.onTransfer?.(progress),
       })
@@ -473,19 +601,29 @@ export class RemoteHost {
         marked === SSH_FAILURE.UNKNOWN ? SSH_FAILURE.NETWORK : marked,
       ))
     }
-    if (attempt.code === 0) {
-      return { version: attempt.stdout.trim().split('\n').at(-1) ?? this.version, via: 'artefact' }
+    // One parser for every exit path: the script prints one JSON object as the last line of
+    // stdout, so "did it install" is `parsed.ok`, not `code === 0`. The exit code is kept
+    // only for diagnostics — it used to carry the semantics (3 = unavailable, 4 = mismatch,
+    // …) and that is exactly what broke: a `set -e` abort, a killed `curl` or a full disk
+    // exited with a number no branch knew, and the sentinel matching below then decided
+    // "this is a download problem" or "this is an unpack problem" by searching stderr.
+    const parsed = parseScriptResult(attempt)
+    if (parsed.ok && parsed.code === SCRIPT_CODES.INSTALLED) {
+      return { version: parsed.version ?? this.version, via: 'artefact' }
     }
-    const detail = (attempt.stderr || attempt.stdout).trim()
-    if (!detail.includes('ARTEFACT_UNAVAILABLE')) {
-      // The download worked but the unpack or verify did not. Exit codes 4/5/6/7 all happen
-      // **before** the rename, so the live tree is intact and the rollback judgement keeps it;
-      // only a tree that cannot start is replaced by the previous release. The verdict is
+    const detail = parsed.detail !== undefined && parsed.detail !== ''
+      ? `${parsed.code}${parsed.stage === undefined ? '' : ` at ${parsed.stage}`}: ${parsed.detail}`
+      : `${parsed.code}${parsed.stage === undefined ? '' : ` at ${parsed.stage}`}`
+    if (parsed.code !== SCRIPT_CODES.ARTEFACT_UNAVAILABLE) {
+      // The download worked but the unpack or verify did not — or the script did not report
+      // at all (`UNKNOWN`, with the raw tail attached). Every failure the installer can name
+      // happens **before** the commit line, so the live generation is intact and the rollback
+      // judgement keeps it; only a live tree that cannot start is replaced. The verdict is
       // always acted on and always reported: a rollback that silently failed is the worst
       // outcome of the three, and it must not read like an ordinary install error.
       const rollback = await this.#rollbackAfterFailure(`installing the resident host failed: ${detail.slice(-600)}`)
       throw toSshError(new Error(
-        `installing the resident host failed: ${detail.slice(-600)}\n${rollback}`,
+        `installing the resident host failed: ${detail.slice(-600)}${parsed.tail === undefined ? '' : `\nscript output tail: ${parsed.tail}`}\n${rollback}`,
       ))
     }
     failures.push(
@@ -511,16 +649,18 @@ export class RemoteHost {
    * @returns {Promise<string>} one line describing what the rollback did.
    */
   async #rollbackAfterFailure(context) {
-    let verdict
+    let parsed
     try {
       const result = await this.connection.exec({
         argv: ['sh', '-c', rollbackScript(this.layout.runtime, this.layout.cli)],
         timeoutMs: 120_000,
       })
-      verdict = result.stdout.trim().split('\n').at(-1)?.trim() ?? ''
-      if (result.code !== 0 || verdict === '') {
-        const why = (result.stderr || result.stdout).trim().slice(-300) || `exit ${String(result.code)}`
-        this.log(`${context}; the rollback did not report a verdict (${why})`)
+      parsed = parseScriptResult(result)
+      if (!parsed.parsed) {
+        // The script ran but its last line was not JSON: a shell that died mid-`trap`, an
+        // exec that truncated stdout. `tail` is the last 600 bytes of raw output, which is
+        // the only evidence left — better in the error than swallowed.
+        this.log(`${context}; the rollback printed no result line (${parsed.tail ?? 'no output'})`)
         return 'rollback did not report a verdict — the node may be on a broken tree; connect again and read the resident host log'
       }
     } catch (error) {
@@ -528,21 +668,21 @@ export class RemoteHost {
       this.log(`${context}; the rollback itself failed: ${why}`)
       return `rollback could not run (${why}) — the node may be on a broken tree; connect again and read the resident host log`
     }
-    if (verdict === ROLLBACK_VERDICTS.KEPT_CURRENT) {
+    if (parsed.code === ROLLBACK_VERDICTS.KEPT_CURRENT) {
       // The good news case, and it is worth a log line: it says the failure cost nothing.
       this.log(`${context}; rollback=kept-current — the live runtime still starts and was left as it was`)
       return 'rollback: kept the runtime that was already installed (it still starts), so nothing was changed'
     }
-    if (verdict === ROLLBACK_VERDICTS.ROLLED_BACK) {
-      this.log(`${context}; rollback=rolled-back — the live runtime did not start, so the previous release was restored`)
-      return 'rollback: the live runtime could not start, so the previous release was restored'
+    if (parsed.code === ROLLBACK_VERDICTS.ROLLED_BACK) {
+      this.log(`${context}; rollback=rolled-back — the live runtime did not start, so the previous generation was restored`)
+      return 'rollback: the live runtime could not start, so the previous generation was restored'
     }
-    if (verdict === ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK) {
+    if (parsed.code === ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK) {
       this.log(`${context}; rollback=nothing-to-roll-back — no previous runtime to fall back to`)
       return 'rollback: there was no previous runtime to restore, and the live one did not start'
     }
-    this.log(`${context}; the rollback answered an unknown verdict ${JSON.stringify(verdict)}`)
-    return `rollback reported ${JSON.stringify(verdict)}, which this build does not understand — inspect the node`
+    this.log(`${context}; the rollback answered an unknown code ${JSON.stringify(parsed.code)}`)
+    return `rollback reported ${JSON.stringify(parsed.code)}, which this build does not understand — inspect the node`
   }
 
   /** Read the installed resident version, or `undefined` when absent. */
@@ -969,13 +1109,19 @@ echo written
    */
   async ensureServing(options = {}) {
     const existing = await this.status()
+    // `existing.profile === this.layout.profileName`, never the `NODE_PROFILE` constant:
+    // the profile name is *derived from the node's root*, so `~/.dsh-fleet` launches
+    // `--profile rnh-dsh-fleet`. Comparing against the constant made every non-default
+    // root fail this check forever and stop/start a perfectly healthy host on **every**
+    // connect (measured on a real node: `status.json` said `"profile":"rnh"` while the
+    // host ran `--profile rnh-dsh-fleet`).
     const launchedByThisShape = existing !== undefined
       && existing.profile === this.layout.profileName
       && existing.overlay !== true
       && existing.version === this.version
     if (existing !== undefined && !options.force && !options.bundleChanged
       && launchedByThisShape
-      && await this.isAlive(existing.pid)) {
+      && await this.isAlive(existing.pid, existing)) {
       this.serving = existing
       return existing
     }
@@ -1004,7 +1150,22 @@ cat ${this.layout.log}
       argv: ['sh', '-c', `cat ${this.layout.run}/pid 2>/dev/null || echo 0`],
       timeoutMs: 15_000,
     })
-    const pid = Number.parseInt(pidResult.stdout.trim(), 10) || 0
+    let pid = Number.parseInt(pidResult.stdout.trim(), 10) || 0
+    // What the recorded pid *is*, not only that it exists. Two facts are written down:
+    // the command line (checked against the profile) and the process start time (which is
+    // what makes the pid-plus-starttime pair identify this launch rather than merely this
+    // number). `$!` can be a `setsid` wrapper on a platform where setsid forks, so when the
+    // recorded pid does not carry our profile the real child is looked up by its command
+    // line—better one extra round trip than a status file that makes every later connect
+    // restart the host.
+    let probe = pid === 0 ? undefined : await this.#processProbe(pid)
+    if (probe === undefined || !this.#hasProfile(probe.cmdline, this.layout.profileName)) {
+      const found = await this.#findHostPid()
+      if (found !== 0) {
+        pid = found
+        probe = await this.#processProbe(pid)
+      }
+    }
     // The record says which launch shape produced this host, so a host started by an
     // older build (a `web` profile or a `--patch` overlay) is replaced once instead of
     // being trusted to hot-reload a file it never read.
@@ -1013,8 +1174,11 @@ cat ${this.layout.log}
       token: parsed.token,
       pid,
       version: this.version,
-      profile: NODE_PROFILE,
+      profile: this.layout.profileName,
       overlay: false,
+      // Absent on a platform without procfs; `isAlive` then falls back to the command line
+      // and says so in its own comment.
+      starttime: probe?.starttime,
     }
     await this.connection.exec({
       argv: ['sh', '-c', `printf '%s' '${JSON.stringify(serving).replaceAll("'", `'\\''`)}' > ${this.layout.status}`],
@@ -1025,17 +1189,80 @@ cat ${this.layout.log}
     return serving
   }
 
+  /**
+   * The pid of the resident host, found by its command line.
+   *
+   * Only used when `$!` did not point at the host itself. `ps -eo pid=,args=` is POSIX enough
+   * to exist on both Linux and Darwin, unlike procfs.
+   *
+   * The **judgement stays in JS** (`#hasProfile`, applied by the caller): a shell `case`
+   * pattern for "the profile name, exactly" is where this went wrong once — `--profile rnh`
+   * matched `--profile rnh-dsh-fleet`, which is a different node on the same machine, and the
+   * pattern also has to know that the CLI path comes *before* the profile in the launch line.
+   * The script therefore only lists candidates that mention both facts; the caller decides.
+   *
+   * `0` means "not found"; the caller keeps the pid it had rather than inventing one.
+   * @returns {Promise<number>}
+   */
+  async #findHostPid() {
+    // Two cheap prefilters in the shell — it names our CLI and it was started with some
+    // `--profile` — and the exact judgement in JS. The shell is not trusted with the
+    // comparison: a `case` glob for "this profile name, exactly" is what silently accepted
+    // `--profile rnh-dsh-fleet` for `--profile rnh` here once, and that is a different node.
+    const script = `
+set -u
+ps -eo pid=,args= 2>/dev/null | while read -r pid args; do
+  case "$args" in
+    *"@deepseek-ai/dsh/lib/bin.js"*) ;;
+    *) continue ;;
+  esac
+  case "$args" in
+    *"--profile "*) ;;
+    *) continue ;;
+  esac
+  printf '%s\\n' "$pid"
+done
+`.trim()
+    try {
+      const result = await this.connection.exec({ argv: ['sh', '-c', script], timeoutMs: 15_000, maxBytes: 4096 })
+      const candidates = result.stdout.split('\n').map(line => line.trim()).filter(line => /^\d+$/u.test(line))
+      for (const candidate of candidates) {
+        const pid = Number.parseInt(candidate, 10)
+        const probe = await this.#processProbe(pid)
+        if (this.#hasProfile(probe.cmdline, this.layout.profileName)) return pid
+      }
+      return 0
+    } catch {
+      return 0
+    }
+  }
+
   /** Stop the resident host if this plugin started one. */
   async stop() {
     const existing = await this.status()
-    // The fallback pattern is bracketed on purpose: `pkill -f` matches **any** command line
-    // containing the pattern, and the `sh -c` that runs this very command carries it in its own
-    // argv. Measured on the reference node — plain pattern → the shell killed itself and the
+    // The fallback pattern is derived from **this node's root**, not hard-coded: with
+    // `~/.dsh-fleet` written down, a non-default node's host could never be killed and
+    // its `status.json` was deleted anyway, which is worse than not trying.
+    //
+    // It is bracketed on purpose: `pkill -f` matches **any** command line containing the
+    // pattern, and the `sh -c` that runs this very command carries it in its own argv.
+    // Measured on the reference node — plain pattern → the shell killed itself and the
     // channel died with no exit status (`{"out":"","code":null}`), bracketed pattern → it
-    // survived and reported (`{"out":"SURVIVED","code":0}`). A `[.]` is one character in the
-    // regex, so it still matches `bin.js` in the resident host's own argv.
+    // survived and reported (`{"out":"SURVIVED","code":0}`). A `[.]` is one character in
+    // the regex, so it still matches `bin.js` in the resident host's own argv.
+    //
+    // `$HOME` is expanded by the shell here rather than by JS: the layout is written with
+    // `~` (it is what a person types), and a `~` inside the pkill pattern would be a
+    // literal tilde in a regex. Double quotes let `$HOME` expand while `[` and `]` stay
+    // part of the pattern.
+    const fallbackPattern = shellPath(this.layout.root)
     const script = existing === undefined
-      ? `pkill -f 'dsh-remote-node-harness/runtime/node_modules/@deepseek-ai/dsh/lib/bin[.]js' 2>/dev/null || true; rm -f ${this.layout.status}`
+      ? `
+set -u
+pattern="${fallbackPattern}/runtime/node_modules/@deepseek-ai/dsh/lib/bin[.]js"
+pkill -f "$pattern" 2>/dev/null || true
+rm -f ${this.layout.status}
+`.trim()
       : `
 kill ${String(existing.pid)} 2>/dev/null || true
 i=0
@@ -1056,7 +1283,7 @@ rm -f ${this.layout.status}
     const facts = await this.probe()
     const installed = facts.nodeUsable ? await this.installedVersion() : undefined
     const status = await this.status()
-    const alive = status === undefined ? false : await this.isAlive(status.pid)
+    const alive = status === undefined ? false : await this.isAlive(status.pid, status)
     return {
       facts,
       installedVersion: installed,

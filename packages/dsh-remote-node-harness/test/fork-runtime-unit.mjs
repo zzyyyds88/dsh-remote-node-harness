@@ -475,6 +475,23 @@ const collidingRules = name => DROP_RULES.filter(([pattern]) => pattern.test(bar
   const build = readFileSync(new URL('../scripts/build-fork-runtime.mjs', import.meta.url), 'utf8')
   check(/stripResidue\(staging, \[\.\.\.ARTEFACT_RESIDUE, \.\.\.foreignPlatformResidue\(platform\)\], ARTEFACT_RESIDUE_KEEP\)/u.test(build),
     'the fork build strips with the same list, the same keep list, and the same platform rules')
+  // **The rules cannot check their own output.** `DROP_RULES` match a name and residue rules
+  // match a path; neither knows whether the composition the node loads still resolves what it
+  // names. That is how a build shipped `dsh-office-kit` without `@deepseek-ai/libreoffice-kit`:
+  // the gate said "in step" and every Office call threw on the node. So the build asks the
+  // staged tree, before packing, whether every `RETAINED` package survived the trim.
+  check(/import \{[^}]*\bunresolvedInTree\b[^}]*\} from '\.\/trim-fork-runtime\.mjs'/u.test(build),
+    'the fork build imports the tree-resolution probe, rather than trusting the drop rules')
+  check(/unresolvedInTree\(staging, kept\)/u.test(build) && /RETAINED/u.test(build),
+    'and probes the staged tree for every package RETAINED keeps — the tree being packed, not this checkout')
+  check(/unresolved\.length > 0/u.test(build) && /throw new Error/u.test(build),
+    'a kept package the trim removed fails the build instead of being published')
+  // Ordering is the point: a probe that runs after `archive()` would leave a broken archive in
+  // `--out` for the uploader (or a human) to ship anyway.
+  const probeAt = build.indexOf('unresolvedInTree(staging, kept)')
+  const packAt = build.indexOf('const built = archive(staging, version)')
+  check(probeAt > 0 && packAt > probeAt,
+    'and it runs before the archive is written', `${String(probeAt)} < ${String(packAt)}`)
   // Both packers must ask the shared predicate which files are programs. The rule used to be
   // `spawn-helper` + `*.node` in each script independently, and both were wrong the same way:
   // the ripgrep binary and the sandbox launcher were left 0666, so every `glob`/`grep` on a

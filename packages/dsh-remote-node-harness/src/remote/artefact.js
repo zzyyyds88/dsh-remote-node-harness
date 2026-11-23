@@ -31,9 +31,22 @@
  * - **The checksum is published beside it.** A truncated download over a flaky link
  *   would otherwise unpack into a half-installed runtime that fails at first use
  *   instead of at download time.
- * - **The unpack is atomic.** The new tree is extracted beside the live one and only
- *   then renamed into place, so a failure leaves the previous runtime intact rather
- *   than a mixture of two releases.
+ * - **The install is a transaction.** The new tree is unpacked, repaired, stamped and
+ *   probed inside its own generation directory (`runtime.<n+1>`), and the live runtime is
+ *   a **symlink** (`runtime -> runtime.<n>`) that one `ln -sfn` flips. That is the only
+ *   statement that changes what a node runs, so a script killed anywhere before it leaves
+ *   the previous generation serving and the previous tree untouched — see
+ *   {@link installScript}. It replaced two renames (`runtime` → `.previous`, staging →
+ *   `runtime`), a three-statement window in which a killed script left the node with no
+ *   runtime at all.
+ *
+ * **shell and JS speak one contract: the last line of stdout is one JSON object.**
+ * A `trap` guarantees the line is printed on every exit path, the exit code is kept for
+ * diagnostics but carries no meaning, and the old sentinel-substring vocabulary
+ * (`ARTEFACT_UNAVAILABLE` matched with `String.includes`) is now only the `code` *field*
+ * of that object — so `ARTEFACT_CHECKSUM_UNAVAILABLE` can never be mistaken for
+ * `ARTEFACT_UNAVAILABLE` because of how somebody spelled a name
+ * ({@link parseScriptResult}).
  *
  * @module @greatbaby/dsh-remote-node-harness/remote/artefact
  */
@@ -459,41 +472,220 @@ export function artefactUrls({
 }
 
 /**
- * The shell script that installs one runtime on the node.
+ * Every `code` the two node-side scripts can put in their result line.
  *
- * Written as one `sh -c` payload because a handful of round trips over a slow link
- * costs more than the script does, and every command here is one the probe has already
- * proved exists (`curl`/`wget`, `tar`, `sha256sum`/`shasum`).
+ * These are **field values of one JSON object**, not substrings to be grepped out of
+ * stderr. The old contract read `detail.includes('ARTEFACT_UNAVAILABLE')`, which meant
+ * `ARTEFACT_CHECKSUM_UNAVAILABLE` had to be spelled so it would not collide — a naming
+ * convention standing in for a parser, and one that a truncated stderr (the exec
+ * capture is capped at 1 MiB) could silently defeat.
  *
- * The archive's layout is the runtime directory itself — `node_modules/…` at the top —
- * because that is what the live runtime is on a node that npm once installed.
- *
- * `set -eu` is deliberate: a partially applied install must stop the connect, not
- * continue into a node that starts with half a runtime.
- *
- * The exit codes are the contract `RemoteHost.install` switches on:
- *
- * | code | meaning | what the caller does |
- * |---|---|---|
- * | 0 | installed | start the node |
- * | 3 | no source served it (`ARTEFACT_UNAVAILABLE`) | report the list it tried; never direct GitHub |
- * | 4 | checksum mismatch | roll back, report |
- * | 5 | archive is not a DSH runtime | roll back, report |
- * | 6 | the archive arrived but its `.sha256` did not (`ARTEFACT_CHECKSUM_UNAVAILABLE`) | roll back, report — never unpack unverified bytes |
- * | 7 | a binary the runtime spawns directly is not executable after unpack (`ARTEFACT_NOT_EXECUTABLE`) | roll back, report — the install is otherwise complete but unusable |
+ * The names are kept because they already appear in logs and in the design doc; what
+ * changed is that nothing compares substrings any more. See {@link parseScriptResult}.
  */
+export const SCRIPT_CODES = Object.freeze({
+  /** The tree was installed and the live symlink now points at it. */
+  INSTALLED: 'INSTALLED',
+  /** No configured source served the archive (or the machine has no downloader). */
+  ARTEFACT_UNAVAILABLE: 'ARTEFACT_UNAVAILABLE',
+  /** The archive arrived, but its published `.sha256` did not. */
+  ARTEFACT_CHECKSUM_UNAVAILABLE: 'ARTEFACT_CHECKSUM_UNAVAILABLE',
+  /** The archive arrived and did not match its published checksum. */
+  ARTEFACT_CHECKSUM_MISMATCH: 'ARTEFACT_CHECKSUM_MISMATCH',
+  /** `tar` refused the archive. */
+  ARTEFACT_UNPACK_FAILED: 'ARTEFACT_UNPACK_FAILED',
+  /** The archive unpacked but is not a DSH runtime (no CLI at the expected path). */
+  ARTEFACT_SHAPE_UNEXPECTED: 'ARTEFACT_SHAPE_UNEXPECTED',
+  /** A payload the runtime spawns directly is not executable after unpack. */
+  ARTEFACT_NOT_EXECUTABLE: 'ARTEFACT_NOT_EXECUTABLE',
+  /** The unpacked tree's own CLI cannot report a version, so it would not start. */
+  ARTEFACT_CLI_FAILED: 'ARTEFACT_CLI_FAILED',
+  /** The verified generation could not be made live (the `ln -sfn` failed). */
+  ARTEFACT_SWITCH_FAILED: 'ARTEFACT_SWITCH_FAILED',
+  /** A signal cut the script off. The live generation was not touched. */
+  ARTEFACT_INTERRUPTED: 'ARTEFACT_INTERRUPTED',
+  /** The result line was missing, unparsable, or did not name a code. */
+  UNKNOWN: 'UNKNOWN',
+})
+
+/** How much of the raw tail is kept when the result line cannot be parsed. */
+export const SCRIPT_RESULT_TAIL_BYTES = 600
+
+/**
+ * Read the last line of a script's stdout as the one JSON result object.
+ *
+ * The contract, in one sentence: **the last non-empty line of stdout is
+ * `{"ok":true|false,"code":"…","stage":"…", …}` on every exit path**, because the
+ * script installs an EXIT trap that prints it. The exit code is kept for diagnostics
+ * and carries no meaning — a non-zero status only says "look at that line".
+ *
+ * When the line is missing or not JSON (a killed shell, a shell that does not run the
+ * trap, an old script), the answer is `UNKNOWN` plus the last
+ * {@link SCRIPT_RESULT_TAIL_BYTES} of the raw output, so the failure still says
+ * something. `parsed` distinguishes "the script answered" from "we had to guess".
+ *
+ * **Why truncation is reported rather than guessed at.** `SshConnection.exec` caps each stream
+ * at `maxBytes` and keeps the *head*, so a script that printed megabytes would lose its last
+ * line — the one line that matters. The install script prints nothing else (`curl -fLsS`
+ * writes to a file, `tar -xzf` is silent, and the staged `--version` output is captured into a
+ * variable), so this should never happen; when the flag is set anyway, `truncated` says the
+ * `UNKNOWN` below is a capture artefact and not necessarily the script's silence.
+ *
+ * @param {{ code?: number | null, stdout?: string, stderr?: string, truncated?: boolean } | undefined} result
+ * @returns {{ ok: boolean, code: string, stage: string, detail: string,
+ *   want: string | undefined, got: string | undefined, version: string | undefined,
+ *   generation: string | undefined, raw: string | undefined, tail: string, parsed: boolean,
+ *   truncated: boolean }}
+ */
+export function parseScriptResult(result) {
+  const stdout = String(result?.stdout ?? '')
+  const stderr = String(result?.stderr ?? '')
+  const truncated = result?.truncated === true
+  const lines = stdout.split('\n').map(line => line.trim()).filter(line => line !== '')
+  const last = lines.at(-1)
+  const tail = (stderr.trim() !== '' ? stderr : stdout).trim().slice(-SCRIPT_RESULT_TAIL_BYTES)
+  if (last !== undefined) {
+    let parsed
+    try {
+      parsed = JSON.parse(last)
+    } catch {
+      parsed = undefined
+    }
+    if (parsed !== null && typeof parsed === 'object' && typeof parsed.ok === 'boolean') {
+      const code = typeof parsed.code === 'string' && parsed.code !== ''
+        ? parsed.code
+        : (parsed.ok === true ? SCRIPT_CODES.INSTALLED : SCRIPT_CODES.UNKNOWN)
+      return {
+        ok: parsed.ok === true,
+        code,
+        stage: typeof parsed.stage === 'string' && parsed.stage !== '' ? parsed.stage : 'unknown',
+        detail: typeof parsed.detail === 'string' ? parsed.detail : '',
+        want: typeof parsed.want === 'string' ? parsed.want : undefined,
+        got: typeof parsed.got === 'string' ? parsed.got : undefined,
+        version: typeof parsed.version === 'string' ? parsed.version : undefined,
+        generation: typeof parsed.generation === 'string' ? parsed.generation : undefined,
+        raw: last,
+        tail,
+        parsed: true,
+        truncated,
+      }
+    }
+  }
+  return {
+    ok: false,
+    code: SCRIPT_CODES.UNKNOWN,
+    stage: 'unknown',
+    detail: truncated
+      ? 'the captured output hit its byte cap, so the result line may have been cut off'
+      : '',
+    want: undefined,
+    got: undefined,
+    version: undefined,
+    generation: undefined,
+    raw: last,
+    tail,
+    parsed: false,
+    truncated,
+  }
+}
+
+/**
+ * The shell preamble that makes "last line is JSON" true on every exit path.
+ *
+ * Shared by {@link installScript} and {@link rollbackScript} so the two cannot answer
+ * in different shapes: the caller has one parser ({@link parseScriptResult}) and one
+ * vocabulary ({@link SCRIPT_CODES} plus {@link ROLLBACK_VERDICTS}).
+ *
+ * `trap finish EXIT` covers a normal exit, an explicit `fail`, and `set -e` tripping.
+ * The INT/TERM/HUP traps turn a signal into an ordinary exit so the EXIT trap still
+ * runs; without them a `sh` killed by SIGTERM exits without printing anything, which
+ * is exactly the case where the caller needs the line most (it can then tell "the
+ * script was cut off" from "the script said no").
+ *
+ * The values are escaped with `sed`/`tr` rather than assumed clean: a detail can carry
+ * a path, and a path can carry a quote.
+ *
+ * @param {string} stage - the initial stage name, for an unexpected exit.
+ * @returns {string}
+ */
+function resultPreamble(stage) {
+  return `
+# ---- result channel -------------------------------------------------------
+# The caller reads the LAST LINE of stdout as one JSON object on every exit path.
+# The exit code is kept for diagnostics and carries no meaning: "non-zero" only means
+# "read the line". This replaced "exit code + a sentinel substring in stderr", which
+# needed names chosen so one sentinel would not contain another.
+json_escape() {
+  printf '%s' "$1" | tr '\\n\\r\\t' '   ' | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g'
+}
+json_field() {
+  if [ -z "$2" ]; then return 0; fi
+  printf ',"%s":"%s"' "$1" "$(json_escape "$2")"
+}
+stage="${stage}"
+result=''
+interrupted=''
+fail_code=''
+fail_stage=''
+fail_detail=''
+fail_want=''
+fail_got=''
+fail() {
+  fail_code=$1
+  fail_stage=$2
+  fail_detail=\${3-}
+  fail_want=\${4-}
+  fail_got=\${5-}
+  exit 1
+}
+finish() {
+  status=$?
+  # Cleared first: the traps below would otherwise re-enter this function on the way out.
+  trap - EXIT INT TERM HUP
+  if [ -n "$result" ]; then
+    printf '%s\\n' "$result"
+  else
+    # A signal is not reported by the signal trap itself. The trap only sets a flag and
+    # exits, and the code and stage are read **here**, at exit time: the action string of a
+    # shell trap is expanded differently by different shells (dash freezes it when the trap
+    # is set), so a trap that built its own JSON would report the stage the script started
+    # in rather than the one it was killed in — measured: an install TERMed during the
+    # download answered a stage of "prepare".
+    if [ -n "$interrupted" ] && [ -z "$fail_code" ]; then
+      fail_code=${SCRIPT_CODES.ARTEFACT_INTERRUPTED}
+      fail_detail="a signal stopped the script during the $stage stage"
+    fi
+    printf '{"ok":false,"code":"%s","stage":"%s"%s%s%s}\\n' \\
+      "$(json_escape "\${fail_code:-${SCRIPT_CODES.UNKNOWN}}")" \\
+      "$(json_escape "\${fail_stage:-\${stage}}")" \\
+      "$(json_field detail "\${fail_detail:-}")" \\
+      "$(json_field want "\${fail_want:-}")" \\
+      "$(json_field got "\${fail_got:-}")"
+  fi
+  exit "$status"
+}
+trap finish EXIT
+# Record, then leave: the EXIT trap above still runs and prints the one result line, so a
+# killed script is distinguishable from a script that said no. Without this a shell that
+# receives SIGTERM exits without printing anything — the case where the caller most needs to
+# know whether the live tree was touched.
+trap 'interrupted=1; exit 1' INT TERM HUP
+`.trimEnd()
+}
 
 /**
  * Turn a `~`-rooted path into something a shell expands inside double quotes.
  *
- * `~/.dsh-remote-node-harness/runtime` only expands when it is unquoted and at the start of a word.
- * This script quotes every path — a directory with a space in it must not break an
- * install — so the tilde has to be replaced by `$HOME` instead. Without this the script
- * happily creates a directory literally named `~` and then fails to download into it.
+ * `~/.dsh-remote-node-harness/run` only expands when it is unquoted and at the start of a
+ * word. Every path in the generated scripts is quoted — a directory with a space in it must
+ * not break an install — so the tilde has to be replaced by `$HOME` instead. Without this the
+ * script happily creates a directory literally named `~` and then fails to download into it.
  *
+ * Exported because `daemon.js` needs the same rewrite for its own commands: two
+ * implementations of this would eventually disagree about `~`.
  * @param {string} path
  */
-function shellPath(path) {
+export function shellPath(path) {
   return path.startsWith('~/') ? `$HOME/${path.slice(2)}` : path
 }
 
@@ -534,10 +726,39 @@ function executableRestoreLines() {
 
 /**
  * The shell script that installs one runtime on the node.
+ *
+ * Written as one `sh -c` payload because a handful of round trips over a slow link costs more
+ * than the script does, and every command here is one the probe has already proved exists
+ * (`curl`/`wget`, `tar`, `sha256sum`/`shasum`).
+ *
+ * The archive's layout is a runtime directory itself — `node_modules/…` at the top.
+ *
+ * **One script = one transaction.** The live runtime is a symlink
+ * (`runtime -> runtime.<n>`); the new tree is unpacked, repaired, stamped and asked for its
+ * version inside its own `runtime.<n+1>`, and the last statement that changes what the node
+ * runs is a single `ln -sfn runtime.<n+1> runtime`. So:
+ *
+ * - every failure before that line leaves the live generation serving, untouched;
+ * - a rollback is the same operation pointed the other way (see {@link rollbackScript}), not
+ *   a second script with its own semantics;
+ * - a script killed between "unpacked" and "switched" leaves a residue generation and a
+ *   working node; the next successful install prunes it;
+ * - one generation is kept and the rest are removed, so the disk cost is bounded — the old
+ *   `.previous` directory was never cleaned up and cost 268–408 MiB per upgrade.
+ *
+ * A node installed by a pre-symlink build has a **real directory** at `runtime`. It is
+ * migrated to `runtime.<n>` *before* the download starts, so every exit path below sees a
+ * symlink and the commit point stays one statement for new and old nodes alike.
+ *
+ * `set -eu` is deliberate: a partially applied install must stop the connect, not continue
+ * into a node that starts with half a runtime. Every failure it can hit is either checked
+ * explicitly (and reported with a {@link SCRIPT_CODES} value) or falls through to the EXIT
+ * trap, which reports the stage it had reached.
+ *
  * @param {object} options
  * @param {string} options.version
- * @param {string} options.runtime - the runtime directory, `~/.dsh-remote-node-harness/runtime`.
- * @param {string} options.cli - the CLI path inside that directory.
+ * @param {string} options.runtime - the live symlink path, e.g. `~/.dsh-remote-node-harness/runtime`.
+ * @param {string} options.cli - the CLI path inside the runtime, through the symlink.
  * @param {string[]} options.urls - candidate download URLs.
  * @param {number} [options.build] - the packaging build, stamped into the tree.
  * @returns {string}
@@ -545,14 +766,75 @@ function executableRestoreLines() {
 export function installScript({ version, runtime, cli, urls, build = RUNTIME_BUILD }) {
   const checksumUrls = urls.map(url => `${url}.sha256`)
   const quote = list => list.map(url => `'${url}'`).join(' ')
+  const runtimeShell = shellPath(runtime)
+  const cliShell = shellPath(cli)
+  // The CLI's path *inside* a generation, so the same script can probe the staging tree
+  // before it is live. The caller passes the through-the-symlink path (that is what the
+  // launch line uses), so the generation-relative part is what remains after the runtime
+  // prefix — and if a caller passes something unrelated, the default is the one path the
+  // installer itself writes.
+  const cliRelative = cliShell.startsWith(runtimeShell)
+    ? cliShell.slice(runtimeShell.length)
+    : '/node_modules/@deepseek-ai/dsh/lib/bin.js'
   return `
 set -eu
-runtime="${shellPath(runtime)}"
-staging="$runtime.incoming"
-previous="$runtime.previous"
-archive="$(dirname "$runtime")/runtime-${version}.tar.gz"
-mkdir -p "$(dirname "$runtime")"
-cd "$(dirname "$runtime")"
+${resultPreamble('prepare')}
+runtime="${runtimeShell}"
+cli="${cliShell}"
+cli_relative="${cliRelative}"
+base="$(dirname "$runtime")"
+archive="$base/runtime-${version}.tar.gz"
+mkdir -p "$base"
+cd "$base"
+
+# ---- the live generation ---------------------------------------------------
+# 'runtime' is a symlink to 'runtime.<n>'; that symlink is the one and only answer to
+# "what does this node run". A node installed before this layout has a **real directory**
+# at 'runtime' instead, and it is migrated here, once, *before* anything is downloaded:
+#
+#   mv runtime runtime.0 && ln -sfn runtime.0 runtime
+#
+# Doing it first is what keeps the commit point uniform: every exit path below sees a
+# symlink, so the only statement that changes what the node runs is the single
+# 'ln -sfn' at the end. Migrating at the end instead would make the last step two
+# statements for exactly the nodes that are hardest to repair by hand.
+live=''
+if [ -L "$runtime" ]; then
+  live=$(readlink "$runtime")
+elif [ -d "$runtime" ]; then
+  migrate=0
+  while [ -e "$base/runtime.$migrate" ]; do migrate=$((migrate + 1)); done
+  mv "$runtime" "$base/runtime.$migrate"
+  ln -sfn "runtime.$migrate" "$runtime"
+  live="runtime.$migrate"
+fi
+# A 'runtime' that is neither a symlink nor a directory means one of two things: a fresh
+# node, or a script that was killed inside 'ln -sfn''s own unlink/symlink pair. In the
+# second case the generations are still on disk, and the newest one is what was about to
+# become live — so adopt it rather than report a node with no runtime.
+if [ -z "$live" ]; then
+  newest=''
+  for candidate in "$base"/runtime.*; do
+    [ -d "$candidate" ] || continue
+    suffix=\${candidate##*/runtime.}
+    case "$suffix" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$newest" ] || [ "$suffix" -gt "$newest" ]; then newest=$suffix; fi
+  done
+  if [ -n "$newest" ]; then
+    ln -sfn "runtime.$newest" "$runtime"
+    live="runtime.$newest"
+  fi
+fi
+# The generation this install writes into. It is **not** the live one and is never the
+# live one until the commit line: a failure anywhere below leaves 'runtime' alone.
+next=1
+for candidate in "$base"/runtime.*; do
+  [ -d "$candidate" ] || continue
+  suffix=\${candidate##*/runtime.}
+  case "$suffix" in ''|*[!0-9]*) continue ;; esac
+  if [ "$suffix" -ge "$next" ]; then next=$((suffix + 1)); fi
+done
+staging="$base/runtime.$next"
 
 fetch() {
   for target in "$@"; do
@@ -563,19 +845,19 @@ fetch() {
     elif command -v wget >/dev/null 2>&1; then
       wget -q -T 20 -t 2 -O "$OUT" "$target" && return 0
     else
-      echo "this machine has neither curl nor wget" >&2
-      return 1
+      fail ${SCRIPT_CODES.ARTEFACT_UNAVAILABLE} download "this machine has neither curl nor wget"
     fi
   done
   return 1
 }
 
+stage=download
 OUT="$archive"
 if ! fetch ${quote(urls)}; then
-  echo "ARTEFACT_UNAVAILABLE" >&2
-  exit 3
+  fail ${SCRIPT_CODES.ARTEFACT_UNAVAILABLE} download "no configured source served the archive"
 fi
 
+stage=verify
 OUT="$archive.sha256"
 if ! fetch ${quote(checksumUrls)}; then
   # **No sidecar is a failure, not a skip.** The archive came from the same host that is
@@ -584,8 +866,7 @@ if ! fetch ${quote(checksumUrls)}; then
   # "truncated download" into "half-installed runtime that fails at first use" — the exact
   # thing the checksum exists to prevent, and the failure lands days later on a tool call.
   rm -f "$archive"
-  echo "ARTEFACT_CHECKSUM_UNAVAILABLE" >&2
-  exit 6
+  fail ${SCRIPT_CODES.ARTEFACT_CHECKSUM_UNAVAILABLE} verify "the archive arrived but its .sha256 did not"
 fi
 expected=$(cut -d' ' -f1 < "$archive.sha256")
 if command -v sha256sum >/dev/null 2>&1; then
@@ -595,18 +876,21 @@ else
 fi
 if [ "$expected" != "$actual" ]; then
   rm -f "$archive"
-  echo "ARTEFACT_CHECKSUM_MISMATCH $expected $actual" >&2
-  exit 4
+  fail ${SCRIPT_CODES.ARTEFACT_CHECKSUM_MISMATCH} verify "the archive does not match its published sha256" "$expected" "$actual"
 fi
 
+stage=unpack
 rm -rf "$staging"
 mkdir -p "$staging"
-tar -xzf "$archive" -C "$staging"
-if [ ! -f "$staging/node_modules/@deepseek-ai/dsh/lib/bin.js" ]; then
+if ! tar -xzf "$archive" -C "$staging" 2>/dev/null; then
   rm -rf "$staging"
   rm -f "$archive" "$archive.sha256"
-  echo "ARTEFACT_SHAPE_UNEXPECTED" >&2
-  exit 5
+  fail ${SCRIPT_CODES.ARTEFACT_UNPACK_FAILED} unpack "tar could not unpack the archive"
+fi
+if [ ! -f "$staging$cli_relative" ]; then
+  rm -rf "$staging"
+  rm -f "$archive" "$archive.sha256"
+  fail ${SCRIPT_CODES.ARTEFACT_SHAPE_UNEXPECTED} unpack "the archive has no node_modules/@deepseek-ai/dsh/lib/bin.js"
 fi
 # tar on a Windows packer writes 0666 for every entry — measured on the published rc.5
 # archive: 25 038 files, **0** carrying +x. chmodSync on Windows leaves 100666, so the packer
@@ -620,11 +904,12 @@ fi
 # gate reports as "in step". The rule is now the same one the packer uses
 # (isArtefactExecutable): every file inside a package's bin/ directory, spawn-helper by name,
 # and native addons by suffix.
+stage=repair
 ${executableRestoreLines()}
 # **Verified, not assumed.** A tree whose payloads are not executable installs silently and
-# breaks at the first search, so it is checked here, where the exit code can still roll it
-# back. Absent is fine — a Darwin prebuild is not in a Linux archive — but present and not
-# executable is fatal, and says which file.
+# breaks at the first search, so it is checked here, where the answer can still be "no"
+# without anything live having changed. Absent is fine — a Darwin prebuild is not in a Linux
+# archive — but present and not executable is fatal, and says which file.
 broken=
 for candidate in "$staging/node_modules/@vscode/ripgrep-linux-x64/bin/rg" "$staging/node_modules/@deepseek-ai/node-addon-system-linux-x64/bin/landlock-run"; do
   if [ -f "$candidate" ] && [ ! -x "$candidate" ]; then broken="$broken $candidate"; fi
@@ -632,21 +917,55 @@ done
 if [ -n "$broken" ]; then
   rm -rf "$staging"
   rm -f "$archive" "$archive.sha256"
-  echo "ARTEFACT_NOT_EXECUTABLE$broken" >&2
-  exit 7
+  fail ${SCRIPT_CODES.ARTEFACT_NOT_EXECUTABLE} repair "a payload the runtime spawns is not executable" "$broken"
 fi
 
-# The swap. Deliberately the ONLY place the previous directory is created or overwritten: every
-# check above exits before this line, so a rejected archive (exit 4/5/6/7) leaves both the live
-# tree and the previous one exactly as they were. Together with the liveness probe in
-# rollbackScript that is what makes a failed install cost nothing — without this ordering a
-# rollback after a download failure would downgrade the node to an older release.
-rm -rf "$previous"
-if [ -d "$runtime" ]; then mv "$runtime" "$previous"; fi
-mv "$staging" "$runtime"
-rm -f "$archive" "$archive.sha256"
-printf '%s\n' '${stampText({ build, via: 'artefact' })}' > "$runtime/${BUILD_STAMP}"
-node "${shellPath(cli)}" --version
+# The stamp is written into the **staging** generation: it records which build packed these
+# bytes, and a tree only carries it once every check above has passed.
+stage=stamp
+printf '%s\\n' '${stampText({ build, via: 'artefact' })}' > "$staging/${BUILD_STAMP}"
+
+# **The tree has to start before it may become live.** '--version' imports the real entry
+# point, so a missing native module or a broken tree is caught while 'runtime' still points
+# at the release that works. This is the check that makes the commit line safe.
+stage=probe
+installed_version=$(node "$staging$cli_relative" --version 2>/dev/null || true)
+if ! printf '%s' "$installed_version" | grep -Eq '^[0-9]+\\.[0-9]+\\.[0-9]+'; then
+  rm -rf "$staging"
+  rm -f "$archive" "$archive.sha256"
+  fail ${SCRIPT_CODES.ARTEFACT_CLI_FAILED} probe "the unpacked tree's CLI did not report a version" "${version}" "$installed_version"
+fi
+
+# ---- commit ---------------------------------------------------------------
+# The one statement that changes what this node runs. Everything above could fail without
+# touching the live generation; nothing below can undo the switch, and nothing below is
+# allowed to turn a good switch into a reported failure.
+stage=switch
+previous=''
+if [ -n "$live" ] && [ "$live" != "runtime.$next" ]; then previous="$live"; fi
+if ! ln -sfn "runtime.$next" "$runtime"; then
+  fail ${SCRIPT_CODES.ARTEFACT_SWITCH_FAILED} switch "could not point runtime at runtime.$next"
+fi
+# **Bounded cleanup.** The live generation and exactly one previous one are kept (the
+# previous is what a rollback points at); every other generation is residue from a failed
+# or interrupted attempt. 'runtime.incoming'/'runtime.previous' are the pre-symlink
+# layout's staging and backup directories: after this switch the tree that was live is the
+# previous generation, so both are older than what is kept. Failures here are ignored on
+# purpose — the switch already succeeded, and a full disk must not be reported as "the
+# install failed".
+stage=prune
+for candidate in "$base"/runtime.*; do
+  [ -d "$candidate" ] || continue
+  name=\${candidate##*/}
+  suffix=\${name#runtime.}
+  case "$suffix" in ''|*[!0-9]*) continue ;; esac
+  if [ "$name" = "runtime.$next" ] || { [ -n "$previous" ] && [ "$name" = "$previous" ]; }; then continue; fi
+  rm -rf "$candidate" 2>/dev/null || true
+done
+rm -rf "$base/runtime.incoming" "$base/runtime.previous" 2>/dev/null || true
+rm -f "$archive" "$archive.sha256" 2>/dev/null || true
+result=$(printf '{"ok":true,"code":"%s","stage":"done","version":"%s","generation":"%s"}' \\
+  "${SCRIPT_CODES.INSTALLED}" "$(json_escape "$installed_version")" "runtime.$next")
 `.trim()
 }
 
@@ -742,63 +1061,143 @@ export function inspectRuntime({ version, build, wantedVersion }) {
  * They exist because "a rollback ran" and "a rollback did something" are different facts, and
  * the one that matters to a user is the second. `kept-current` is the ordinary answer after a
  * failed install: the live tree was never touched, so the node is still on the release it had.
+ *
+ * They travel as the `code` field of the result line (see {@link parseScriptResult}), not as
+ * a bare word on stdout: the caller has one parser for both scripts, and a bare word would
+ * need its own "did the script even run" check.
  */
 export const ROLLBACK_VERDICTS = Object.freeze({
   /** The live runtime still starts; nothing was changed. */
   KEPT_CURRENT: 'kept-current',
-  /** The live runtime could not start; `$runtime.previous` took its place. */
+  /** The live runtime could not start; the previous generation took its place. */
   ROLLED_BACK: 'rolled-back',
   /** The live runtime could not start and there was no previous tree to use. */
   NOTHING_TO_ROLL_BACK: 'nothing-to-roll-back',
 })
 
 /**
- * Decide what a failed install leaves behind: the live tree, or the previous one.
+ * The CLI's path *inside* a runtime generation.
  *
- * **Why the live tree is started before anything is removed.** Every failure {@link
- * installScript} reports with exit 4, 5, 6 or 7 happens *before* the rename, so at that moment
- * `$runtime` is the healthy release the node has been serving and `$runtime.previous` is one
- * release **older**. A rollback that unconditionally did `rm -rf "$runtime"` and then moved
- * `.previous` into place therefore *downgraded* a node whose download had merely failed:
- * measured on a real node by planting `runtime=v2-good` / `runtime.previous=v1-old` and running
- * the old script, the node came back running v1-old. A failed install must leave what it did
- * not touch alone, and the only thing that cannot lie about a tree is starting it — so the
- * `node … --version` probe decides. Only a live tree that cannot run is replaced.
+ * The caller passes the through-the-symlink path (`…/runtime/node_modules/@deepseek-ai/dsh/
+ * lib/bin.js`), which is what the launch line and every later read use; a generation path is
+ * that same string with the runtime prefix swapped. Falling back to the path the installer
+ * itself writes keeps a caller that passes something unrelated working instead of producing
+ * a script that probes nothing.
+ * @param {string} runtime - the `~`-rooted runtime path, as the caller spelled it.
+ * @param {string} cli - the `~`-rooted CLI path, as the caller spelled it.
+ * @returns {string}
+ */
+function cliRelativeTo(runtime, cli) {
+  const runtimeShell = shellPath(runtime)
+  const cliShell = shellPath(cli)
+  return cliShell.startsWith(runtimeShell)
+    ? cliShell.slice(runtimeShell.length)
+    : '/node_modules/@deepseek-ai/dsh/lib/bin.js'
+}
+
+/**
+ * Decide what a failed install leaves behind: the live generation, or the one before it.
+ *
+ * **With the symlink layout this is the same operation as an install, pointed the other
+ * way.** An install that failed before its commit line never touched `runtime`, so the
+ * ordinary answer is `kept-current` and the script changes nothing. An install that failed
+ * *after* the commit line cannot happen by construction — the only statement after the
+ * switch is cleanup that ignores its own failures — so `rolled-back` is now the answer to
+ * "the live generation itself does not start", not to "an install failed".
+ *
+ * The live generation is started before anything is moved, and that ordering is the fix for
+ * A1: a script that restored a backup unconditionally *downgraded* a node whose download had
+ * merely failed. Measured on a real node by planting `runtime=v2-good` /
+ * `runtime.previous=v1-old` and running the old script, the node came back running v1-old.
+ *
+ * Three layouts are handled, because a node in service can be in any of them:
+ *
+ * 1. `runtime -> runtime.<n>` (this build): probe the target; if it runs, keep it.
+ * 2. `runtime` a **real directory** (a build before the symlink layout): probe it; if it
+ *    runs, keep it exactly as it is. Rollback never migrates — a repair that runs while the
+ *    caller is already handling a failure must be the smallest possible action.
+ * 3. `runtime` gone or broken, with `runtime.previous` (the pre-symlink backup): restore it.
  *
  * `set -u` rather than `set -eu`: a failed probe is an answer here, not a reason to abort
  * without printing a verdict at all.
  *
- * @param {string} runtime - the live runtime directory.
- * @param {string} [cli] - the CLI inside that directory; defaults to the path the installer
+ * @param {string} runtime - the live runtime path (`~`-rooted is fine).
+ * @param {string} [cli] - the CLI inside that runtime; defaults to the path the installer
  *   writes. `RemoteHost` passes its own layout value so the two can never disagree.
  * @returns {string}
  */
 export function rollbackScript(runtime, cli = `${runtime}/node_modules/@deepseek-ai/dsh/lib/bin.js`) {
+  const runtimeShell = shellPath(runtime)
+  const cliShell = shellPath(cli)
+  const cliRelative = cliRelativeTo(runtime, cli)
   return `
 set -u
-runtime="${shellPath(runtime)}"
-cli="${shellPath(cli)}"
-previous="$runtime.previous"
-staging="$runtime.incoming"
-if [ -f "$cli" ] && node "$cli" --version >/dev/null 2>&1; then
-  # The live tree still runs, so the failed install never got as far as replacing it. Leave it
-  # exactly as it is and say so: this is the difference between "nothing happened" and "the
-  # node went backwards one release".
-  rm -rf "$staging"
-  echo ${ROLLBACK_VERDICTS.KEPT_CURRENT}
+${resultPreamble('rollback')}
+runtime="${runtimeShell}"
+cli="${cliShell}"
+cli_relative="${cliRelative}"
+base="$(dirname "$runtime")"
+live=''
+if [ -L "$runtime" ]; then live=$(readlink "$runtime"); fi
+
+# Whether one generation holds a tree that starts. The only evidence that cannot lie about a
+# tree is starting it; a stamp or a version file proves who wrote something, not that it runs.
+generation_works() {
+  [ -n "$1" ] || return 1
+  [ -f "$base/$1$cli_relative" ] || return 1
+  node "$base/$1$cli_relative" --version >/dev/null 2>&1
+}
+
+# The ordinary answer: the live generation still starts, so the failed install never got as
+# far as replacing it. Nothing is changed — that is the difference between "nothing happened"
+# and "the node went backwards one release".
+if [ -n "$live" ] && generation_works "$live"; then
+  result=$(printf '{"ok":true,"code":"%s","stage":"rollback","generation":"%s"}' \\
+    "${ROLLBACK_VERDICTS.KEPT_CURRENT}" "$(json_escape "$live")")
   exit 0
 fi
-if [ -d "$previous" ]; then
-  # The live tree is not runnable (a rename happened and the new tree is bad). The previous
-  # tree was accepted by this same installer when it was installed, which makes it the best
-  # candidate there is; if it too cannot start, the next connect reports a real install error.
-  rm -rf "$runtime"
-  mv "$previous" "$runtime"
-  rm -rf "$staging"
-  echo ${ROLLBACK_VERDICTS.ROLLED_BACK}
+# A pre-symlink node whose runtime is a real directory and still starts: same answer, and it
+# is left as a directory. Migrating here would be a bigger action than the failure deserves.
+if [ ! -L "$runtime" ] && [ -d "$runtime" ] && node "$runtime$cli_relative" --version >/dev/null 2>&1; then
+  result=$(printf '{"ok":true,"code":"%s","stage":"rollback"}' "${ROLLBACK_VERDICTS.KEPT_CURRENT}")
   exit 0
 fi
-rm -rf "$staging"
-echo ${ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK}
+
+# The live generation does not start. The previous one was accepted by this same installer
+# when it was installed, which makes it the best candidate there is. Pick the highest numbered
+# generation that is not the live one and that starts; a residue directory from an interrupted
+# install is skipped because it does not start.
+target=''
+for candidate in "$base"/runtime.*; do
+  [ -d "$candidate" ] || continue
+  name=\${candidate##*/}
+  suffix=\${name#runtime.}
+  case "$suffix" in ''|*[!0-9]*) continue ;; esac
+  [ "$name" = "$live" ] && continue
+  if generation_works "$name"; then
+    if [ -z "$target" ] || [ "$suffix" -gt "$target_suffix" ]; then
+      target="$name"
+      target_suffix="$suffix"
+    fi
+  fi
+done
+if [ -n "$target" ]; then
+  ln -sfn "$target" "$runtime" || fail ${SCRIPT_CODES.ARTEFACT_SWITCH_FAILED} rollback "could not point runtime at $target"
+  result=$(printf '{"ok":true,"code":"%s","stage":"rollback","generation":"%s"}' \\
+    "${ROLLBACK_VERDICTS.ROLLED_BACK}" "$(json_escape "$target")")
+  exit 0
+fi
+
+# The pre-symlink backup, for a node that has not been through an install since the layout
+# changed. It is restored only after every generation has been proven not to start.
+if [ -d "$base/runtime.previous" ] && node "$base/runtime.previous$cli_relative" --version >/dev/null 2>&1; then
+  rm -rf "$runtime" "$base/runtime.incoming" 2>/dev/null || true
+  mv "$base/runtime.previous" "$runtime" || fail ${SCRIPT_CODES.ARTEFACT_SWITCH_FAILED} rollback "could not restore runtime.previous"
+  result=$(printf '{"ok":true,"code":"%s","stage":"rollback","generation":"runtime.previous"}' \\
+    "${ROLLBACK_VERDICTS.ROLLED_BACK}")
+  exit 0
+fi
+
+result=$(printf '{"ok":true,"code":"%s","stage":"rollback"}' "${ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK}")
 `.trim()
 }

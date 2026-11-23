@@ -35,9 +35,11 @@ import {
   inspectRuntime,
   installScript,
   isArtefactExecutable,
+  parseScriptResult,
   parseStamp,
   platformTag,
   rollbackScript,
+  SCRIPT_CODES,
   stampJson,
 } from '../src/remote/artefact.js'
 import { detectLibc, pluginInstallScript, remoteLayout } from '../src/remote/daemon.js'
@@ -240,56 +242,125 @@ const runShellScript = (shell, directory, text) => {
     'while a slow but working line still gets a real budget')
   check(script.includes('sha256sum') && script.includes('shasum'),
     'it verifies the checksum on either flavour of coreutils')
-  check(script.includes('ARTEFACT_CHECKSUM_MISMATCH'), 'and reports a mismatch by name')
-  // **No sidecar is a failure, not a skip.** It used to be `if fetch …; then` — a missing
-  // `.sha256` silently skipped the comparison and unpacked unverified bytes, which is exactly
-  // the "half-installed runtime that fails at first use" the checksum exists to prevent.
-  check(script.includes('ARTEFACT_CHECKSUM_UNAVAILABLE') && script.includes('exit 6'),
-    'an archive whose .sha256 cannot be fetched is refused, not unpacked unverified')
-  check(!script.includes('if fetch ') || script.includes('ARTEFACT_CHECKSUM_UNAVAILABLE'),
-    'the checksum step is unconditional, not an `if fetch …` that can fall through')
-  // The script is a template, so the CLI path is already substituted into it: the
-  // assertion has to look for the substituted form.
-  check(script.includes('node "/root/.dsh-remote-node-harness/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js" --version'),
-    'and the result is verified by running the installed CLI')
-  check(script.includes('.incoming'), 'it unpacks into a staging directory')
+
+  // ---- the result contract: the last line of stdout is one JSON object -----------
+  // The codes are **field values**, not substrings to grep for: the old contract matched
+  // `detail.includes('ARTEFACT_UNAVAILABLE')` on stderr, so a truncated capture could
+  // silently flip a failure's category, and `ARTEFACT_CHECKSUM_UNAVAILABLE` had to be named
+  // so it would not contain the shorter name.
+  check(script.includes('trap finish EXIT'),
+    'every exit path prints through an EXIT trap, so no failure can exit silently')
+  check(script.includes("trap 'interrupted=1; exit 1' INT TERM HUP"),
+    'and a signal sets a flag instead of exiting silently, so the EXIT trap still prints')
+  check(script.includes('SCRIPT_CODES') === false,
+    'the codes are interpolated into the script, not referenced by name at run time')
+  for (const [name, value] of Object.entries(SCRIPT_CODES)) {
+    if (name === 'UNKNOWN') continue // JS-side only: the shell never prints it
+    check(script.includes(`"${value}"`) || script.includes(value),
+      `the ${name} code is in the script`, value)
+  }
+  // The old script exited 3/4/5/6/7 and put the sentinel on **stderr**; `parseScriptResult`
+  // reads stdout only. A regression here would look like "the script said nothing".
+  check(!/^\s*exit [3-7]$/mu.test(script),
+    'no exit code carries the meaning any more — the JSON line does')
+  // The staging generation is where every check runs, and it is never the live one.
+  check(script.includes('staging="$base/runtime.$next"'),
+    'it unpacks into a numbered next generation, not into the live tree')
+  check(!script.includes('mv "$staging" "$runtime"'),
+    'and never renames anything onto the live path — that is what removed the window')
 
   const rollback = rollbackScript('/root/.dsh-remote-node-harness/runtime')
-  // Old semantics: `.previous` existed → restore it. That is still one of the answers, but it is
-  // no longer the *first* question. The script must ask whether the **live** tree still starts
-  // before it touches anything — otherwise a failed download (checksum, unpack, shape,
-  // executable-bit checks all happen before the rename) downgrades a healthy node to the
-  // release before it. Measured on a real node: runtime=v2-good, runtime.previous=v1-old, one
-  // rollback later the node ran v1-old.
-  check(rollback.includes('node "$cli" --version'),
-    'the rollback starts the live tree before deciding anything', rollback.split('\n').find(line => line.includes('--version')))
-  check(rollback.indexOf('node "$cli" --version') < rollback.indexOf('rm -rf "$runtime"'),
-    'and it decides before it removes the live tree — that ordering is the whole fix')
-  check(rollback.includes('.previous') && rollback.includes('rolled-back'),
-    'a failed install that did replace the tree can still be rolled back')
+  // The installer's failure happens before the commit line, so the ordinary answer is
+  // `kept-current`: the live generation is started and left alone. That ordering is the A1
+  // fix — a rollback that restored a backup unconditionally downgraded a node whose download
+  // had merely failed (measured: runtime=v2-good, runtime.previous=v1-old, one rollback later
+  // the node ran v1-old).
+  check(rollback.includes('generation_works "$live"'),
+    'the rollback starts the live generation before deciding anything',
+    rollback.split('\n').find(line => line.includes('generation_works')))
+  check(rollback.indexOf('generation_works "$live"') < rollback.indexOf('ln -sfn'),
+    'and it decides before it changes the live symlink — that ordering is the whole fix')
+  check(rollback.includes('runtime.previous') && rollback.includes('rolled-back'),
+    'a pre-symlink node with a .previous backup can still be rolled back')
   check(rollback.includes('nothing-to-roll-back'),
     'and reports when there was nothing to roll back to')
-  // The third answer is the ordinary one now: the live tree was never touched, so the failure
-  // cost nothing. JS needs to tell the three apart to say which happened, hence ROLLBACK_VERDICTS.
-  check(rollback.includes('kept-current'),
-    'and reports when the live tree was kept because it still runs')
   for (const [name, value] of Object.entries(ROLLBACK_VERDICTS)) {
-    check(rollback.includes(value), `the ${name} verdict is the string daemon.js branches on`, value)
+    check(rollback.includes(value), `the ${name} verdict is in the result line`, value)
   }
   const verdicts = Object.values(ROLLBACK_VERDICTS)
   check(new Set(verdicts).size === verdicts.length,
     'the three verdicts are distinct, so the caller cannot confuse them', verdicts.join(' '))
 
-  // The other half of A1 is on the install side: `.previous` must not be created or overwritten
-  // before the last verification, or a rejected archive still leaves a rollback that "restores"
-  // an older tree over a live one. Exit codes 4/5/6/7 all come before the swap.
-  const swapAt = script.indexOf('rm -rf "$previous"')
+  // ---- one commit point -----------------------------------------------------------
+  // Under the generation layout the only statement that changes what the node runs is the
+  // final `ln -sfn`. Every check above it can fail without touching `runtime`; nothing below
+  // it is allowed to turn a good switch into a reported failure. The old layout's
+  // `rm -rf "$previous"; mv "$runtime" "$previous"; mv "$staging" "$runtime"` had a window
+  // in which `runtime` did not exist at all.
+  const commitAt = script.indexOf('ln -sfn "runtime.$next" "$runtime"')
   const lastCheckAt = script.indexOf('ARTEFACT_NOT_EXECUTABLE')
-  check(swapAt > 0 && lastCheckAt > 0 && swapAt > lastCheckAt,
-    'the previous tree is only replaced after every verification has passed',
-    `${String(lastCheckAt)} < ${String(swapAt)}`)
-  check(script.indexOf('mv "$staging" "$runtime"') > swapAt,
-    'and the live tree is only moved aside at the swap itself')
+  const probeAt = script.indexOf('installed_version=$(node "$staging$cli_relative" --version')
+  check(commitAt > 0 && lastCheckAt > 0 && commitAt > lastCheckAt,
+    'the live symlink is only switched after every verification has passed',
+    `${String(lastCheckAt)} < ${String(commitAt)}`)
+  check(probeAt > 0 && commitAt > probeAt,
+    'and after the staged tree has actually started — that is what makes the switch safe')
+  check(!script.includes('mv "$staging" "$runtime"'),
+    'the live path is never a rename target, so there is no window where it does not exist')
+  // The old `.incoming` staging directory is only ever *deleted* now — as residue from a node
+  // installed by an earlier build. It must never be written to: a staging tree beside the live
+  // one is what the numbered generation replaced.
+  check(!script.includes('staging="$runtime.incoming"'),
+    'the old .incoming staging path is not written to any more')
+  check(script.includes('rm -rf "$base/runtime.incoming"'),
+    'and the residue an earlier build left is cleaned up')
+}
+
+// ---- the JSON result line parses, and says UNKNOWN when it cannot ------------
+{
+  const installed = parseScriptResult({
+    code: 0,
+    stdout: 'some progress\n{"ok":true,"code":"INSTALLED","stage":"done","version":"0.2.2","generation":"runtime.3"}\n',
+    stderr: '',
+  })
+  check(installed.parsed && installed.ok, 'a result line is recognised', installed.raw)
+  check(installed.code === SCRIPT_CODES.INSTALLED, 'and its code is read', installed.code)
+  check(installed.version === '0.2.2', 'and the version it installed', installed.version)
+  check(installed.generation === 'runtime.3', 'and the generation it made live', installed.generation)
+
+  // The exit code is deliberately **not** consulted: this result says ok even though the
+  // status was 0 and another would say not-ok with status 0. Only the line decides.
+  const mismatch = parseScriptResult({
+    code: 1,
+    stdout: '{"ok":false,"code":"ARTEFACT_CHECKSUM_MISMATCH","stage":"verify","want":"aa","got":"bb"}',
+    stderr: '',
+  })
+  check(!mismatch.ok, 'a reported failure is not ok')
+  check(mismatch.code === SCRIPT_CODES.ARTEFACT_CHECKSUM_MISMATCH, 'its code survives', mismatch.code)
+  check(mismatch.want === 'aa' && mismatch.got === 'bb',
+    'and both hashes are carried, so the error can show what did not match')
+
+  // A shell killed before its trap, an old script, an exec that cut stdout: the honest
+  // answer is UNKNOWN plus the tail, not a guess at which failure it was.
+  const silent = parseScriptResult({ code: 1, stdout: 'tar: broken pipe\n', stderr: '' })
+  check(!silent.parsed, 'output without a result line is not claimed to be a result')
+  check(silent.code === SCRIPT_CODES.UNKNOWN, 'it reads as UNKNOWN', silent.code)
+  check(silent.tail.includes('tar: broken pipe'), 'and the raw tail is kept for the error', silent.tail)
+  check(parseScriptResult(undefined).code === SCRIPT_CODES.UNKNOWN,
+    'no result at all is UNKNOWN too, never a silent success')
+  // stderr is preferred for the tail because that is where a `set -e` abort leaves its
+  // only evidence; the result line itself is read from stdout only.
+  const stderrTail = parseScriptResult({ code: 2, stdout: '', stderr: 'sh: line 9: node: not found\n' })
+  check(stderrTail.tail.includes('node: not found'), 'stderr is what the tail falls back to', stderrTail.tail)
+  // `exec` keeps the *head* of each stream, so a capture that hit its cap could have lost the
+  // result line. Saying so is the difference between "the script was silent" (a real fault) and
+  // "this capture cannot tell" (a measurement fault).
+  const cut = parseScriptResult({ code: 1, stdout: 'x'.repeat(100), stderr: '', truncated: true })
+  check(cut.truncated === true && cut.code === SCRIPT_CODES.UNKNOWN,
+    'a truncated capture is UNKNOWN and says the line may have been cut', cut.detail)
+  check(cut.detail.includes('cut off'), 'with a detail that names the cause', cut.detail)
+  check(parseScriptResult({ code: 0, stdout: '{"ok":true,"code":"INSTALLED","stage":"done"}', truncated: false }).truncated === false,
+    'and an untruncated capture is not flagged')
 }
 
 // ---- files that must be executable after unpack -----------------------------
@@ -381,18 +452,18 @@ const runShellScript = (shell, directory, text) => {
     cli: '/root/.dsh-remote-node-harness/runtime/node_modules/@deepseek-ai/dsh/lib/bin.js',
     urls: ['https://mirror/x.tar.gz'],
   })
-  check(script.includes('ARTEFACT_NOT_EXECUTABLE') && script.includes('exit 7'),
+  check(script.includes('ARTEFACT_NOT_EXECUTABLE'),
     'an unpacked tree with a non-executable payload fails the install by name')
   check(/\[ ! -x "\$candidate" \]/u.test(script),
     'and it decides that by testing the executable bit, not by trusting chmod')
   check(script.includes('ripgrep-linux-x64/bin/rg'),
     'the verification names the file whose absence broke search')
-  // Order matters: the check must run before the staging tree is renamed into place, or the
-  // rollback has nothing to restore and the broken tree is already serving.
+  // Order matters: the check must run before the staging tree becomes live, or the broken tree
+  // is already serving and the rollback has nothing better to offer.
   const verifyAt = script.indexOf('ARTEFACT_NOT_EXECUTABLE')
-  const swapAt = script.indexOf('mv "$staging" "$runtime"')
+  const swapAt = script.indexOf('ln -sfn "runtime.$next" "$runtime"')
   check(verifyAt > 0 && swapAt > verifyAt,
-    'the verification runs before the staging tree replaces the live runtime',
+    'the verification runs before the staging tree becomes the live runtime',
     `${String(verifyAt)} < ${String(swapAt)}`)
 }
 
@@ -677,6 +748,24 @@ const runShellScript = (shell, directory, text) => {
   // The Session log lives in the shared DSH home on purpose: two roots on one machine
   // are two brains, not two machines, and each Session record names its own cwd.
   check(second.home === first.home, 'both roots share the machine\'s DSH home', first.home)
+
+  // ---- the live runtime is a symlink, and the layout says so ------------------
+  // `runtime` stays the one path every reader uses (the launch line, the CLI, the stamp):
+  // resolving a generation at read time would let two readers disagree about which tree is
+  // live. The generation directories are spelled separately so a caller that has to tell
+  // "the link" from "what it points at" can — the liveness probe must not follow a broken
+  // target and call it alive.
+  check(first.runtime === first.runtimeLink,
+    'the live path is the same string under both names, so nothing has to guess', first.runtimeLink)
+  check(first.generationPrefix === '~/.dsh-remote-node-harness/runtime.',
+    'generations are named runtime.<n> beside the link', first.generationPrefix)
+  check(`${first.generationPrefix}7` !== first.runtime,
+    'and a generation can never collide with the link itself')
+  // The CLI is read *through* the symlink on purpose: `node <link>/node_modules/…/bin.js`
+  // resolves normally, and that keeps one path for the launcher, `inspectRuntime` and the
+  // rollback probe.
+  check(first.cli.startsWith(`${first.runtime}/`),
+    'the CLI path goes through the live link, not into a generation', first.cli)
 }
 
 // ---- the packing build, which the version cannot express -------------------
@@ -774,6 +863,12 @@ const runShellScript = (shell, directory, text) => {
 // together with the ability to install the upstream release (ADR-0007).
 {
   const { RemoteHost } = await import('../src/remote/daemon.js')
+  // The scripts answer in **one JSON object on their last stdout line** (see
+  // `parseScriptResult`), so the stub answers the same way. Returning exit codes instead would
+  // test the parser against a shape no script produces.
+  const installedLine = extra => JSON.stringify({ ok: true, code: SCRIPT_CODES.INSTALLED, stage: 'done', version: '0.2.2-rc.3', ...extra })
+  const failedLine = (code, stage = 'verify', extra = {}) => JSON.stringify({ ok: false, code, stage, ...extra })
+  const verdictLine = code => JSON.stringify({ ok: true, code, stage: 'rollback' })
   const stub = (answers = {}) => {
     const calls = []
     return {
@@ -782,7 +877,11 @@ const runShellScript = (shell, directory, text) => {
         calls.push(request.argv.join(' '))
         const script = request.argv.at(-1) ?? ''
         const answer = Object.entries(answers).find(([needle]) => script.includes(needle))?.[1]
-        return { code: answer?.code ?? 0, stdout: answer?.stdout ?? '', stderr: answer?.stderr ?? '' }
+        return {
+          code: answer?.code ?? 0,
+          stdout: answer?.stdout ?? installedLine(),
+          stderr: answer?.stderr ?? '',
+        }
       },
     }
   }
@@ -801,9 +900,10 @@ const runShellScript = (shell, directory, text) => {
     return { error, result, calls: connection.calls, logs }
   }
   const ranNpm = calls => calls.some(call => call.includes('npm install'))
-  // The rollback judgement is the one command that probes the live tree. Counting it is how
-  // these tests tell "the rollback ran" from "the rollback was skipped", which is the defect.
-  const rollbacks = calls => calls.filter(call => call.includes('node "$cli" --version'))
+  // The rollback judgement is the one command that probes the live generation by starting it.
+  // Counting it is how these tests tell "the rollback ran" from "the rollback was skipped",
+  // which is the defect.
+  const rollbacks = calls => calls.filter(call => call.includes('generation_works'))
 
   // 1. A successful download is the whole install, and it never touches a registry.
   const installed = await attempt({})
@@ -816,7 +916,9 @@ const runShellScript = (shell, directory, text) => {
   //    **not** fall back to the upstream release: that tree would write this build's stamp
   //    and read as "in step" forever, pinning the node to the upstream runtime after one
   //    network blip.
-  const refused = await attempt({ answers: { 'ARTEFACT_UNAVAILABLE': { code: 3, stderr: 'ARTEFACT_UNAVAILABLE' } } })
+  const refused = await attempt({
+    answers: { 'ARTEFACT_UNAVAILABLE': { stdout: failedLine(SCRIPT_CODES.ARTEFACT_UNAVAILABLE, 'download') } },
+  })
   check(refused.error !== undefined, 'a missing artefact fails the connect')
   const refusedText = String(refused.error?.message)
   check(refusedText.includes('could not be installed'), 'with a message that says so',
@@ -825,6 +927,15 @@ const runShellScript = (shell, directory, text) => {
     refusedText.slice(-160))
   check(!ranNpm(refused.calls),
     'and never reaching for the upstream release, which would pin the node to it')
+  // The distinction the JSON contract makes possible: a script that said nothing at all is
+  // **not** read as "no source served it". It takes the rollback branch and is reported.
+  const silent = await attempt({ answers: { 'ARTEFACT_UNAVAILABLE': { code: 1, stdout: '', stderr: 'Killed' } } })
+  check(!String(silent.error?.message).includes('no source served'),
+    'a script that printed no result line is not mistaken for a missing artefact',
+    String(silent.error?.message).slice(0, 90))
+  check(silent.error !== undefined, 'it is still a failure')
+  check(rollbacks(silent.calls).length === 1, 'and it still asks the rollback judgement',
+    String(rollbacks(silent.calls).length))
 
   // 3. Every URL the artefact script is given comes from the one configured source, and none
   //    starts at GitHub itself: GitHub direct is ~27 KB/s, which reads as a hang.
@@ -837,20 +948,25 @@ const runShellScript = (shell, directory, text) => {
 
   // 4. A checksum mismatch is *not* the same thing. The bytes arrived and were wrong, so the
   //    rollback judgement runs and the failure is reported. Every check the install script does
-  //    (checksum, unpack, shape, executable bit) happens **before** the rename, so the live tree
-  //    is intact and the judgement must keep it — restoring `$runtime.previous` here would
-  //    downgrade the node by one release. Measured on a real node: runtime=v2-good,
+  //    (checksum, unpack, shape, executable bit) happens **before** the commit line, so the live
+  //    generation is intact and the judgement must keep it — restoring the previous generation
+  //    here would downgrade the node by one release. Measured on a real node: runtime=v2-good,
   //    runtime.previous=v1-old, one old-style rollback later the node ran v1-old.
   const mismatch = await attempt({
-    answers: { 'ARTEFACT_CHECKSUM_MISMATCH': { code: 4, stderr: 'ARTEFACT_CHECKSUM_MISMATCH a b' } },
+    answers: {
+      'ARTEFACT_CHECKSUM_MISMATCH': { stdout: failedLine(SCRIPT_CODES.ARTEFACT_CHECKSUM_MISMATCH, 'verify', { want: 'aa', got: 'bb' }) },
+      'generation_works': { stdout: verdictLine(ROLLBACK_VERDICTS.KEPT_CURRENT) },
+    },
   })
   check(rollbacks(mismatch.calls).length === 1,
     'a bad checksum asks for the rollback judgement exactly once',
     String(rollbacks(mismatch.calls).length))
-  check(mismatch.calls.some(call => call.includes('node "$cli" --version')),
-    'and that judgement starts the live tree instead of moving `.previous` in blindly')
+  check(mismatch.calls.some(call => call.includes('generation_works "$live"')),
+    'and that judgement starts the live generation instead of switching blindly')
   check(String(mismatch.error?.message).includes('installing the resident host failed'),
     'and reports the checksum rather than the source list')
+  check(String(mismatch.error?.message).includes('ARTEFACT_CHECKSUM_MISMATCH'),
+    'naming the code the script reported', String(mismatch.error?.message).slice(0, 120))
   // The verdict is part of the thrown message, not just a log line: a rollback that failed is
   // the worst outcome of the three and must not read like an ordinary install error.
   check(String(mismatch.error?.message).includes('rollback'),
@@ -859,11 +975,14 @@ const runShellScript = (shell, directory, text) => {
 
   // 4b. An archive that arrived without its `.sha256` is also a failure, and it must *not* read
   //     as "no source served it": the bytes are there, they just cannot be trusted. That
-  //     distinction is the whole reason this exit code exists — `ARTEFACT_CHECKSUM_UNAVAILABLE`
-  //     deliberately does not contain the substring `ARTEFACT_UNAVAILABLE`, so it takes the
-  //     rollback branch instead of the "try the next URL" branch.
+  //     distinction used to be a naming convention (the longer sentinel deliberately did not
+  //     contain the shorter one); it is now a `code` comparison, so it cannot be broken by a
+  //     rename.
   const noSidecar = await attempt({
-    answers: { 'ARTEFACT_CHECKSUM_UNAVAILABLE': { code: 6, stderr: 'ARTEFACT_CHECKSUM_UNAVAILABLE' } },
+    answers: {
+      'ARTEFACT_CHECKSUM_UNAVAILABLE': { stdout: failedLine(SCRIPT_CODES.ARTEFACT_CHECKSUM_UNAVAILABLE, 'verify') },
+      'generation_works': { stdout: verdictLine(ROLLBACK_VERDICTS.KEPT_CURRENT) },
+    },
   })
   check(noSidecar.error !== undefined, 'an archive with no checksum fails the connect')
   check(rollbacks(noSidecar.calls).length === 1,
@@ -872,16 +991,16 @@ const runShellScript = (shell, directory, text) => {
     'it is not reported as a missing artefact, because the bytes did arrive')
   check(!ranNpm(noSidecar.calls), 'and it never reaches for a registry')
 
-  // 4c. The verdict the node reports decides the sentence, and each of the three is surfaced.
+  // 4c. The code the node reports decides the sentence, and each of the three is surfaced.
   for (const [verdict, expected] of [
     [ROLLBACK_VERDICTS.KEPT_CURRENT, 'nothing was changed'],
-    [ROLLBACK_VERDICTS.ROLLED_BACK, 'previous release was restored'],
+    [ROLLBACK_VERDICTS.ROLLED_BACK, 'previous generation was restored'],
     [ROLLBACK_VERDICTS.NOTHING_TO_ROLL_BACK, 'no previous runtime'],
   ]) {
     const answer = await attempt({
       answers: {
-        'ARTEFACT_SHAPE_UNEXPECTED': { code: 5, stderr: 'ARTEFACT_SHAPE_UNEXPECTED' },
-        'node "$cli" --version': { code: 0, stdout: `${verdict}\n` },
+        'ARTEFACT_SHAPE_UNEXPECTED': { stdout: failedLine(SCRIPT_CODES.ARTEFACT_SHAPE_UNEXPECTED, 'unpack') },
+        'generation_works': { stdout: verdictLine(verdict) },
       },
     })
     check(String(answer.error?.message).includes(expected),
@@ -896,15 +1015,12 @@ const runShellScript = (shell, directory, text) => {
   {
     /** @type {string[]} */
     const logs = []
-    const connection = stub({
-      'ARTEFACT_SHAPE_UNEXPECTED': { code: 5, stderr: 'ARTEFACT_SHAPE_UNEXPECTED' },
-      'node "$cli" --version': { code: 0, stdout: `${ROLLBACK_VERDICTS.KEPT_CURRENT}\n` },
-    })
+    const connection = stub()
     connection.exec = (request => {
       const script = request.argv.at(-1) ?? ''
-      if (script.includes('node "$cli" --version')) return Promise.reject(new Error('ssh exec timed out after 120000ms'))
+      if (script.includes('generation_works')) return Promise.reject(new Error('ssh exec timed out after 120000ms'))
       connection.calls.push(request.argv.join(' '))
-      return Promise.resolve({ code: 5, stdout: '', stderr: 'ARTEFACT_SHAPE_UNEXPECTED' })
+      return Promise.resolve({ code: 0, stdout: failedLine(SCRIPT_CODES.ARTEFACT_SHAPE_UNEXPECTED, 'unpack'), stderr: '' })
     })
     const host = new RemoteHost({ connection, version: '0.2.2-rc.3', log: message => logs.push(message) })
     let error
@@ -916,10 +1032,10 @@ const runShellScript = (shell, directory, text) => {
   }
 
   // 4e. **A transport failure has no exit code at all.** A timeout or a dropped channel makes
-  //     `exec` reject, so the `code === 0` check and the rollback branch used to be skipped
-  //     entirely and the rejection flew straight out of `install()`. The remote `sh` may already
-  //     have swapped the tree in before the channel died, so the same judgement is asked for
-  //     and the failure is reported with context.
+  //     `exec` reject, so a `code === 0` check and its rollback branch would be skipped entirely
+  //     and the rejection would fly straight out of `install()`. The remote `sh` may already
+  //     have committed the new generation before the channel died, so the same judgement is
+  //     asked for and the failure is reported with context.
   {
     let rollbackCalls = 0
     /** @type {string[]} */
@@ -928,9 +1044,9 @@ const runShellScript = (shell, directory, text) => {
       calls: [],
       async exec(request) {
         const script = request.argv.at(-1) ?? ''
-        if (script.includes('node "$cli" --version')) {
+        if (script.includes('generation_works')) {
           rollbackCalls += 1
-          return { code: 0, stdout: `${ROLLBACK_VERDICTS.KEPT_CURRENT}\n`, stderr: '' }
+          return { code: 0, stdout: verdictLine(ROLLBACK_VERDICTS.KEPT_CURRENT), stderr: '' }
         }
         connection.calls.push(request.argv.join(' '))
         throw Object.assign(new Error('ssh exec timed out after 1860000ms'), { sshCategory: 'timeout' })
@@ -971,6 +1087,168 @@ const runShellScript = (shell, directory, text) => {
   check(old.error !== undefined, 'a node below the Node floor is refused')
   check(!old.calls.some(call => call.includes('dsh-0.2.2-rc.3-')),
     'before any archive is downloaded')
+}
+
+// ---- the resident host is identified, not merely assumed alive --------------
+// `kill -0 <pid>` answers "does this pid exist", and a pid is reused after a reboot, so a
+// `status.json` read back from a machine that restarted pointed at whatever now held that
+// number and the node looked connected. Two facts are now required, and both are checked here
+// against a stub that answers the probe the way a real node would.
+{
+  const { RemoteHost, remoteLayout } = await import('../src/remote/daemon.js')
+  const layout = remoteLayout('~/.dsh-fleet')
+  // The layout value, not the `NODE_PROFILE` constant: `~/.dsh-fleet` launches
+  // `--profile rnh-dsh-fleet`, and comparing against `rnh` made every connect stop a healthy
+  // host and start it again (measured on a real node: status.json said "rnh" while the host
+  // ran --profile rnh-dsh-fleet).
+  const probeAnswer = (alive, cmdline, starttime, proc = true) => ({
+    code: 0,
+    stdout: `alive=${alive ? 'yes' : 'no'}\nproc=${proc ? 'yes' : 'no'}\ncmdline=${cmdline}\nstarttime=${starttime ?? ''}\n`,
+    stderr: '',
+  })
+  const hostWith = answer => new RemoteHost({
+    connection: { calls: [], exec: async () => answer },
+    version: '0.2.2-rc.3',
+    layout,
+  })
+
+  const good = `node ${layout.cli} --profile ${layout.profileName} --host 127.0.0.1 --port 0 --no-open`
+  check(await hostWith(probeAnswer(true, good, '123456')).isAlive(4242, { profile: layout.profileName, starttime: '123456' }) === true,
+    'a pid whose command line names this node’s profile and whose start time matches is the host')
+  check(await hostWith(probeAnswer(true, good, '999999')).isAlive(4242, { profile: layout.profileName, starttime: '123456' }) === false,
+    'the same command line with a different start time is a reused pid, not the host')
+  check(await hostWith(probeAnswer(true, `node ${layout.cli} --profile rnh --host 127.0.0.1`, '123456')).isAlive(4242, { profile: layout.profileName, starttime: '123456' }) === false,
+    'a host started with the default profile is not this node’s host')
+  check(await hostWith(probeAnswer(true, 'node /somewhere/else/bin.js --profile rnh-dsh-fleet', '1')).isAlive(4242, { profile: layout.profileName, starttime: '1' }) === true,
+    'the profile name is matched as `--profile <name>`, not as a bare substring of the path')
+  check(await hostWith(probeAnswer(true, `node ${layout.cli} --profile rnh-dsh-fleet-extra`, '1')).isAlive(4242, { profile: layout.profileName, starttime: '1' }) === false,
+    'so a longer profile name is not mistaken for this one')
+  check(await hostWith(probeAnswer(false, '', undefined)).isAlive(4242, { profile: layout.profileName }) === false,
+    'a pid that does not exist is not alive, whatever the record says')
+  check(await hostWith(probeAnswer(true, good, undefined)).isAlive(4242, { profile: layout.profileName }) === true,
+    'a record written before start times existed is accepted on the command line alone')
+  // No procfs (darwin): the command line comes from `ps`, the start time does not exist. The
+  // degradation is deliberate and named — refusing these would restart every Mac node once.
+  check(await hostWith(probeAnswer(true, good, undefined, false)).isAlive(4242, { profile: layout.profileName, starttime: '123456' }) === true,
+    'without procfs the command line is the strongest evidence available, and it is accepted')
+  check(await hostWith(probeAnswer(true, 'node unrelated.js', undefined, false)).isAlive(4242, { profile: layout.profileName }) === false,
+    'but an unrelated process is still refused there')
+  check(await hostWith(probeAnswer(true, good, '1')).isAlive(0) === false, 'pid 0 is never a host')
+  check(await hostWith(probeAnswer(true, good, '1')).isAlive(1.5) === false, 'and neither is a non-integer')
+
+  // ---- what `status.json` records, and what `stop` looks for ----------------
+  // The record has to match the launch line, or the next connect cannot recognise its own
+  // host and restarts it. That is the whole "host restarts on every connect" defect.
+  {
+    const calls = []
+    const connection = {
+      calls,
+      async exec(request) {
+        const script = request.argv.at(-1) ?? ''
+        calls.push(script)
+        if (script.includes('cat ') && script.includes('status.json')) return { code: 0, stdout: '{}', stderr: '' }
+        if (script.includes('setsid nohup')) {
+          return { code: 0, stdout: 'dsh web: http://127.0.0.1:41000/?token=tok\n', stderr: '' }
+        }
+        if (script.includes('run/pid')) return { code: 0, stdout: '777\n', stderr: '' }
+        if (script.includes('/proc/')) {
+          return {
+            code: 0,
+            stdout: `alive=yes\nproc=yes\ncmdline=node ${layout.cli} --profile ${layout.profileName} --host 127.0.0.1\nstarttime=424242\n`,
+            stderr: '',
+          }
+        }
+        return { code: 0, stdout: '', stderr: '' }
+      },
+    }
+    const host = new RemoteHost({ connection, version: '0.2.2-rc.3', layout })
+    const serving = await host.ensureServing()
+    check(serving.profile === layout.profileName,
+      'status.json records the profile the host was actually started with', serving.profile)
+    check(serving.profile !== 'rnh',
+      'which for a non-default root is not the historical constant', serving.profile)
+    check(serving.starttime === '424242',
+      'and the start time that makes the pid identify a launch rather than a number', serving.starttime)
+    const launch = calls.find(script => script.includes('setsid nohup')) ?? ''
+    check(launch.includes(`--profile ${layout.profileName}`),
+      'the launch line and the record agree on the profile', layout.profileName)
+
+    // A record that matches is adopted without restarting: this is what stops the bounce.
+    const second = []
+    let statusText = JSON.stringify(serving)
+    const adopting = new RemoteHost({
+      connection: {
+        calls: second,
+        async exec(request) {
+          const script = request.argv.at(-1) ?? ''
+          second.push(script)
+          if (script.includes('status.json')) return { code: 0, stdout: statusText, stderr: '' }
+          if (script.includes('/proc/')) {
+            return { code: 0, stdout: `alive=yes\nproc=yes\ncmdline=node ${layout.cli} --profile ${layout.profileName}\nstarttime=${serving.starttime}\n`, stderr: '' }
+          }
+          return { code: 0, stdout: '', stderr: '' }
+        },
+      },
+      version: '0.2.2-rc.3',
+      layout,
+    })
+    const adopted = await adopting.ensureServing()
+    check(adopted.pid === serving.pid, 'a matching record is adopted rather than restarted', String(adopted.pid))
+    check(!second.some(script => script.includes('setsid nohup')),
+      'so no second host is launched on a plain reconnect')
+
+    // The reverse: a record from an older build says `rnh` while this root launches
+    // `rnh-dsh-fleet`. It must be replaced once, not trusted forever.
+    statusText = JSON.stringify({ ...serving, profile: 'rnh' })
+    const replacing = new RemoteHost({
+      connection: {
+        calls: [],
+        async exec(request) {
+          const script = request.argv.at(-1) ?? ''
+          if (script.includes('status.json')) return { code: 0, stdout: statusText, stderr: '' }
+          if (script.includes('setsid nohup')) return { code: 0, stdout: 'dsh web: http://127.0.0.1:41001/?token=tok2\n', stderr: '' }
+          if (script.includes('run/pid')) return { code: 0, stdout: '888\n', stderr: '' }
+          if (script.includes('/proc/')) return { code: 0, stdout: 'alive=no\nproc=unknown\ncmdline=\nstarttime=\n', stderr: '' }
+          return { code: 0, stdout: '', stderr: '' }
+        },
+      },
+      version: '0.2.2-rc.3',
+      layout,
+    })
+    const replaced = await replacing.ensureServing()
+    check(replaced.profile === layout.profileName,
+      'a record from an older launch shape is replaced once and rewritten correctly',
+      replaced.profile)
+  }
+
+  // ---- `stop` must be able to find a non-default node's host ---------------
+  // The fallback pattern used to be the literal `dsh-remote-node-harness/runtime/…`, so a node
+  // under `~/.dsh-fleet` could never be killed by it — and its `status.json` was deleted
+  // anyway, which is worse than not trying: the host kept running with nothing pointing at it.
+  {
+    const calls = []
+    const host = new RemoteHost({
+      connection: {
+        calls,
+        async exec(request) {
+          calls.push(request.argv.at(-1) ?? '')
+          if ((request.argv.at(-1) ?? '').includes('status.json') && (request.argv.at(-1) ?? '').includes('cat')) {
+            return { code: 0, stdout: '{}', stderr: '' }
+          }
+          return { code: 0, stdout: '', stderr: '' }
+        },
+      },
+      version: '0.2.2-rc.3',
+      layout,
+    })
+    await host.stop()
+    const pattern = calls.find(script => script.includes('pkill')) ?? ''
+    check(pattern.includes('$HOME/.dsh-fleet/runtime'),
+      'the pkill fallback names this node’s own root, not the default one', pattern.slice(0, 120))
+    check(pattern.includes('bin[.]js'),
+      'and keeps the bracketed form that stops pkill from matching its own command line',
+      pattern.includes('bin[.]js'))
+  }
 }
 
 if (failures.length > 0) {

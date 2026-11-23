@@ -88,15 +88,47 @@ const MiB = 1024 * 1024
 // ---- 4. the archive path is derived the way the installer derives it -----
 {
   const layout = { runtime: '/root/.dsh-fleet/runtime' }
-  check(archiveFor(layout, '0.2.2-rc.5') === '/root/.dsh-fleet/runtime-0.2.2-rc.5.tar.gz',
+  check(archiveFor(layout, '0.2.2-rc.5', '/root') === '/root/.dsh-fleet/runtime-0.2.2-rc.5.tar.gz',
     'the watched archive is beside the runtime, as the install script writes it',
-    archiveFor(layout, '0.2.2-rc.5'))
-  // The script does `archive="$(dirname "$runtime")/runtime-${version}.tar.gz"`, so a runtime
-  // with a trailing separator must not produce a doubled slash — the watch would then look at
-  // a path the download never touches and report a permanent zero.
+    archiveFor(layout, '0.2.2-rc.5', '/root'))
+  // The script does `archive="$base/runtime-${version}.tar.gz"` with `base` already absolute, so
+  // a runtime with a trailing separator must not produce a doubled slash — the watch would then
+  // look at a path the download never touches and report a permanent zero.
   const trailing = { runtime: '/root/.dsh-fleet/runtime/' }
-  check(!archiveFor(trailing, '1').includes('//'),
-    'a trailing separator does not double the slash', archiveFor(trailing, '1'))
+  check(!archiveFor(trailing, '1', '/root').includes('//'),
+    'a trailing separator does not double the slash', archiveFor(trailing, '1', '/root'))
+
+  // ---- the `~` that made every progress bar read 0 B --------------------------
+  // The layout is written the way a person types it, and the watcher used to build
+  // `'~/…/runtime-x.tar.gz'` and send it inside single quotes — where `~` is a literal tilde.
+  // `stat` therefore answered "no such file" for the whole download and the card showed
+  // `0 B` on a link that was working. The path is now absolute before it is quoted, using the
+  // home the probe reported.
+  const tilde = { runtime: '~/.dsh-remote-node-harness/runtime' }
+  check(archiveFor(tilde, '0.2.2') === undefined,
+    'a ~-rooted layout with no known home gives no path rather than a literal tilde',
+    String(archiveFor(tilde, '0.2.2')))
+  check(archiveFor(tilde, '0.2.2', '/home/deploy') === '/home/deploy/.dsh-remote-node-harness/runtime-0.2.2.tar.gz',
+    'with the home known it becomes an absolute path', archiveFor(tilde, '0.2.2', '/home/deploy'))
+  check(archiveFor(tilde, '0.2.2', '/home/deploy/') === '/home/deploy/.dsh-remote-node-harness/runtime-0.2.2.tar.gz',
+    'and a home with a trailing separator does not double the slash',
+    archiveFor(tilde, '0.2.2', '/home/deploy/'))
+  check(archiveFor(tilde, '0.2.2', '') === undefined,
+    'an empty home is unknown, not "the current directory"')
+  check(archiveFor(tilde, '0.2.2', 'relative/home') === undefined,
+    'a home that is not absolute is refused: the node reports $HOME as an absolute path')
+  check(!String(archiveFor(tilde, '0.2.2', '/home/deploy')).includes('~'),
+    'no path that reaches a single-quoted shell word ever contains a tilde')
+
+  // A watch on an unresolvable path is a no-op, not a stream of `0 B` updates: reporting zero
+  // is the one answer that looks like a stalled download when it is really a path bug.
+  let called = 0
+  const stop = watchTransfer({ exec: async () => { called += 1; throw new Error('must not run') } }, {
+    archive: undefined, intervalMs: 5, onUpdate: () => { called += 1 },
+  })
+  await new Promise(resolve => setTimeout(resolve, 30))
+  stop()
+  check(called === 0, 'a watch with no resolvable archive measures nothing at all', String(called))
 }
 
 // ---- 5. a source that will not say its size gives no total ---------------
@@ -115,6 +147,17 @@ const MiB = 1024 * 1024
   check(await totalBytes(broken, ['https://example.invalid/a.tar.gz']) === undefined,
     'a probe that throws is not a failure of the transfer it was measuring')
   check(await totalBytes(loud, []) === undefined, 'no URL means nothing to measure')
+
+  // `-L` is what makes a CNB total exist at all: the anonymous GET answers 302, and a HEAD
+  // without follow prints the redirect's headers, which carry no `content-length`. The tradeoff
+  // is unchanged — no total still means no ETA — so this is only about not answering
+  // "unknown" for a source that does say.
+  const seen = []
+  const recorder = { exec: async request => { seen.push(request.argv.at(-1) ?? ''); return { code: 0, stdout: '', stderr: '', truncated: false } } }
+  await totalBytes(recorder, ['https://cnb.cool/x/a.tar.gz'])
+  check(seen.some(script => /curl -sIL/u.test(script)),
+    'the size probe follows redirects, because the source answers 302 first',
+    seen.join('\n').split('\n').find(line => line.includes('curl')) ?? '(none)')
 }
 
 // ---- 6. the watch reports, then stops ------------------------------------

@@ -108,7 +108,8 @@ const runtime = `${root}/runtime`
 const cli = `${runtime}/node_modules/@deepseek-ai/dsh/lib/bin.js`
 
 // Import the real script generator: the test must run the bytes the plugin would.
-const { installScript, artefactUrls, rollbackScript } = await import('../src/remote/artefact.js')
+const { installScript, artefactUrls, rollbackScript, parseScriptResult, ROLLBACK_VERDICTS, SCRIPT_CODES }
+  = await import('../src/remote/artefact.js')
 const urls = artefactUrls({ version, platform })
 const script = installScript({ version, runtime, cli, urls })
 
@@ -120,32 +121,63 @@ const started = Date.now()
 const installed = await nodeRun(`sh -c '${shellQuote(script)}'`, { timeoutMs: 1_900_000 })
 const elapsed = Math.round((Date.now() - started) / 1000)
 log(`install took ${String(elapsed)}s`)
-// The script reports its own failures on stderr — `ARTEFACT_UNAVAILABLE` (the download
-// never completed), `ARTEFACT_CHECKSUM_MISMATCH`, `ARTEFACT_SHAPE_UNEXPECTED` (the archive
-// does not hold the tree the script expects). Reading only stdout made a 465 s truncated
-// download look like a silent success that left an empty directory, which is why this
-// branch reports the exit code and stderr first.
-if (installed.code !== 0 || installed.stderr.trim().length > 0) {
-  log(`install exited ${String(installed.code)}${installed.timedOut ? ' (it was cut off by this test\'s own limit)' : ''}`)
-  for (const line of installed.stderr.trim().split('\n').slice(-6)) log(`  stderr: ${line.trim()}`)
+// The script answers in **one JSON object on its last stdout line** on every exit path, and
+// the exit code carries no meaning (see `parseScriptResult`). Reading the exit code and
+// searching stderr was the old contract: a `set -e` abort or a killed `curl` exited with a
+// number no branch knew, and `ARTEFACT_UNAVAILABLE` was found by substring — which meant a
+// truncated stderr could silently change a failure's category.
+const result = parseScriptResult(installed)
+if (!result.parsed) {
+  log(`the install printed no result line (exit ${String(installed.code)}${installed.timedOut ? ', cut off by this test\'s own limit' : ''})`)
+  for (const line of `${installed.stdout}\n${installed.stderr}`.trim().split('\n').slice(-8)) log(`  output: ${line.trim()}`)
 }
-// Exit 3 is the script's own vocabulary for "this network cannot get the artefact"
-// (`ARTEFACT_UNAVAILABLE`): the line failed the speed floor, or no candidate URL answered.
-// That is a condition of *this deployment*, not a defect in the script — the same code
-// installs fine on a node that can reach the release. Reporting it as a failure would make
-// a network problem look like a broken plugin, and reporting it as a pass would be a lie,
-// so it is a SKIP with the reason the runner prints.
-if (installed.code === 3 && /ARTEFACT_UNAVAILABLE/u.test(installed.stderr)) {
-  log(`SKIP: this node could not download the release artefact — ${installed.stderr.trim().replaceAll('\n', ' ').slice(-160)}`)
+// `ARTEFACT_UNAVAILABLE` means this network could not get the artefact: the line failed the
+// speed floor, or no candidate URL answered. That is a condition of *this deployment*, not a
+// defect in the script — the same code installs fine on a node that can reach the release.
+// Reporting it as a failure would make a network problem look like a broken plugin, and
+// reporting it as a pass would be a lie, so it is a SKIP with the reason the runner prints.
+if (result.code === SCRIPT_CODES.ARTEFACT_UNAVAILABLE) {
+  log(`SKIP: this node could not download the release artefact — ${(result.detail || result.tail).replaceAll('\n', ' ').slice(-160)}`)
   await nodeExec(`rm -rf ${root}`)
   process.exit(3)
 }
-const lastLine = installed.stdout.trim().split('\n').at(-1) ?? ''
-check(installed.code === 0 && lastLine.includes(version),
-  'the installed CLI reports the requested version',
-  `exit ${String(installed.code)}: ${lastLine || installed.stderr.trim().split('\n').at(-1) || 'no output'}`)
+check(result.ok && result.code === SCRIPT_CODES.INSTALLED,
+  'the install reports INSTALLED',
+  `code=${result.code} stage=${result.stage}${result.detail === '' ? '' : ` detail=${result.detail}`}${result.tail === '' ? '' : ` tail=${result.tail.slice(-160)}`}`)
+check(result.version === version,
+  'and the version the tree it made live reports',
+  `${String(result.version)} vs ${version}`)
 
 // ---- what the install left behind -----------------------------------------
+// Under the generation layout the live path is a **symlink** to `runtime.<n>`, and exactly one
+// previous generation is kept beside it. The old assertions looked for `runtime.previous`,
+// which this layout no longer creates: keeping a numbered generation is what makes the switch
+// one `ln -sfn` instead of three renames with a window in the middle where no runtime exists.
+const shape = await nodeExec(
+  `test -L ${runtime} && echo link=yes || echo link=no; `
+  + `echo target=$(readlink ${runtime} 2>/dev/null); `
+  + `echo gens=$(cd ${root} && ls -d runtime.* 2>/dev/null | wc -l); `
+  + `echo stamp=$(cat ${runtime}/.rnh-artefact.json 2>/dev/null)`,
+)
+const shapeField = name => shape.trim().split('\n')
+  .map(line => line.trim())
+  .find(line => line.startsWith(`${name}=`))
+  ?.slice(name.length + 1)
+check(shapeField('link') === 'yes',
+  'the live runtime is a symlink to a numbered generation', shapeField('link'))
+check(/^runtime\.\d+$/u.test(shapeField('target') ?? ''),
+  'and it points at a generation, not at a path inside one', shapeField('target'))
+check(Number(shapeField('gens')) <= 2,
+  'at most two generations exist: the live one and the one before it',
+  String(shapeField('gens')))
+let stamp
+try {
+  stamp = JSON.parse(shapeField('stamp') ?? '')
+} catch {
+  stamp = undefined
+}
+check(stamp?.build !== undefined,
+  'the tree carries the build stamp, without which every connect reinstalls', shapeField('stamp'))
 // Each line is a labelled answer rather than a bare value: a failed `test` prints
 // nothing, and an unlabelled empty line silently shifts every later field.
 const tree = await nodeExec(
@@ -224,26 +256,39 @@ check(helped.trim().length > 0 && !/Error|Cannot find/u.test(helped),
   'and its CLI resolves its own dependencies', helped.trim().split('\n')[0])
 
 // ---- a second install is idempotent --------------------------------------
-const again = await nodeRun(`sh -c '${shellQuote(script)}'`, { timeoutMs: 1_900_000 })
-if (again.code !== 0) log(`the second install exited ${String(again.code)}: ${again.stderr.trim().split('\n').at(-1) ?? ''}`)
-check(again.code === 0 && (again.stdout.trim().split('\n').at(-1) ?? '').includes(version),
+const againRun = await nodeRun(`sh -c '${shellQuote(script)}'`, { timeoutMs: 1_900_000 })
+const again = parseScriptResult(againRun)
+if (!again.ok) log(`the second install reported ${again.code} at ${again.stage}: ${again.detail || again.tail}`)
+check(again.ok && again.code === SCRIPT_CODES.INSTALLED,
   'a second install replaces the first cleanly',
-  `exit ${String(again.code)}: ${again.stdout.trim().split('\n').at(-1) ?? again.stderr.trim().split('\n').at(-1) ?? 'no output'}`)
-const previous = await nodeExec(`test -d ${runtime}.previous && echo kept || echo none`)
-check(previous.trim() === 'kept', 'the replaced tree is kept for rollback', previous.trim())
+  `code=${again.code} stage=${again.stage}${again.generation === undefined ? '' : ` generation=${again.generation}`}`)
+const gensAfter = await nodeExec(`cd ${root} && ls -d runtime.* 2>/dev/null | sort -V | tr '\\n' ' '`)
+const generationNames = gensAfter.trim().split(/\s+/u).filter(name => /^runtime\.\d+$/u.test(name))
+check(generationNames.length === 2,
+  'the replaced generation is kept beside the new one, and only it', gensAfter.trim())
+// The tree that was live before this second install must still start: that is what makes it a
+// usable fallback rather than a directory that merely exists.
+const keptOk = generationNames.length === 2
+  ? await nodeExec(`node ${root}/${generationNames[0]}/node_modules/@deepseek-ai/dsh/lib/bin.js --version 2>&1 | tail -1`)
+  : ''
+check(keptOk.trim().includes(version),
+  'and that kept generation still starts', keptOk.trim())
 
 // ---- rollback keeps the live tree when it still runs -----------------------
 // The old assertion here was "rollback reports rolled-back". That was the defect in one line:
 // after a *successful* second install the live tree starts perfectly, so a rollback must keep it.
-// Unconditionally moving `.previous` in downgraded the node one release, and every failed
-// download (checksum, unpack, shape, executable bit — all before the rename) did exactly that.
-const rolled = await nodeRun(`sh -c '${shellQuote(rollbackScript(runtime))}'`)
-check(rolled.code === 0 && rolled.stdout.trim().includes('kept-current'),
-  'rollback keeps a live runtime that still starts', rolled.code === 0 ? rolled.stdout.trim() : `exit ${String(rolled.code)}: ${rolled.stderr.trim()}`)
+// Unconditionally switching to the previous generation downgraded the node one release, and
+// every failed download (checksum, unpack, shape, executable bit — all before the commit line)
+// did exactly that.
+const rolledRun = await nodeRun(`sh -c '${shellQuote(rollbackScript(runtime, cli))}'`, { timeoutMs: 120_000 })
+const rolled = parseScriptResult(rolledRun)
+check(rolled.code === ROLLBACK_VERDICTS.KEPT_CURRENT,
+  'rollback keeps a live runtime that still starts', `${rolled.code} at ${rolled.stage}`)
 const stillThere = await nodeExec(`test -f ${cli} && node ${cli} --version`)
 check(stillThere.trim().includes(version), 'and the runtime is still the one that was installed', stillThere.trim())
-const previousAfter = await nodeExec(`test -d ${runtime}.previous && echo kept || echo none`)
-check(previousAfter.trim() === 'kept', 'with the older tree untouched beside it', previousAfter.trim())
+const gensKept = await nodeExec(`cd ${root} && ls -d runtime.* 2>/dev/null | sort -V | tr '\\n' ' '`)
+check(gensKept.trim() === gensAfter.trim(),
+  'with the older generation untouched beside it', gensKept.trim())
 
 await nodeExec(`rm -rf ${root}`)
 log(`cleaned ${root}`)
