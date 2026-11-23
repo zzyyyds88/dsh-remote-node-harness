@@ -1,10 +1,33 @@
 # 节点侧重写设计（2026-11-23）
 
-> 状态：**待批**。本文是 `docs/adr` 级的设计文档，按 AGENTS §6「大任务先改设计并单独提交 `docs:`」写成；
-> 实现必须逐批落在本文的 §九 顺序上，不得跳批。
+> 状态：**已实施（批 0–批 5 全部落地）**。本文是 `docs/adr` 级的设计文档，按 AGENTS §6
+> 「大任务先改设计并单独提交 `docs:`」写成；实现逐批落在本文的 §九 顺序上。
+>
+> 三层验收结果与遗留项见 `packages/dsh-remote-node-harness/docs/ACCEPTANCE.zh.md`
+> 的 2026-11-23 一节；实现后的形状摘要见 `docs/ARCHITECTURE.md` §六之九。
 >
 > 真源优先级不变：`docs/GOAL.zh.md` > 本文 > `docs/ARCHITECTURE.md` > 其他。
 > 本文只回答「为什么必须重写、重写成什么形状、按什么顺序」；具体取舍的历史理由仍归 ADR。
+
+## 〇、实施结果（2026-11-23 收尾）
+
+批 0–批 5 全部落地，共 16 个提交。**批 0 的 12 条阻断缺陷**全部先复现再修，
+每条都有会在修复前变红的测试。三层验收（真节点 `probe-93`）：
+
+| 层 | 结果 |
+|---|---|
+| offline | **27 passed, 0 failed, 0 skipped** |
+| contract | **3 passed, 0 failed** |
+| e2e | **15 passed, 0 failed, 2 skipped**（两个 skip 带原因） |
+
+批 2 之后又补了一批，因为「office 那类缺陷不再复发」这个目标在批 2 时只覆盖了 office 一个实例：
+**凭据本身也是能力的一部分**，而「某个能力需要某把 key」这件事原来没有任何地方可以声明。
+补上后，`web_search`（`tool-web` 挂在三个预设里、需要 `DEEPSEEK_API_KEY`、而非 DeepSeek
+桌面推送 `[]` 个 ref）成为这个结构的第二个实例，且现在会在三处被检查：离线对账、
+生成物派生一致性、连接期报告。
+
+**没有做完的**（都写进了 ACCEPTANCE 的「没有验证到」）：手机端渲染、真机跨版本升级、
+真实浏览器失败态、`dropPackages()` 的键空间不对称、macOS 无 procfs 的降级路径。
 
 ## 一、问题的真实形状
 
@@ -352,10 +375,13 @@ src/
 
 ## 十、验收判据
 
-- **分层**（沿用项目现有分层，不新增层级）：offline 19 → +批 1 的闸门；contract 3；e2e 真节点。
+- **分层**（沿用项目现有分层，不新增层级）：offline（现 27 个）、contract（3 个）、e2e 真节点（17 个）。
 - **每条缺陷一个回归测试**，且测试必须在**修复前红**（否则测的不是那条缺陷）。
 - **真节点验收**：一台机器从「刚 SSH 连上」到「大脑在答话」，全程走新通道；首连（含插件安装）、升级（含故意制造的校验失败，断言**不降级**）、断线重连（断言 2/4/8/120 s 阶梯与 `attempt` 递增）、reinstall（断言 host 真的重启了）。
-- **能力可判定**：`GET /rnh/api/nodes` 返回 `capabilities.lock`，每项带 `state` 与 `offReason`；office 在关掉时必须显示 `off` 且节点工具目录里没有 `office_*`。
+- **能力可判定**：能力清单在 `capabilities.mjs` 里带 `verdict`/`host`/`credentials`，
+  离线对账断言每一处声明与它一致；**`GET /rnh/api/nodes` 的 `capabilities.lock`
+  没有实现** —— 能力状态目前通过 `provision.unmet`（连接期报告）与离线对账可见，
+  没有暴露成 HTTP 字段。这是本节唯一没做到的判据，记在 ACCEPTANCE 里。
 - **不许用旧的验收结果顶替**：本次重写涉及 `describe()` 字段集与 `state` 值域（新增 `recovering`/`stopping`/`terminated`），属公开 UI/API 契约变更，客户端必须同步改并重新截图。
 
 ## 十一、明确不做的
@@ -367,8 +393,16 @@ src/
 - **不顺手重构没有缺陷的模块**：`multipart.js` 已接近纯模块模板，只补大小上限；`transfer-progress` 的算术是对的（`transfer-unit` 25 条断言覆盖），只修路径解析。
 - **不删除一代备份**：`runtime.<n-1>` 是回滚能力，不是可以省的磁盘。改了符号链接模型之后它只在切换时被读，删了就没有退路。
 
-## 十二、待确认
+## 十二、当时的待确认项与最终决定
 
-1. **office 的取舍**：保留 = 装 `libreoffice-kit`（driver 3.7 MiB + 本平台引擎；wasm 回退 145 MiB，win32 189.7 MiB）；关掉 = 节点不宣告 office 工具。**推荐关掉**（省 145 MiB，且「宣告了但跑不了」比「没有这个能力」更糟）。这条影响 `ADR-0007` 的体积结论与 `ADR-0008` 的裁剪结论，需要重述。
-2. **`state` 值域新增三个值**是公开契约变更：客户端同步改是本次范围内的，但**手机端**（DSH Go 经中转）也会读到 `describe()` 的字段——它今天是否依赖 `state` 的四个值？本轮未验证手机侧。
-3. **`RUNTIME_BUILD` 之后是否要求「archive sha256 进发布清单」**：这会改变发布流程（发布时多生成一个清单文件），但也第一次让「戳证明树是谁打的」成立。
+1. **office 的取舍** —— **用户决定：保留能力、补齐引擎**。已实施：`RETAINED` 加
+   `@deepseek-ai/libreoffice-kit`（driver 3.9 MiB）与 `@deepseek-ai/libreoffice-kit-wasm`
+   （Linux 引擎 145.3 MiB），删除规则收窄成 `/^libreoffice-kit-(?:win32|darwin)-/`。
+   代价是制品变大；收益是三个 office 工具真的能用，而不是被宣告后每次都失败。
+   这条改变了 `ADR-0007` 的体积结论与 `ADR-0008` 的裁剪结论（待重述）。
+2. **`state` 值域新增三个值** —— 已按兼容优先处理：`recovering` 对外仍报 `idle` + `droppedAt`
+   （设置页本来就靠这个组合渲染「已断线，正在重连」），`stopping`/`terminated` 靠客户端的
+   未知值兜底。**手机侧仍未验证**，写在 ACCEPTANCE 的「没有验证到」里。
+3. **archive sha256 是否进发布清单** —— **未做**。这是发布流程变更（发布时多生成一个清单
+   文件），需要单独决定；今天的戳仍只能证明「谁写了戳」，不能证明「树是谁打的」。
+   留在 ACCEPTANCE 的遗留项里。
