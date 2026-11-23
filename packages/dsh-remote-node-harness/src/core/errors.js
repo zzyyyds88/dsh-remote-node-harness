@@ -144,10 +144,53 @@ const PHASE_CODES = Object.freeze({
 })
 
 /**
+ * The sentence `ssh2` raises when a host verifier answers "no".
+ *
+ * This string belongs to the **dependency**, not to this project: ssh2 v1.17.0's
+ * `lib/protocol/kex.js` hands it to `doFatalError(protocol, msg, 'handshake', …)` on both the
+ * callback path (`kex.js:1206`, thrown at `kex.js:1210`) and the synchronous-return path
+ * (`kex.js:1233`, thrown at `kex.js:1237`). `doFatalError` turns it into `new Error(msg)` with
+ * `level = 'handshake'` (`lib/protocol/utils.js:171-192`, via `makeError` at 141-151) and emits
+ * it from the client, so this project only ever receives the sentence — never the decision.
+ *
+ * It is matched as a **substring of the message**, tolerating a wrapper around it (`ssh handshake
+ * failed: Host denied (verification failed)`), because the phrase is specific to this one
+ * failure: grepping ssh2 v1.17.0 for it finds exactly the four lines above and nothing else, so
+ * no unrelated failure can contain it by accident. Re-check this on every `ssh2` upgrade: a
+ * reworded literal would put a refused host key back on the `check-network` path, which is a
+ * retry button that cannot help.
+ *
+ * This is the fallback, not the main path. The normal case is a **structured** mark: this
+ * project's own `hostVerifier` is the code that refused, so it stamps
+ * `sshCategory: 'host-key'` and that mark outranks any sentence (see `ssh/connection.js`).
+ */
+const SSH2_HOST_KEY_REJECTION = 'Host denied (verification failed)'
+
+/**
+ * True when `error` is ssh2's host-key rejection.
+ *
+ * Kept separate from the category check so "who decided" (a structured mark) stays
+ * distinguishable from "what it says" (a dependency's literal).
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isSsh2HostKeyRejection(error) {
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : ''
+  return message.includes(SSH2_HOST_KEY_REJECTION)
+}
+
+/**
  * Classify one connect failure.
  *
  * Order matters: an explicit `code` on the error wins (a throw site that knows exactly what
- * went wrong), then the SSH category (which `SshConnection` attaches), then the phase.
+ * went wrong), then the SSH category (which `SshConnection` attaches, and which outranks text
+ * because it comes from the code that decided), then ssh2's own host-key literal, then the
+ * phase.
+ *
+ * The literal sits **after the mark and before the phase** on purpose. ssh2 raises it during
+ * the handshake, when the node is in `probe`, whose fallback code is `ssh-network` — a
+ * retryable network fault. A refused host key is neither a network fault nor retryable; it is
+ * the one failure the person can only resolve by reviewing the key.
  *
  * @param {unknown} error
  * @param {{ phase?: string }} [context] - the phase the node was in when it threw.
@@ -155,7 +198,11 @@ const PHASE_CODES = Object.freeze({
  */
 export function classifyFailure(error, context = {}) {
   const detail = error instanceof Error ? error.message : String(error)
-  const code = explicitCode(error) ?? codeFromSsh(error) ?? PHASE_CODES[context.phase ?? ''] ?? 'unknown'
+  const code = explicitCode(error)
+    ?? codeFromSsh(error)
+    ?? (isSsh2HostKeyRejection(error) ? 'ssh-host-key' : undefined)
+    ?? PHASE_CODES[context.phase ?? '']
+    ?? 'unknown'
   const entry = ERROR_CODES[code] ?? ERROR_CODES.unknown
   return {
     code: ERROR_CODES[code] === undefined ? 'unknown' : code,

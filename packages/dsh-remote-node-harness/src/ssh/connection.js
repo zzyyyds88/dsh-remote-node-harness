@@ -11,6 +11,7 @@
  */
 import { createHash } from 'node:crypto'
 import { Client } from 'ssh2'
+import { ERROR_CODES, isSsh2HostKeyRejection } from '../core/errors.js'
 
 const READY_TIMEOUT_MS = 20_000
 const KEEPALIVE_INTERVAL_MS = 15_000
@@ -84,13 +85,55 @@ export const SSH_FAILURE = Object.freeze({
   UNKNOWN: 'unknown',
 })
 
-/** Classify one ssh2 error into a stable category. */
+/** Every category a mark may carry, except `unknown` (which never says anything). */
+const MARKABLE_CATEGORIES = new Set([
+  SSH_FAILURE.AUTH,
+  SSH_FAILURE.HOST_KEY,
+  SSH_FAILURE.TIMEOUT,
+  SSH_FAILURE.NETWORK,
+  SSH_FAILURE.CLOSED,
+  SSH_FAILURE.CHANNEL,
+  SSH_FAILURE.PROTOCOL,
+])
+
+/**
+ * The category an error already carries, when it names one this file knows.
+ *
+ * Two spellings are read because two writers exist: `toSshError` writes `category` and
+ * `sshCategory`, and a throw site that knows better may write either one.
+ * @param {unknown} error
+ * @returns {string | undefined}
+ */
+function markedCategory(error) {
+  const marked = Reflect.get(error ?? {}, 'sshCategory') ?? Reflect.get(error ?? {}, 'category')
+  return typeof marked === 'string' && MARKABLE_CATEGORIES.has(marked) ? marked : undefined
+}
+
+/**
+ * Classify one ssh2 error into a stable category.
+ *
+ * **A mark wins over any text.** The sentence is the weakest evidence available — ssh2 reuses
+ * one message for a whole class of failures, and a single sentence can name two causes at once
+ * (`Host denied (verification failed)` says nothing, while "host key … password …" says both).
+ * The code that *decided* is always more precise: our own `hostVerifier` refuses on a
+ * fingerprint mismatch and marks that failure `host-key`, and any throw site may set a mark.
+ *
+ * Only when nothing is marked does this read text, and the order below is load-bearing:
+ * **host key before auth**, because the auth pattern matches the word "password", which can
+ * appear in a host-key sentence too, and a refused host key must never be reported as a wrong
+ * credential (that would offer the wrong button and retry forever).
+ */
 export function classifySshError(error) {
+  const marked = markedCategory(error)
+  if (marked !== undefined) return marked
+  // ssh2's own rejection literal — the fallback for an error that carries no mark, i.e. one
+  // raised by something other than this file's verifier (see `isSsh2HostKeyRejection`).
+  if (isSsh2HostKeyRejection(error)) return SSH_FAILURE.HOST_KEY
   const text = (error instanceof Error ? error.message : String(error)).toLowerCase()
+  if (/host key|hostkey|man-in-the-middle|fingerprint/u.test(text)) return SSH_FAILURE.HOST_KEY
   if (/all configured authentication methods failed|authentication|publickey|password|private key/u.test(text)) {
     return SSH_FAILURE.AUTH
   }
-  if (/host key|hostkey|man-in-the-middle|fingerprint/u.test(text)) return SSH_FAILURE.HOST_KEY
   // Before the network rule, and before `unknown`: this is the server declining a channel,
   // not the network failing, and it is the one refusal that a retry can fix.
   if (/channel open failure|open failed|unable to exec|unable to open shell|channel is not open|administratively prohibited/u.test(text)) {
@@ -104,10 +147,38 @@ export function classifySshError(error) {
   return SSH_FAILURE.UNKNOWN
 }
 
-/** Wrap one error with its category and cause. */
+/**
+ * Wrap one error with its category and cause.
+ *
+ * An `ssh-*` code a throw site already set is carried through, because it is more specific than
+ * the category it corresponds to: a refusal this connection made itself is marked
+ * `ssh-host-key` at the source, and a re-wrap on the way out must not downgrade it to a bare
+ * category. Only this layer's own `ssh-*` vocabulary is carried, so a `code` some other
+ * library happened to set cannot leak into the panel's vocabulary.
+ */
 export function toSshError(error, category = classifySshError(error)) {
   const message = error instanceof Error ? error.message : String(error)
-  return Object.assign(new Error(message, { cause: error }), { category, sshCategory: category })
+  const wrapped = Object.assign(new Error(message, { cause: error }), { category, sshCategory: category })
+  const code = Reflect.get(error ?? {}, 'code')
+  // `ssh-*` is this layer's half of the panel's vocabulary (`core/errors.js` owns the table);
+  // anything else is another library's code and is not ours to forward.
+  if (typeof code === 'string' && code.startsWith('ssh-') && ERROR_CODES[code] !== undefined) {
+    wrapped.code = code
+  }
+  return wrapped
+}
+
+/**
+ * Wrap one handshake failure that **this object's own `hostVerifier`** refused.
+ *
+ * The fingerprint comparison happens here, so the decision is known here — there is nothing to
+ * infer from ssh2's message, and ssh2's message (`Host denied (verification failed)`, see
+ * `isSsh2HostKeyRejection`) is deliberately not the evidence. Both marks are set so that either
+ * reader finds it: `sshCategory`/`code` for `classifyFailure` and this file's classifier.
+ * @param {unknown} cause - the error ssh2 raised because the verifier answered `false`.
+ */
+export function hostKeyRejection(cause) {
+  return Object.assign(toSshError(cause, SSH_FAILURE.HOST_KEY), { code: 'ssh-host-key' })
 }
 
 /**
@@ -497,6 +568,15 @@ export class SshConnection {
   #connectOnce() {
     return new Promise((resolve, reject) => {
       const client = new Client()
+      /**
+       * Whether this attempt's own host verifier refused.
+       *
+       * The verifier cannot throw into ssh2's handshake — it answers `verify(false)` and ssh2
+       * raises its own generic error — so the decision is recorded here and attached to that
+       * error. Per attempt on purpose: a stale refusal must not mark a later, unrelated
+       * handshake failure on a reconnect.
+       */
+      let hostKeyRefused = false
       let settled = false
       const settle = (fn) => {
         if (settled) return
@@ -532,7 +612,11 @@ export class SshConnection {
         // listener installed inside the `ready` branch.
         if (!settled) {
           try { client.end() } catch { /* already gone */ }
-          settle(() => reject(toSshError(error)))
+          settle(() => reject(
+            // The refusal was this object's own decision (see `hostVerifier`), so it is reported
+            // from that decision rather than from ssh2's wording of it.
+            hostKeyRefused ? hostKeyRejection(error) : toSshError(error),
+          ))
         }
       })
       // Temporary: name the caller whenever this process hangs up. The node's own `auth.log`
@@ -545,11 +629,16 @@ export class SshConnection {
           return realEnd(...args)
         }
       }
-      client.connect(this.#connectConfig())
+      client.connect(this.#connectConfig(() => { hostKeyRefused = true }))
     })
   }
 
-  #connectConfig() {
+  /**
+   * @param {() => void} [onHostKeyRefused] - called when the verifier below refuses, so the
+   *   handshake failure that follows is reported from that decision instead of from ssh2's
+   *   generic message.
+   */
+  #connectConfig(onHostKeyRefused) {
     const { host, port, username, auth } = this.target
     /** @type {import('ssh2').ConnectConfig} */
     const config = {
@@ -564,6 +653,10 @@ export class SshConnection {
       // refuse a silent change. `undefined` in target.hostFingerprint means this
       // node has never been verified — that is **first use**, not a failure, so the
       // key is recorded and the handshake proceeds. Every later handshake compares.
+      //
+      // **This callback is the deciding code**, so a refusal is recorded here (see
+      // `#connectOnce`). ssh2's own reaction, `Host denied (verification failed)`, is a literal
+      // it owns and says nothing; the fingerprint comparison above is what actually happened.
       hostVerifier: (key, verify) => {
         const fingerprint = fingerprintOf(key)
         const expected = this.target.hostFingerprint
@@ -573,7 +666,10 @@ export class SshConnection {
           return
         }
         const accepted = fingerprint === expected
-        if (!accepted) this.target.onFingerprintMismatch?.(expected, fingerprint)
+        if (!accepted) {
+          onHostKeyRefused?.()
+          this.target.onFingerprintMismatch?.(expected, fingerprint)
+        }
         verify(accepted)
       },
     }

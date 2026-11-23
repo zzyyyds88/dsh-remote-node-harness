@@ -1,11 +1,15 @@
 /**
  * `core/errors.js` and `host/node-log.js` — the two pieces the settings page needs to say
- * *what* failed and let a person act on it, checked without a node.
+ * *what* failed and let a person act on it, plus the SSH failure categories they are fed.
+ * No node is needed: a loopback `ssh2` server stands in for the one handshake that matters.
  *
  * What this proves, and why each matters:
  *
  *   - every SSH category maps onto a code, and a code's `action` is one a client can localise;
  *   - a throw site that names a code wins over the phase guess (the more specific fact wins);
+ *   - a refused host key stays a host key even though ssh2 says nothing recognisable and the
+ *     node is in `probe` (whose fallback is a **retryable** network fault) — the one failure
+ *     where a wrong answer is a retry loop with no way out;
  *   - a phase with no explicit code still lands on a code naming the stage, not `unknown`;
  *   - `retryable` is a fact about the cause: a wrong password is not retryable, a dropped
  *     socket is — that is the difference between offering a button and lying;
@@ -14,8 +18,10 @@
  *
  * Usage: node test/errors-unit.mjs
  */
+import ssh2 from 'ssh2'
 import { ERROR_ACTIONS, ERROR_CODES, classifyFailure } from '../src/core/errors.js'
 import { LOG_LINES, NodeLog, redact } from '../src/host/node-log.js'
+import { SshConnection, classifySshError, hostKeyRejection, toSshError } from '../src/ssh/connection.js'
 
 let failed = 0
 const check = (ok, label, detail) => {
@@ -58,6 +64,95 @@ const check = (ok, label, detail) => {
   // `category` (not `sshCategory`) is what `toSshError` writes; both have to work.
   const viaCategory = classifyFailure(Object.assign(new Error('x'), { category: 'network' }))
   check(viaCategory.code === 'ssh-network', 'the `category` spelling works too', viaCategory.code)
+}
+
+// ---- 2b. a refused host key is never a retryable network fault --------------
+// The reported bug: a machine whose key changed was rendered as "cannot reach the machine /
+// check the network / retry", with a retry that looped forever. Three independent facts have
+// to hold, and only the first one is about ssh2's text:
+//
+//   - the literal ssh2 raises when its verifier says no classifies as a host key;
+//   - a structured mark (what this project's own verifier sets) does too, without any text;
+//   - the mark outranks text, so a sentence naming both causes cannot be misread.
+{
+  // ssh2 v1.17.0, `lib/protocol/kex.js:1206/1210/1233/1237`: `level = 'handshake'`, message is
+  // this literal and nothing else. It is the dependency's string, so the test pins the exact
+  // spelling: a reworded ssh2 must fail here rather than silently become `ssh-network`.
+  const literal = Object.assign(new Error('Host denied (verification failed)'), { level: 'handshake' })
+  const byLiteral = classifyFailure(literal, { phase: 'probe' })
+  check(byLiteral.code === 'ssh-host-key',
+    'ssh2\'s own "Host denied (verification failed)" is a host key, not a network fault', byLiteral.code)
+  check(byLiteral.action === 'review-host-key', 'so the card offers to review the key', byLiteral.action)
+  check(byLiteral.retryable === false, 'and no retry button that cannot help', String(byLiteral.retryable))
+  check(classifySshError(literal) === 'host-key', 'the SSH layer agrees', classifySshError(literal))
+
+  // A wrapper around the same message must not lose it: the panel is told a host key was
+  // refused, not that the reconnect ladder should try again.
+  const wrapped = Object.assign(new Error('ssh handshake failed: Host denied (verification failed)'), {})
+  check(classifyFailure(wrapped, { phase: 'probe' }).code === 'ssh-host-key',
+    'a wrapper around ssh2\'s rejection still classifies as a host key',
+    classifyFailure(wrapped, { phase: 'probe' }).code)
+
+  // The structured path, with a message that says nothing at all. This is what our own
+  // `hostVerifier` produces (see `hostKeyRejection`), and it must work purely off the mark.
+  const marked = hostKeyRejection(new Error('whatever ssh2 said'))
+  check(classifySshError(marked) === 'host-key', 'a marked error needs no text to classify', classifySshError(marked))
+  const byMark = classifyFailure(marked, { phase: 'probe' })
+  check(byMark.code === 'ssh-host-key', 'and classifyFailure reads the mark', byMark.code)
+  check(byMark.action === 'review-host-key', 'with the review action', byMark.action)
+  check(byMark.retryable === false, 'and not retryable', String(byMark.retryable))
+
+  // The mark wins over contradictory text: the sentence below names a credential, and the
+  // auth pattern would have claimed it. A refusal decided by the verifier is not a refusal of
+  // the credential, however the sentence reads.
+  const markedWithAuthWords = Object.assign(
+    hostKeyRejection(new Error('publickey authentication failed: Host denied (verification failed)')),
+    {},
+  )
+  check(classifySshError(markedWithAuthWords) === 'host-key',
+    'a host-key mark outranks auth-looking text', classifySshError(markedWithAuthWords))
+
+  // Old ordering bug, without any mark: the auth pattern contains the word `password`, and it
+  // used to be tested before the host-key pattern, so this sentence became `auth` and offered
+  // "fix the credential". Host key must win.
+  const ambiguous = new Error('Host key verification failed; the password authentication step was not reached')
+  check(classifySshError(ambiguous) === 'host-key',
+    'text naming both a host key and a password is a host key', classifySshError(ambiguous))
+  const ambiguousWrapped = toSshError(ambiguous)
+  check(classifyFailure(ambiguousWrapped, { phase: 'probe' }).code === 'ssh-host-key',
+    'and the panel is told so', classifyFailure(ambiguousWrapped, { phase: 'probe' }).code)
+
+  // The rest of the text rules still work — moving the host-key rule must not swallow them.
+  // Each is checked through the real pipeline (`toSshError` reads the sentence and attaches the
+  // category; `classifyFailure` reads the category), because that is the path a live failure
+  // travels. `classifyFailure` alone sees no sentence by design: text classification belongs to
+  // the SSH layer, and duplicating it in `core/errors.js` would be a second, drifting copy.
+  const textCases = [
+    [new Error('All configured authentication methods failed'), 'auth', 'ssh-auth'],
+    [new Error('Timed out while waiting for handshake'), 'timeout', 'ssh-timeout'],
+    [new Error('connect ECONNREFUSED 127.0.0.1:22'), 'network', 'ssh-network'],
+    // A full channel budget is retried inside the SSH layer; it has no panel code of its own,
+    // so only the category is asserted for it.
+    [new Error('Channel open failure: open failed'), 'channel', undefined],
+    [new Error('No response from server'), 'closed', 'ssh-closed'],
+  ]
+  for (const [error, category, expectedCode] of textCases) {
+    check(classifySshError(error) === category,
+      `"${error.message}" classifies as ${category}`, classifySshError(error))
+    if (expectedCode !== undefined) {
+      const classified = classifyFailure(toSshError(error), { phase: 'probe' })
+      check(classified.code === expectedCode,
+        `  and the panel code is ${expectedCode}`, classified.code)
+      check(classified.detail === error.message, '  with the original sentence kept', classified.detail)
+    }
+  }
+
+  // A throw site's own precise ssh code survives a re-wrap: `toSshError` is called again on
+  // the way out of the retry loop, and a downgrade there would put the bug back.
+  const rewrapped = toSshError(marked)
+  check(rewrapped.code === 'ssh-host-key', 're-wrapping keeps the explicit ssh code', String(rewrapped.code))
+  check(classifyFailure(rewrapped, { phase: 'probe' }).code === 'ssh-host-key',
+    'so the panel still sees a host key after the retry ladder', classifyFailure(rewrapped, { phase: 'probe' }).code)
 }
 
 // ---- 3. an explicit code wins over the phase -------------------------------
@@ -170,6 +265,98 @@ const check = (ok, label, detail) => {
 
   log.clear()
   check(log.lines().length === 0, 'clear empties it', String(log.lines().length))
+}
+
+// ---- 7. the same failure over a real handshake ------------------------------
+// Sections 2-2b use hand-crafted errors. This one is end to end, and it is placed last because
+// it is the only check that opens a socket and awaits. Two reasons it is worth a socket:
+//
+//   - it proves the `hostVerifier` this project writes actually marks the refusal (2b only
+//     proves a hand-made mark is *read*), so the fix is not "we classified a string we wrote";
+//   - it pins what the panel is told from a real refusal: `review-host-key`, not retryable.
+//     Measured before the fix on this same loopback server: the panel got
+//     `{code: ssh-network, action: check-network, retryable: true}` — a Retry button for a
+//     changed key, which can only ever fail again.
+//
+// The server is a loopback `ssh2` server, so nothing external is contacted.
+{
+  const { private: hostKey } = ssh2.utils.generateKeyPairSync('ed25519')
+  // How many TCP connections the server saw. A host-key refusal must not be retried, so the
+  // three attempts below must be exactly three dials: if the refusal were ever reclassified
+  // into a retryable category, `#connectWithRetry` would dial again and this would grow.
+  let connections = 0
+  const server = new ssh2.Server({ hostKeys: [hostKey] }, client => {
+    connections += 1
+    client.on('authentication', context => context.accept())
+    client.on('error', () => undefined)
+  })
+  await new Promise(resolve => { server.listen(0, '127.0.0.1', resolve) })
+  const { port } = server.address()
+  const target = extra => ({
+    host: '127.0.0.1',
+    port,
+    username: 'root',
+    auth: { kind: 'password', password: 'x' },
+    log: () => undefined,
+    ...extra,
+  })
+
+  // First use: the key is recorded and the handshake proceeds (trust on first use).
+  let recorded
+  const first = new SshConnection(target({ onFirstFingerprint: fingerprint => { recorded = fingerprint } }))
+  let firstUseError
+  try {
+    await first.client()
+  } catch (error) {
+    firstUseError = error
+  }
+  check(firstUseError === undefined, 'a first-use key is recorded and accepted', firstUseError?.message)
+  check(typeof recorded === 'string' && recorded.length > 0, 'and the fingerprint was handed back', recorded)
+  check(connections === 1, 'that took exactly one handshake', String(connections))
+  first.dispose()
+
+  // The recorded key is accepted on the next handshake.
+  const second = new SshConnection(target({ hostFingerprint: recorded }))
+  let matchError
+  try {
+    await second.client()
+  } catch (error) {
+    matchError = error
+  }
+  check(matchError === undefined, 'the recorded key is accepted', matchError?.message)
+  check(connections === 2, 'and that is a second handshake', String(connections))
+  second.dispose()
+
+  // The key changed. This is the reported failure, and this is where it used to come out as
+  // `ssh-network` (retryable) with a Retry button that looped.
+  let mismatchCallbacks = 0
+  const third = new SshConnection(target({
+    hostFingerprint: 'de:ad:be:ef',
+    onFingerprintMismatch: () => { mismatchCallbacks += 1 },
+  }))
+  let refusal
+  try {
+    await third.client()
+  } catch (error) {
+    refusal = error
+  }
+  check(refusal !== undefined, 'a changed key refuses the handshake')
+  // A guard, not the red-before-the-fix check: a refusal must never be retried, and this is the
+  // only place the retry ladder (`MAX_RETRIES`) can be observed from outside. Before the fix the
+  // SSH layer said `unknown` (not retryable either), so this number was already 3 — the bug was
+  // one layer up, in what the panel was told; see the assertions below.
+  check(connections === 3, 'the refusal is not retried — one dial per attempt', String(connections))
+  check(mismatchCallbacks === 1, 'the mismatch is reported once', String(mismatchCallbacks))
+  check(refusal?.sshCategory === 'host-key',
+    'the refusal carries the structured mark, not just ssh2\'s sentence', String(refusal?.sshCategory))
+  check(refusal?.code === 'ssh-host-key', 'and the panel code is set at the source', String(refusal?.code))
+  const live = classifyFailure(refusal, { phase: 'probe' })
+  check(live.code === 'ssh-host-key', 'so a real handshake lands on ssh-host-key', live.code)
+  check(live.action === 'review-host-key', 'which is the review-the-key control', live.action)
+  check(live.retryable === false, 'and is not retried', String(live.retryable))
+  third.dispose()
+
+  await new Promise(resolve => { server.close(resolve) })
 }
 
 if (failed > 0) {
