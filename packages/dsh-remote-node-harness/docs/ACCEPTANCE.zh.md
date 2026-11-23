@@ -741,7 +741,7 @@ bug，是同一类结构缺陷在长新 bug。设计文档与逐条实证见
 |---|---|
 | offline | **34 passed, 0 failed, 0 skipped** in 21.4s（新增 `node-status`/`recovery-ladder`/`capabilities`/`capabilities-logic`/`gate-mutation`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`/`browse-protocol`/`merge-stream`/`registry`/`suite-registry`/`node-stream-set`） |
 | contract | **3 passed, 0 failed** in 940ms |
-| e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 215.9s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
+| e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 236.8s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
 
 e2e 里 17 个套件中有 2 个在这台部署上跳过，所以"passed"是 15 —— 这一栏写的是**实跑数**，
 套件总数（17）写在 `run-all.mjs --list` 与 README 里。两者的差就是那两个带原因的 SKIP。
