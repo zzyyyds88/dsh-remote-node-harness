@@ -1215,10 +1215,20 @@ provision 白名单、bundle 名。
 - 节点 brain 没有独立版本号（它是以文件写入的，唯一戳是内容哈希），所以 `decideGate` 的
   brain 分支保持惰性 —— 代价是「节点被别的桌面装新了要拒绝」这条保护仍然不存在。
 - `remoteRoot` 仍不加引号插进 `sh -c`（入口是设置页，属本机可信输入，但仍是注入面）。
-- `decorators.js` 仍是单文件 1083 行、按命名空间分 18 个 `decorate*` 函数；`remote-control.js`
-  与它的合并流骨架有约 150 行重复。设计 §九 批 5 第 23 项未做。
-- 错误仍有两套词汇：`src/core/errors.js` 的 `classifyFailure` 与 `daemon.js` 的
-  `PROVISION_FAILURES`（后者今天没有消费者）。设计 §九 批 5 第 22 项只做了错误帧那一半。
+- `decorators.js` 仍是单文件约 1010 行、按命名空间分 18 个 `decorate*` 函数；设计 §九 批 5
+  第 23 项只做了合并流那一半（`host/merge-stream.js`），**按命名空间拆分未做**。
+- `client.js` 仍是单文件约 2350 行，`node-view.js` 的纯视图模型没有独立出来。
+
+### 已经关上的口子（本轮）
+
+- 错误词汇**只剩一张表**：`src/core/errors.js` 的 `ERROR_CODES` + `classifyFailure`。
+  `daemon.js` 的 `PROVISION_FAILURES`（旧那套、零消费者）已删，设计 §七 的「失败只有一个出口」
+  因此在词汇层面成立。
+- 两份逐行同构的合并流骨架收敛成 `host/merge-stream.js`：生命周期归一处，
+  `mergeControlStream` / `mergeWorkspaceStream` 各自只提供载荷策略。`detach()` 幂等，
+  订阅恰好释放一次（`merge-stream-unit` 断言）。
+- 设计 §八 列的 11 项死代码已删；`encode` 与 `SecretStore.describe` 经复核**不是**死代码，
+  保留（设计文档里的那两条是误判，已在 §八 注明）。
 
 ### 目录浏览的协议（F1/F2 修完之后）
 

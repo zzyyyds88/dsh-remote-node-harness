@@ -317,7 +317,10 @@ src/
     components/*     按职责拆，单文件 ≤ 300 行
 ```
 
-删除：`ChangeSignal`、`sessionStream`、`workspaceEndpoint`、`encode`、`toFailure`、`SESSION_REQUEST_KEYS`、`installedVersionScript`、`installedBuildScript`、`uninstallPlugins`、`SecretStore.describe`、`PROVISION_FAILURES`、两份重复的合并流实现。
+删除（**已全部执行**，每一项都先用 `git grep -w` 确认过零消费者）：`ChangeSignal`、`sessionStream`、`workspaceEndpoint`、`toFailure`、`SESSION_REQUEST_KEYS`、`workspaceIdOf`、`installedVersionScript`、`installedBuildScript`、`uninstallPlugins`、`PROVISION_FAILURES`、两份重复的合并流实现（收敛成 `host/merge-stream.js`）。
+`encode` 保留：`toRemote` 的递归遍历在用它（第 282 行），设计里把它列成死代码是**误判**，以代码为准。
+`SecretStore.describe` 也保留：`recovery-ladder-unit` 用它断言「agent 凭据写进去之后读得到」，
+设计里同样列错了。
 
 `decorators.js`（1083 行）拆成 `session / workspace / workspace-files / terminal / job / misc` 六个声明表 + 少量真逻辑；`directoryPicker` 的视图模型（约 170 行）搬去 `picker-listing.js`；`terminal/attach` 的双向泵抽成通用 `pipeUplink`。
 `decorators-extra.js` 的 8 个命名空间收敛成 `wire.js` 里的一张声明表（约 140 行样板归零）。
@@ -372,10 +375,11 @@ src/
 21. `browse` 结构化协议 + 路径策略下沉 —— **已做**（`posix-path.js` 是唯一折叠处，
     `browse.js` 换成 `type\0value\0` 记录 + NUL/base64 名字块，`browse-protocol-unit`
     在真实 shell 上跑真实脚本，含 marker 形状的目录名、换行、非 UTF-8、缺 `find`）；
-22. 错误唯一出口 + 一张错误表 —— **只做了一半**：错误帧不再退化成 EOF（`error-frame-unit`），
-    但 `classifyFailure` 与 `PROVISION_FAILURES` 两套词汇仍在，后者没有消费者；
-23. 合并流与四个 `Remote*` 骨架收敛 —— **未做**（`decorators.js` 仍 1083 行、18 个
-    `decorate*`，与 `remote-control.js` 的合并流骨架约 150 行重复）。
+22. 错误唯一出口 + 一张错误表 —— **已做**：错误帧不再退化成 EOF（`error-frame-unit`），
+    词汇只剩 `src/core/errors.js` 一张表（`PROVISION_FAILURES` 已删）；
+23. 合并流与四个 `Remote*` 骨架收敛 —— **合并流已做**（`host/merge-stream.js`，生命周期归一处，
+    `detach()` 幂等，`merge-stream-unit` 20 条断言）；**`decorators.js` 的按命名空间拆分未做**
+    （仍约 1010 行、18 个 `decorate*` 函数），记在 ARCHITECTURE 的「仍然开着的口子」里。
 
 ## 十、验收判据
 
