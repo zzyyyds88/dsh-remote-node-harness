@@ -1111,11 +1111,119 @@ const __rnhRemoteScope = id => typeof id === "string" && /^rnh_[a-z0-9]+_/.test(
 `RNH_BROWSE_ERROR` 报错，因为下一步会在节点上真的 `mkdir -p` 出来。本机（`listLocal`）的
 语义不变，仍是不存在就报错 —— 本机不需要从选择器里造目录。
 
+## 六之九、能力单一真源、状态机、安装事务（2026-11-23 重写）
+
+这一节记录一次结构性重写。起点是一句判断：「节点端做得太烂，修了几百遍，到底有没有彻底重构」。
+核对下来，**现象成立、归因要修正一次**：141 次提交里真正落在节点生命周期（`src/remote/` +
+`packages/rnh-brain`）的只有 6 次，其中 3 次是 fix —— 节点侧被改得很少，却反复出问题。
+原因不是没人修，是同一类结构缺陷在长新 bug。
+
+设计文档与逐条实证在 [`refactor-node-side.zh.md`](refactor-node-side.zh.md)。下面只写结论形状。
+
+### 能力：从 26 处声明到一处
+
+「节点有什么能力」原来被声明在 6 组 26 处，**互不校验**：组合行、预设行、打包保留名单
+（`RETAINED`）、打包删除规则（`DROP_RULES`）、provision 复制白名单、`dsh.bundle.patch`；
+外加 3 份节点固定组合、4 份 bundle 名、**4 种键空间**（行 id / 无 scope 目录名 / 包全名 / 报告名）。
+
+现在只有一处：`packages/rnh-brain/capabilities.mjs`，零依赖纯数据 + 纯函数，
+**全仓唯一允许出现 `@deepseek-ai/` 字面量的文件**。每个能力自带 `verdict`：
+
+| verdict | 未满足时 | 今天用在哪 |
+|---|---|---|
+| `required` | 拒绝（形状留着，今天都用得上） | 大脑本身：传输、控制器、agent 平面、office、模型平面 |
+| `optional` | 组合与预设里**都不出现**（不是宣告了再失败） | 形状已有，暂无成员 |
+| `never` | 行不在，包也不该在盘上 | 浏览器面、Electron 壳、computer use、实验包、开发工具链、外部 agent bundle |
+
+下游一律派生、不许手写：组合行集（`composedRowIds`）、预设行集（`presetRowIds`）、
+打包保留集（`keptPackages`，`trim-fork-runtime.mjs` 的 `RETAINED` 就是它）、删除理由、
+provision 白名单、bundle 名。
+
+**这解决了 office 那一类缺陷的根**：原来保留 `dsh-office-kit`、却按前缀删掉它硬依赖的
+`libreoffice-kit`（含 Linux 上真正使用的 WASM 引擎），于是三个 office 工具永远在目录里、
+永远一调用就抛「Kit is not installed」。更糟的是守住它的那条断言查错了关系
+（「被保留的名字是否命中删除规则」=同名交叉，而真实失效是「被保留的包**依赖**的包被删」
+=依赖闭包交叉），且夹具不写 `dependencies`，改对关系也抓不住。
+现在 `keepClosure()` 沿 `dependencies` 求运行时闭包（peer 只收名不递归、dev 不追、
+**optional 不追** —— 这正是 Linux 能删掉 189.7 MiB win32 引擎的原因），并断言
+「闭包里没有任何包命中删除规则」。
+
+### 三种声明不一致，现在会在离线层变红
+
+`offline/capabilities` 把每一处现状与注册表对账：组合 59 行、4 个预设共 112 行、
+6 个保留包、11 条删除规则、provision 白名单、bundle 名、平台。任何一处单独漂移都红。
+
+`offline/generated` 守住三段生成链的最后一跳：`cordis.patch.yml` + `presets/` 改了却没重跑
+`embed-into-rnh.mjs`，节点上跑的就是旧组合 —— 这件事**已经发生过一次**（源里 `MCP server fleet`
+被写成 `rhn`，嵌入副本没跟着改，CI 全绿）。
+
+`offline/fork-runtime` 的闭包闸门；`build-fork-runtime.mjs` 在打出归档前调
+`unresolvedInTree(staging, RETAINED)` —— 缺包直接让构建失败，不再把装不起来的树发出去。
+
+### 状态：15 个可变字段到一个判别联合
+
+原来 `state`（4 值）+ `phase`（5 值字符串）+ `serving` + `error` + `failure` + `droppedAt` +
+`recoveries` + `recoveryAttempts` + `transfer` + `gate` + `provision` + `runtimeVia` 等字段并存，
+靠 `describe()` 的「有值才展开」拼成隐式联合类型，跨字段不变量由客户端各自补救 ——
+于是出现「connecting 期间 serving 仍有值」「断开后 state=idle 却残留 error 渲染红块」
+「syncConfig 失败仍显示绿点」这类组合。
+
+现在 `src/host/node-status.js`：
+`idle | connecting | connected | recovering | failed | stopping | terminated`。
+`reduce(status, event, ctx)` 是纯函数（22 个事件），副作用是显式列表
+（`publish`/`armTimer`/`cancelTimer`/`invalidateSocket`/`resetGateway`/`stopResidentHost`/
+`persistOutcome`/`log`），由 `rnh.js` 一层 interpreter 执行。六条不变量可以用
+`violationsOf()` 双向断言（构造非法 status 能抓到 + `reduce` 产出的永远合法）。
+
+`describe()` 从 status 纯投影，**旧字段名一个没改、没删**（手机端也读它），只新增
+`kind`/`gate`/`lastError`。`state` 的三个新值里 `recovering` 对外仍报 `idle` + `droppedAt`
+（设置页本来就靠这个组合渲染「已断线，正在重连」）；`stopping`/`terminated` 靠客户端的
+未知值兜底。
+
+`gate` 首次进 `describe()`：用户此前看不到「这次连接为什么要重装」。
+
+### 安装：一次事务，不是两半
+
+原来失败处理被切成两半：shell 管字节与目录、JS 管版本与状态，各自补齐「自己那半」的回滚，
+而中间那个窗口（换目录、传输被杀、status 与进程不一致）没人管。三条实证：
+校验失败的回滚会把**好的现役树**换成**更旧的备份**（降级）；传输超时根本不进回滚；
+`status.json` 里 profile 写死常量而比较用派生名，非默认 root **每次 connect 都重启宿主**。
+
+现在：
+
+- 布局是 `runtime -> runtime.<n>`（符号链接）+ 保留一代。解包/校验/chmod/打戳/自检全在
+  `runtime.<n+1>` 里完成，**唯一的提交语句是一条 `ln -sfn`**。任何失败都不触碰现役；
+  「回滚」是同一个操作反向。
+- shell 与 JS 之间是**最后一行 JSON**（`trap finish EXIT` 保证任何退出都有），退出码只作诊断。
+  这套替掉了「退出码 + stderr 哨兵子串」——后者靠命名规避子串碰撞，还会被采集上限截断。
+- 进程身份是「pid 存在 且 `/proc/<pid>/cmdline` 含 `--profile <名>`（两侧锚定）且 starttime 相等」，
+  不再用 `kill -0` 当活着。
+
+### 失败只有一个出口
+
+一条规则：**每条远端能力都必须暴露 `state`，`catch(() => undefined)` 禁止出现在能力路径上**。
+原来 11 处把失败翻译成「看起来正常」：凭据推送失败仍 CONNECTED、`ensureServing` 不看退出码、
+错误帧先 `finish()` 再 `onEnd(error)` 于是被降级成 EOF、`find` 缺失当空目录、lookup 覆盖失败静默、
+`decorators` 的方法名不存在静默跳过、客户端的四个 `.catch(() => undefined)`……
+
+各文件头注释一直在写「静默本地作答是必须消灭的失败模式」——**实现与文档相反**。
+
+### 这一节之外、仍然开着的口子
+
+- `dropPackages()` 按**无 scope 的目录名**匹配 `DROP_RULES`，而保留集用**全名** —— 键空间不统一
+  是已知债务，改它会改变构建删什么，需要重新构建制品验收。
+- 节点 brain 没有独立版本号（它是以文件写入的，唯一戳是内容哈希），所以 `decideGate` 的
+  brain 分支保持惰性 —— 代价是「节点被别的桌面装新了要拒绝」这条保护仍然不存在。
+- `remoteRoot` 仍不加引号插进 `sh -c`（入口是设置页，属本机可信输入，但仍是注入面）。
+- `browse.js` 的哨兵协议仍是「stdout + stderr 拼起来做无锚点正则」，路径合法性散在三处。
+
+---
+
 ## 七、测试
 
-共 39 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 19 个（纯逻辑 + 组合
-检查）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个（运行中的 Host + 连上的节点）。
-下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
+共 47 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 27 个（纯逻辑 + 组合
+检查 + 真 POSIX shell 跑安装脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
+（运行中的 Host + 连上的节点）。下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 
 | 脚本 | 验证什么 | 依赖 |
 |---|---|---|

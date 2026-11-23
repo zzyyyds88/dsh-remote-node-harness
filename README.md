@@ -118,7 +118,11 @@ dsh-client-ui-*    : 0
 web-runtime        : 0
 ```
 
-**测试**：39 个套件分三层，`test/run-all.mjs` 一次调度。端到端层最近一次全量跑在 `rnhtest` Host + 真实 Linux 节点上：**12 passed, 1 failed, 1 skipped in 345.6s**（那次唯一失败是 `workspace-flow` 里写死的一个节点目录名，已改成从工作区路径派生，单跑 15.8s 通过）；契约层与纯逻辑层各自全绿。跑不了的套件带原因记 SKIP，不记成通过；`--layer e2e` 一个都没跑成时非零退出。
+**测试**：47 个套件分三层（offline 27 / contract 3 / e2e 17），`test/run-all.mjs` 一次调度。
+最近一次三层全量：纯逻辑 **27 passed, 0 failed**；契约 **3 passed**；端到端在 `rnhtest` Host +
+真实 Linux 节点上 **15 passed, 0 failed, 2 skipped in 732.4s**（两个 skip 都带原因：这台桌面没有
+第三方插件可切换、没有开 `--remote-debugging-port` 的 Chrome）。跑不了的套件带原因记 SKIP，
+不记成通过；`--layer e2e` 一个都没跑成时非零退出。
 
 ```bash
 node packages/dsh-remote-node-harness/test/run-all.mjs                            # 全部

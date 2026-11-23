@@ -306,7 +306,7 @@ node packages\dsh-remote-node-harness\test\workspace-browse.mjs <base> <token>
 node packages\dsh-remote-node-harness\test\run-all.mjs --layer offline,contract
 ```
 
-单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 39 个套件与它们各自的依赖。
+单跑某一个套件时才用直调形式；`test/run-all.mjs --list` 打印全部 47 个套件与它们各自的依赖。
 **每个套件守的是哪条上游契约、DSH 升级后按什么顺序重跑**，见 [`UPGRADE.zh.md`](UPGRADE.zh.md) §二。
 
 ```powershell
@@ -691,3 +691,61 @@ sidecar 记 `installed: "0.6.7", anchors: 3`。单独用 0.6.7 的 tarball 跑 `
 tail 的退出码，第一次升级因此误报「镜像没到」；desktop profile 的 pnpm 有
 `virtualStoreDirMaxLength: 60` 与 `minimumReleaseAge` 两道门槛，直接 `pnpm install`
 会分别报 `ERR_PNPM_VIRTUAL_STORE_DIR_MAX_LENGTH_DIFF` 和被拦下。
+
+### 2026-11-23 · 节点侧全面重写（三层验收）
+
+起因是一句判断：「节点端做得太烂，修了几百遍，到底有没有彻底重构」。核对后确认：141 次提交里
+真正落在节点生命周期的只有 6 次（3 次 fix）——**改得很少却反复出问题**，所以修的不是同一个
+bug，是同一类结构缺陷在长新 bug。设计文档与逐条实证见
+[`docs/refactor-node-side.zh.md`](../../../docs/refactor-node-side.zh.md)，
+形状写进 [`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §六之九。
+
+**修掉的阻断缺陷**（每条都先复现再修；「真节点」= `probe-93`，Ubuntu 24.04 / linux-x64 / glibc 2.35）
+
+| # | 缺陷 | 复现证据 |
+|---|---|---|
+| 1 | 换过主机密钥的节点永久卡在「检查网络 / 重试」，唯一有用的「查看主机密钥」永不出现 | `classifyFailure(Error('Host denied (verification failed)'), {phase:'probe'})` 修复前 `ssh-network`/`check-network`/retryable；修复后 `ssh-host-key`/`review-host-key`/不重试 |
+| 2 | `nodes.json` 只坏一个字段就整张节点表静默清零，下一次写把原文件覆盖 | 改名式备份 + 逐条跳过；`registry-unit` 67 条断言 |
+| 3 | 节点校验错误返回 500 而不是 400 | 实测 `normalizeNode({name:''})`：修复前 `500/rnh-failed`，修复后 `400/node-invalid` |
+| 4 | 重连阶梯被自己清零：延迟恒 2 s，4s/8s/120s 是死代码，且对关机节点每 2 s 重连一次并重写 nodes.json | 离线复现 `2000×6`；修复后 `2000,4000,8000,120000,120000,120000` |
+| 5 | agent 认证的节点永远连不上（`put()` 不写记录、`write({kind:'agent'})` 还会删记录） | 离线复现；`recovery-ladder-unit` 覆盖 |
+| 6 | 首次连接的插件安装必然 EJSONPARSE（`printf` 写出字面 `\n`） | 真节点 `cat -A` 得到 `{}}\n`，`npm error EJSONPARSE position 65` |
+| 7 | 校验失败的回滚把**好的现役树**换成**更旧的备份**（升一次级反而降级） | 真节点复现：`runtime=v2-good`/`.previous=v1-old` → 旧 rollback 后变 `v1-old`；现在 `kept-current` 不动 |
+| 8 | `runtime` 改为符号链接后 e2e 的 `du -sm` 量到链接本身（0 MiB） | 真 e2e 暴露；`du -smL` 修复 |
+| 9 | office 工具永远在目录里、一调用就抛「Kit is not installed」（保留 driver、按前缀删掉引擎） | 真节点 `import.meta.resolve` → `ERR_MODULE_NOT_FOUND` |
+| 10 | 错误帧被降级成正常结束（先 `finish()` 再 `onEnd(error)`，`AsyncQueue.fail` 遇 closed 直接 return） | `error-frame-unit` 用真 ws + 真 Gateway + 真 AsyncQueue 断言错误到达消费者 |
+| 11 | 客户端不渲染 `failed + phase`（后端特意保留的诊断被前端一个条件作废）；`idle + 残留 error` 渲染红块 | `client-bundle` 渲染层断言 + 变异验证 |
+| 12 | `rowsOfBundle()` 只认字符串形态的 `dsh.bundle.patch` → 两个最需要解释的 bundle 恒 0 行，守卫静默失效 | `check-capabilities` |
+
+**结构性改动**
+
+- `packages/rnh-brain/capabilities.mjs`：能力单一真源（20 个能力、`verdict` 三态、派生 6 个方向）。
+- `src/host/node-status.js`：`idle|connecting|connected|recovering|failed|stopping|terminated`
+  判别联合 + 22 个事件的纯 `reduce` + 8 个显式副作用 + 6 条可断言不变量。
+- 安装事务化：`runtime -> runtime.<n>` 符号链接 + **唯一提交语句** `ln -sfn`；
+  shell↔JS 契约改为最后一行 JSON；进程身份用 `/proc/<pid>/{cmdline,stat}`。
+- 传输层补四个上限（HTTP 超时/响应体、ws 累计缓冲、multipart part 数）。
+- 生成物同步门禁 `generated` + 能力对账门禁 `capabilities`。
+
+**三层验收（2026-11-23 实跑）**
+
+| 层 | 结果 |
+|---|---|
+| offline | **27 passed, 0 failed, 0 skipped** in 19.7s（新增 `node-status`/`recovery-ladder`/`capabilities`/`generated`/`ws-frame`/`http-over-ssh`/`error-frame`/`install-shell`） |
+| contract | **3 passed, 0 failed** in 783ms |
+| e2e（真节点 `probe-93`） | **15 passed, 0 failed, 2 skipped** in 732.4s；两个 skip 带原因（本机无第三方插件可切换、无 `--remote-debugging-port` 的 Chrome） |
+
+e2e 里有几条值得单独记：`e2e/artefact` 现在真的在节点上跑安装脚本 —— 新鲜安装是符号链接
+指向编号代、升级只留一代、坏校验和不动现役、提交点被 SIGKILL 后现役仍可启动、
+回滚答 `kept-current` 而不降级；`e2e/session`/`tool-parity`/`tool-git-image` 证明工具仍在
+节点上原生运行。
+
+**这一轮没有验证到的**
+
+- 手机端（DSH Go 经中转）：`describe()` 新增了 `kind`/`gate`/`lastError`、`state` 新增
+  `stopping`/`terminated`（`recovering` 对外仍报 `idle`），未在手机上实渲染。
+- 真机上的**升级路径**（节点版本落后 → 下载新制品 → 切换）：e2e 覆盖了脚本语义与回滚，
+  没有跑一次真实的跨版本升级。
+- 真实浏览器里的失败态：客户端那部分只到源码 + mock 渲染层。
+- `dropPackages()` 的键空间不对称（规则按裸名、保留按全名）是已知债务，本轮**没有**改。
+- macOS（无 procfs）的进程身份降级路径只有代码与构造输入，未在 macOS 上执行。
