@@ -56,6 +56,14 @@ const entries = FILES.map(path => `  ${JSON.stringify(path)}: ${literal(readFile
 const capabilityFacts = await import(new URL('../capabilities.mjs', import.meta.url).href)
 const credentialRefs = capabilityFacts.credentialRefsOfCapabilities()
 const embeddedCredentials = credentialRefs.map(ref => `  ${JSON.stringify(ref)},`).join('\n')
+// The third-party configuration registry travels the same way, for the same reason: the Host
+// has to know which files a composed bundle reads, and it cannot ask `capabilities.mjs` at
+// runtime. Emitted as one JSON literal so it reads as data rather than as code.
+const thirdPartyConfigs = capabilityFacts.declaredConfigFiles()
+const embeddedThirdParty = JSON.stringify(thirdPartyConfigs, undefined, 2)
+  .split('\n')
+  .map((line, index) => (index === 0 ? line : `  ${line}`))
+  .join('\n')
 
 const source = `/**
  * The node-side brain composition, embedded.
@@ -91,6 +99,17 @@ export const BRAIN_PACKAGE = '@local/rnh-brain'
 export const BRAIN_CREDENTIAL_REFS = Object.freeze([
 ${embeddedCredentials}
 ])
+
+/**
+ * Files a composed third-party bundle reads from the node's \`$HOME\`, and which of their keys
+ * may travel.
+ *
+ * Derived from \`THIRD_PARTY_BUNDLES\` in \`capabilities.mjs\` at generation time, for the same
+ * reason as the credential list above: the plugin cannot import that module at runtime. The
+ * whitelist is load-bearing rather than tidy — the desktop's own config file can hold several
+ * servers' credentials, and only the keys named here are written to another machine.
+ */
+export const BRAIN_THIRD_PARTY_CONFIG = Object.freeze(${embeddedThirdParty})
 
 /** Package-relative path → file contents, for everything a node needs. */
 export const BRAIN_FILES = Object.freeze({

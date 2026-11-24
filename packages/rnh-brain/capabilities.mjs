@@ -812,6 +812,133 @@ export const CAPABILITIES = Object.freeze([
   },
 ])
 
+/**
+ * Third-party bundles a node can be given, and the configuration they cannot work without.
+ *
+ * ## Why this table had to exist
+ *
+ * Every record in `CAPABILITIES` above describes something a node composes **itself**
+ * (`@local/rnh-brain` plus upstream rows). A plugin a person installed on their desktop is a
+ * different thing: it is composed onto a node by the per-plugin switch, and its prerequisites
+ * live **outside** DSH. `@vectorize-io/hindsight-coding-agents` states this in its own README:
+ * "Memory itself is configured OUTSIDE dsh, in `~/.hindsight/coding-agent.json`". Nothing in this
+ * repository could say that, so nothing could check it — measured on a real node: the plugin
+ * composed and activated, and then `pages/tree`, `memories` and `reflect` answered `401` for
+ * every single call, because the node had no such file and the plugin therefore fell back to
+ * the hosted default URL with no token. The session ran "without memory" from start to finish,
+ * and no log line anywhere in this project said so.
+ *
+ * It is the office defect's shape one layer over: one declaration (the switch says "it runs
+ * there too"), another supply (provisioning carries model rows and `DEEPSEEK_API_KEY`), and
+ * nothing comparing the two.
+ *
+ * ## What a record is
+ *
+ * - `bundle`      — the full package name, as it appears in `dsh.profile.bundles`;
+ * - `configFiles` — files the bundle reads from the node's `$HOME`. `path` is relative and
+ *                   must stay inside the home (a leading `/` or a `..` segment is refused);
+ *                   `format` is how the merged result is serialised; `mode` is the file mode
+ *                   the node gets (`0600` for anything with a credential in it);
+ *                   `keys` is a **whitelist**, not a copy list — see below;
+ * - `offReason`   — one sentence for a person when the node cannot be given this bundle.
+ *
+ * ## Why `keys` is a whitelist and not "copy the file"
+ *
+ * The desktop's own file can hold more than one server's credential: `banks.<id>.apiToken`
+ * exists precisely so different banks can authenticate differently, and a person may keep
+ * personal paths and per-harness settings in it too. Copying the file whole would ship all of
+ * that to another machine. Only the keys named here travel, merged into whatever the node
+ * already has, and the merge is shallow-by-key: a key not named here is never written.
+ *
+ * ## What is deliberately NOT here
+ *
+ * Platform fit. A bundle whose composition names `C:\…\rhinomcp.exe` cannot work on a Linux
+ * node, but that fact is **derivable** from bytes already on disk — no declaration needed, and
+ * a declaration would go stale the moment the person edits their plugin. `src/core/
+ * plugin-applicability.js` derives it; this table only carries what cannot be derived.
+ *
+ * @type {ReadonlyArray<{
+ *   bundle: string,
+ *   summary: string,
+ *   configFiles: ReadonlyArray<{ path: string, format: 'json', mode: string, keys: readonly string[] }>,
+ *   offReason: string,
+ * }>}
+ */
+export const THIRD_PARTY_BUNDLES = Object.freeze([
+  {
+    bundle: '@vectorize-io/hindsight-coding-agents',
+    summary: 'long-term project memory: it retains what a session decided and recalls it later',
+    configFiles: [
+      {
+        // Resolved against the **node's** `$HOME`, and written by the desktop side: the two
+        // machines are different hosts with different paths, so an absolute path here would
+        // name the desktop's directory on the node.
+        path: '.hindsight/coding-agent.json',
+        format: 'json',
+        mode: '0600',
+        // Exactly the fields the plugin's own `resolveConfig()` reads, minus the ones that
+        // only make sense per harness or per machine (`daemonProfile`, `embedPackagePath`);
+        // `bankId` travels so the node reads and writes the same memory the desktop does.
+        keys: [
+          'serverMode',
+          'apiUrl',
+          'apiToken',
+          'bankId',
+          'autoInject',
+          'retainTags',
+          'reflectTimeoutMs',
+        ],
+      },
+    ],
+    offReason: 'the node cannot be given this plugin\'s configuration, so every memory call '
+      + 'would answer 401 — the plugin is left off rather than composed and broken',
+  },
+])
+
+/**
+ * The registry record for one bundle, or `undefined` when this repository knows nothing about it.
+ *
+ * `undefined` is a normal answer, not a failure: a third-party plugin with no external
+ * configuration needs no record. What it must not be is a **guess** — inferring "this plugin
+ * probably wants a file under the home directory" would ship somebody's credentials to a node
+ * on a hunch.
+ * @param {string} name
+ * @returns {(typeof THIRD_PARTY_BUNDLES)[number] | undefined}
+ */
+export function thirdPartyBundle(name) {
+  return THIRD_PARTY_BUNDLES.find(entry => entry.bundle === name)
+}
+
+/** The config files every declared bundle needs, for the generated copy in the plugin. */
+export function declaredConfigFiles() {
+  const out = []
+  for (const entry of THIRD_PARTY_BUNDLES) {
+    for (const file of entry.configFiles) {
+      out.push({ bundle: entry.bundle, path: file.path, format: file.format, mode: file.mode, keys: file.keys })
+    }
+  }
+  return out
+}
+
+/**
+ * Whether one relative config path is safe to write under the node's home.
+ *
+ * The desktop composes these paths, the node's shell consumes them, so the check is on the
+ * **shape** rather than on whoever wrote the record: no absolute path, no `..` segment, no
+ * empty segment, and no character that a POSIX shell word or an `mv` would reinterpret.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isSafeHomeRelativePath(path) {
+  if (typeof path !== 'string' || path.length === 0) return false
+  if (path.startsWith('/') || path.startsWith('~')) return false
+  if (path.includes('\\')) return false
+  if (!/^[A-Za-z0-9._/-]+$/u.test(path)) return false
+  const segments = path.split('/')
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return false
+  return true
+}
+
 /** One capability by id; throws rather than returning `undefined`, because a typo is a bug. */
 export function capabilityById(id) {
   const found = CAPABILITIES.find(entry => entry.id === id)

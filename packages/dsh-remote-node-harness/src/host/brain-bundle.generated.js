@@ -39,6 +39,33 @@ export const BRAIN_CREDENTIAL_REFS = Object.freeze([
   "DEEPSEEK_API_KEY",
 ])
 
+/**
+ * Files a composed third-party bundle reads from the node's `$HOME`, and which of their keys
+ * may travel.
+ *
+ * Derived from `THIRD_PARTY_BUNDLES` in `capabilities.mjs` at generation time, for the same
+ * reason as the credential list above: the plugin cannot import that module at runtime. The
+ * whitelist is load-bearing rather than tidy — the desktop's own config file can hold several
+ * servers' credentials, and only the keys named here are written to another machine.
+ */
+export const BRAIN_THIRD_PARTY_CONFIG = Object.freeze([
+    {
+      "bundle": "@vectorize-io/hindsight-coding-agents",
+      "path": ".hindsight/coding-agent.json",
+      "format": "json",
+      "mode": "0600",
+      "keys": [
+        "serverMode",
+        "apiUrl",
+        "apiToken",
+        "bankId",
+        "autoInject",
+        "retainTags",
+        "reflectTimeoutMs"
+      ]
+    }
+  ])
+
 /** Package-relative path → file contents, for everything a node needs. */
 export const BRAIN_FILES = Object.freeze({
   "package.json": `{

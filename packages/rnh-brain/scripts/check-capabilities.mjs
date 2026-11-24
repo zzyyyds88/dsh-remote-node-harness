@@ -448,6 +448,63 @@ log('8. platform: DEFAULT_PLATFORM vs PUBLISHED_PLATFORMS[0]')
     `${DEFAULT_PLATFORM} vs ${PUBLISHED_PLATFORMS[0]}`)
 }
 
+// ── 9. third-party bundles: what a node is given, and what it needs to work ------
+log('')
+log('9. third-party bundles: the registry records, and the generated copy in the plugin')
+{
+  const { THIRD_PARTY_BUNDLES, isSafeHomeRelativePath, declaredConfigFiles } = await import(
+    new URL('../capabilities.mjs', import.meta.url).href
+  )
+  check(THIRD_PARTY_BUNDLES.length > 0, 'at least one third-party bundle is registered',
+    THIRD_PARTY_BUNDLES.map(entry => entry.bundle).join(', '))
+
+  // Every record has to be complete, because a half record is worse than none: the supply
+  // chain reads `configFiles` and would write `undefined` paths.
+  for (const entry of THIRD_PARTY_BUNDLES) {
+    const label = entry.bundle
+    check(typeof entry.bundle === 'string' && entry.bundle.length > 0, `${label}: names a bundle`)
+    check(typeof entry.summary === 'string' && entry.summary.length > 0, `${label}: says what it does`)
+    check(typeof entry.offReason === 'string' && entry.offReason.length > 0,
+      `${label}: says why the node may not get it`)
+    check(Array.isArray(entry.configFiles) && entry.configFiles.length > 0,
+      `${label}: declares the configuration it reads`)
+    for (const file of entry.configFiles ?? []) {
+      const where = `${label} ${String(file.path)}`
+      // A path that escapes the home would write outside the directory this project owns on
+      // the node — the one thing a config carrier must never be able to do.
+      check(isSafeHomeRelativePath(file.path), `${where}: stays inside the node's home`)
+      check(file.format === 'json', `${where}: a format this writer implements`, String(file.format))
+      // Anything carrying a credential has to be unreadable to other users on that machine.
+      check(file.mode === '0600', `${where}: is written 0600`, String(file.mode))
+      check(Array.isArray(file.keys) && file.keys.length > 0, `${where}: whitelists at least one key`)
+      check((file.keys ?? []).every(key => typeof key === 'string' && /^[A-Za-z][A-Za-z0-9]*$/u.test(key)),
+        `${where}: every whitelisted key is a plain JSON key name`)
+    }
+  }
+
+  // The generated copy in the plugin must be these records, not a second hand-written list.
+  // `BRAIN_THIRD_PARTY_CONFIG` is written by `embed-into-rnh.mjs`; a record added here without
+  // regenerating means the node silently keeps getting the old set.
+  const embedded = readText(join(PLUGIN, 'src', 'host', 'brain-bundle.generated.js'))
+  const expected = JSON.stringify(declaredConfigFiles())
+  // The literal is indented by the generator (`Object.freeze([` … `\n  ])`), so the capture is
+  // the whole argument and parsed rather than compared as text.
+  const actual = /export const BRAIN_THIRD_PARTY_CONFIG = Object\.freeze\(([\s\S]*?)\)\n/u.exec(embedded)?.[1]
+  check(actual !== undefined, 'the plugin embeds a third-party config registry', 'BRAIN_THIRD_PARTY_CONFIG')
+  if (actual !== undefined) {
+    let parsed
+    try {
+      parsed = JSON.parse(actual)
+    } catch (error) {
+      parsed = undefined
+      check(false, 'the embedded registry is valid JSON', error.message)
+    }
+    check(parsed !== undefined && JSON.stringify(parsed) === expected,
+      'the embedded registry is the one this module declares — regenerate after editing',
+      parsed === undefined ? undefined : `${JSON.stringify(parsed)} vs ${expected}`)
+  }
+}
+
 // ── the verdict ─────────────────────────────────────────────────────────────
 log('')
 const rows = CAPABILITIES.length
