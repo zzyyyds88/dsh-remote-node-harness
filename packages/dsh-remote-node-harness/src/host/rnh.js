@@ -1249,15 +1249,14 @@ export class Rnh {
     return {
       compose: composable,
       plugins: { skipped },
-      // **`content` never leaves this function's caller.** `config` is spread into
-      // `describe()`, which the settings page and the phone both read, and these files hold
-      // credentials: the report carries the path, the mode and the key *names* only — the same
-      // rule `rnh-control` follows for tool results ("no authentication material").
+      // **`content` never leaves this function.** `config` is spread into `describe()`, which
+      // the settings page and the phone both read, and these files hold credentials: the report
+      // carries the path, the mode and the key *names* only — the same rule `rnh-control`
+      // follows for tool results ("no authentication material").
       config: {
         files,
         unavailable,
         written: [],
-        error: undefined,
         report: files.map(file => ({ path: file.path, mode: file.mode, keys: file.keys })),
       },
     }
