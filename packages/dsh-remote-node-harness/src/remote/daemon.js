@@ -948,17 +948,18 @@ echo written
     const script = `
 set -eu
 umask 077
-mkdir -p "$(dirname ${target})"
+target="${target}"
+mkdir -p "$(dirname "$target")"
 tmp="${target}.rnh-new"
 cat > "$tmp"
 chmod ${mode} "$tmp"
-if [ -f ${target} ] && cmp -s "$tmp" ${target}; then
+if [ -f "$target" ] && cmp -s "$tmp" "$target"; then
   rm -f "$tmp"
-  chmod ${mode} ${target}
+  chmod ${mode} "$target"
   echo unchanged
 else
-  mv "$tmp" ${target}
-  chmod ${mode} ${target}
+  mv "$tmp" "$target"
+  chmod ${mode} "$target"
   echo written
 fi
 `.trim()
