@@ -233,6 +233,22 @@ export class SyncSwitches {
       .map(plugin => ({ ...plugin, meta: metaOfBundle(nodeModules, plugin.bundle) }))
   }
 
+  /**
+   * Where one installed bundle lives on this desktop.
+   *
+   * Needed by the fit check, which reads the bundle's own `package.json` (`os`) and composition
+   * files: a bundle that names `C:\…\x.exe` in its composition cannot be composed onto a Linux
+   * node, and that is a fact about the bytes on this disk rather than about the switch.
+   * @param {string} bundle
+   * @returns {string | undefined}
+   */
+  dirOf(bundle) {
+    const dir = this.#dir()
+    if (dir === undefined) return undefined
+    const full = join(dir, 'node_modules', bundle)
+    return existsSync(full) ? full : undefined
+  }
+
   /** Every plugin with its effective switch and where that answer came from. */
   list() {
     return resolvePlugins(this.plugins(), this.overrides)

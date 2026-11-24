@@ -904,6 +904,101 @@ echo written
   }
 
   /**
+   * Write one configuration file into a node's `$HOME`, with the mode the registry asks for.
+   *
+   * This is how a third-party bundle that keeps its settings **outside** DSH gets them: the
+   * plugin reads e.g. `~/.hindsight/coding-agent.json`, and no Cordis row can carry that. The
+   * file belongs to the bundle, so this writes it verbatim and never merges — `plugin-config.js`
+   * already decided what the content is, from a whitelist of keys.
+   *
+   * Four properties matter more than the mechanics:
+   *
+   * - **The content travels on stdin**, not on the command line. It is a credential-bearing
+   *   file: an `argv` would put a token in the node's process table where any other user can
+   *   read it, and would also cross the 256 KiB exec-request ceiling (see
+   *   `writePluginBundle`). The `path` and `mode` are the only literals interpolated, and both
+   *   are validated against a strict shape before they get here.
+   * - **`umask 077` plus an explicit `chmod`**: the redirection creates the file, so the mode it
+   *   is created with is what another process could win a race against; a `chmod` after the
+   *   write closes the window and makes the final mode a checked fact.
+   * - **Byte comparison before replacing**, so a connect that changes nothing does not rewrite
+   *   the file — and therefore does not force the resident host to restart.
+   * - **Atomic `mv`** from a temp file in the same directory: a half-written config is a plugin
+   *   that cannot parse its own settings, which is worse than an old config.
+   *
+   * @param {string} path - home-relative, e.g. `.hindsight/coding-agent.json`.
+   * @param {string} content - the file's full bytes.
+   * @param {{ mode?: string }} [options]
+   * @returns {Promise<{ changed: boolean, mode: string }>}
+   */
+  async writeNodeFile(path, content, options = {}) {
+    // Validated here as well as in the registry: this is the last point before a shell command,
+    // and a caller that computed a path instead of copying one must not be able to escape the
+    // home directory.
+    if (typeof path !== 'string' || path.length === 0 || path.startsWith('/') || path.startsWith('~')
+      || path.includes('\\') || path.split('/').some(segment => segment === '' || segment === '.' || segment === '..')
+      || !/^[A-Za-z0-9._/-]+$/u.test(path)) {
+      throw toSshError(new Error(`refusing to write an unsafe path on the node: ${JSON.stringify(path)}`))
+    }
+    const mode = options.mode ?? '0600'
+    if (!/^0[0-7]{3}$/u.test(mode)) {
+      throw toSshError(new Error(`refusing to write ${path} with mode ${JSON.stringify(mode)}`))
+    }
+    const target = `$HOME/${path}`
+    const script = `
+set -eu
+umask 077
+mkdir -p "$(dirname ${target})"
+tmp="${target}.rnh-new"
+cat > "$tmp"
+chmod ${mode} "$tmp"
+if [ -f ${target} ] && cmp -s "$tmp" ${target}; then
+  rm -f "$tmp"
+  chmod ${mode} ${target}
+  echo unchanged
+else
+  mv "$tmp" ${target}
+  chmod ${mode} ${target}
+  echo written
+fi
+`.trim()
+    const result = await this.connection.exec({
+      argv: ['sh', '-c', script],
+      stdin: content,
+      timeoutMs: 60_000,
+      maxBytes: 64 * 1024,
+    })
+    if (result.code !== 0) {
+      throw toSshError(new Error(
+        `writing ${path} onto the node failed: ${(result.stderr || result.stdout).trim().slice(-400)}`,
+      ))
+    }
+    return { changed: result.stdout.includes('written'), mode }
+  }
+
+  /**
+   * The mode and content of one file in the node's `$HOME`, for reporting and for the
+   * read-before-write comparison. Absent is not an error: it is the first connect.
+   * @param {string} path - home-relative.
+   * @returns {Promise<{ exists: boolean, mode?: string, content?: string }>}
+   */
+  async readNodeFile(path) {
+    const result = await this.connection.exec({
+      argv: ['sh', '-c', `if [ -f "$HOME/${path}" ]; then stat -c %a "$HOME/${path}"; cat "$HOME/${path}"; else echo ABSENT; fi`],
+      timeoutMs: 30_000,
+      maxBytes: 512 * 1024,
+    })
+    if (result.code !== 0) {
+      throw toSshError(new Error(`reading ${path} on the node failed: ${(result.stderr || result.stdout).trim().slice(-300)}`))
+    }
+    const text = result.stdout
+    if (text.startsWith('ABSENT')) return { exists: false }
+    const newline = text.indexOf('\n')
+    if (newline < 0) return { exists: false }
+    return { exists: true, mode: text.slice(0, newline).trim(), content: text.slice(newline + 1) }
+  }
+
+  /**
    * Install the third-party bundles a node has been told to load.
    *
    * The switch means "this plugin also runs there", and a name in `dsh.profile.bundles`
