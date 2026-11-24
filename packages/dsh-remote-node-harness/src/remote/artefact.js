@@ -175,8 +175,17 @@ export const DEFAULT_SOURCES = Object.freeze([
  * delegation happened before the parent's first `turn/end`. Unlike build 6, these change the
  * compiled `lib/` the node loads, so the archive's bytes change too — a stale tree would keep
  * answering the old way while its stamp claimed to be current.
+ *
+ * Build 8 repairs the Office engine. The `DROP_RULES` entry that deleted it was narrowed on
+ * 2026-11-23, **after** build 7 was published, so the repair has never reached a node: the
+ * published build-7 archive carries `@deepseek-ai/dsh-office-kit` (which the brain composition
+ * mounts) and **zero** `libreoffice-kit*` packages. Measured on the test node against that
+ * tree: `import('@deepseek-ai/dsh-office-kit')` succeeds, `import('@deepseek-ai/libreoffice-kit')`
+ * answers `ERR_MODULE_NOT_FOUND`, so every Office tool the brain advertises throws at its first
+ * call. A change to what an archive **contains** is precisely when this number has to move —
+ * without it a tree stamped 7 is called current and never reinstalled, however wrong it is.
  */
-export const RUNTIME_BUILD = 7
+export const RUNTIME_BUILD = 8
 
 /** The stamp file, relative to the runtime directory. */
 export const BUILD_STAMP = '.rnh-artefact.json'

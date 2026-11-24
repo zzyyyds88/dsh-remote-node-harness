@@ -164,7 +164,7 @@ dsh plugin --profile desktop add -w <仓库绝对路径>/packages/dsh-remote-nod
 
 节点要求 Node ≥ 22，以及 `curl`（或 `wget`）。打开第三方插件开关时还需要 `npm`（插件从节点自己的 registry 装进节点的 profile）；运行时本身从不经过 registry。
 
-节点的 DSH 只有一条来路：**下载本项目自己构建的归档**（`dsh-<version>-<platform>.tar.gz`，build 7 实测 58.2 MiB / 25 167 文件 / 61 071 397 字节），只有 CNB 一个源（匿名下载实测 11.7 s，抖动 <1%）。GitHub 不作为下载源——国内节点连不上它，同一份字节仍会传到 GitHub Release 作灾备。
+节点的 DSH 只有一条来路：**下载本项目自己构建的归档**（`dsh-<version>-<platform>.tar.gz`，build 8 实测 103.1 MiB / 25 266 文件 / 108 150 360 字节），只有 CNB 一个源（匿名下载实测 11.7 s，抖动 <1%）。GitHub 不作为下载源——国内节点连不上它，同一份字节仍会传到 GitHub Release 作灾备。
 
 那棵树不是上游发布版，而是本项目从**上游源码的 fork** 编译出来的：删掉浏览器面、Office 引擎与实验性 bundle，再删掉包内没人读的字节（解包 2014.6 MiB → 267.4 MiB）。为什么 fork、代价是什么，见 [`docs/adr-0007-fork-node-runtime.zh.md`](docs/adr-0007-fork-node-runtime.zh.md)。
 
