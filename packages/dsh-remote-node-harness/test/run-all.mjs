@@ -179,6 +179,18 @@ const SUITES = [
     proves: 'what is written onto a node: provider rows copied, account rows not, the result parses as YAML',
   },
   {
+    // The other half of "a switch means this plugin also runs there": the switch is a claim,
+    // and this suite proves the claim is checked. A Windows-only composition going to a Linux
+    // node, and a plugin whose config lives outside DSH with no config to send, are both
+    // refused **with the reason** instead of composed and left failing every call.
+    name: 'applicability',
+    layer: 'offline',
+    file: ['packages', 'dsh-remote-node-harness', 'test', 'plugin-applicability-unit.mjs'],
+    runtime: 'node',
+    timeoutMs: 120_000,
+    proves: 'a third-party bundle is only composed onto a node it fits: a Windows path is refused on a Linux node with the file and line, a declared os is honoured, a POSIX path is not a signal, and the config file carries whitelisted keys only',
+  },
+  {
     name: 'waterfall',
     layer: 'offline',
     file: ['packages', 'dsh-remote-node-harness', 'test', 'waterfall-unit.mjs'],
@@ -396,7 +408,7 @@ const SUITES = [
     // actually turns it red, so this copies the tree to a temp directory, introduces five
     // realistic drifts one at a time and asserts a non-zero exit naming each one. It mutates a
     // copy, never the working tree: a test that can corrupt the source it guards is not a test.
-    proves: 'the reconciliation gate really fails: five single-site drifts — a dropped row, an invented preset row, a drifted bundle name, an underivable credential, an orphan drop rule — each make it exit non-zero and say which',
+    proves: 'the reconciliation gate really fails: seven single-site drifts — a dropped row, an invented preset row, a drifted bundle name, an underivable credential, an orphan drop rule, an escaping third-party config path, a world-readable credential file — each make it exit non-zero and say which',
   },
   {
     name: 'browse-protocol',

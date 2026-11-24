@@ -104,6 +104,25 @@ const CASES = [
     to: "    dropRules: ['^libreoffice-kit-(?:win32|darwin)-', '^nobody-declares-this-'],",
     expect: 'nobody-declares-this',
   },
+  {
+    // A third-party config path that leaves the node's home would write outside the one
+    // directory this project owns over there. Nothing else would catch it: the plugin reads
+    // the path as data and the writer only validates at call time.
+    name: 'a third-party config path escapes the node home',
+    file: ['packages', 'rnh-brain', 'capabilities.mjs'],
+    from: "        path: '.hindsight/coding-agent.json',",
+    to: "        path: '../escape.json',",
+    expect: "stays inside the node's home",
+  },
+  {
+    // A credential-bearing file mode that is world-readable. The registry is the only place
+    // that says 0600, so a drift here means the token lands readable on somebody's server.
+    name: 'a third-party config file is declared world-readable',
+    file: ['packages', 'rnh-brain', 'capabilities.mjs'],
+    from: "        mode: '0600',",
+    to: "        mode: '0644',",
+    expect: 'is written 0600',
+  },
 ]
 
 const root = makeTree()

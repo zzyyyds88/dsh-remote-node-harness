@@ -885,6 +885,39 @@ DSH 一起带来。这条不是可选的兼容开关 —— 去掉它，任何�
 来源。旧的 207 行开关正是这么写的（`- id: X` + `disabled: true` 进节点 patch，只写节点组合里真有
 的行；曾让一台节点的 patch 堆了 59 条什么也没决定的条目），这条路径已删除。
 
+### 开关是一句主张，主张要核对（2026-11-24）
+
+「这个插件也在那台机器上运行」在两种情况下不成立，两条都由 `rnh.js` 的 `#applicable()` 在
+**安装之前**判定，设计见 [`adr-0009`](adr-0009-third-party-bundle-fit.zh.md)：
+
+| 情形 | 怎么判 | 结果 |
+|---|---|---|
+| 组合里有只属于另一个 OS 的字面量（盘符路径 `C:\…`） | 读插件自己的 `package.json` 的 `os`/`cpu`，再扫它 `dsh.bundle.patch` 全部文件 | 不下发、不组合，`provision.plugins.skipped` 带 `文件:行` |
+| 插件要的配置在本机没有 / 有但不全 | `capabilities.mjs` 的 `THIRD_PARTY_BUNDLES` 声明它读哪个文件、哪些键可以下发 | 不下发、不组合，`provision.config.unavailable` 带原因 |
+
+判定为什么**不对称**：盘符路径在 Linux 上是「不可能存在」的证明，反过来 `/foo` 在 URL、路由前缀、
+包内相对路径里到处都是，把它当 Windows 节点的不适配信号会误杀能用的插件。而本项目也只往
+`linux-x64` 节点下发（`PUBLISHED_PLATFORMS` 一个）。
+
+**配置载体是白名单，不是复制文件。** 桌面那份 `~/.hindsight/coding-agent.json` 里可能还有别的服务器
+的 token（`banks.<id>.apiToken`）与个人路径，整份复制等于把它们一起送到另一台机器；只有声明过的键
+才读、才写。写入走 `RemoteHost.writeNodeFile()`：内容走 **stdin**（不进 argv，`ps` 里看不到），
+`umask 077` + 显式 `chmod 0600`，字节相同则不动，原子 `mv`。
+
+**写配置必须强制重启常驻 host**，这与 ADR-0001 的「配置热重载、不重启」是两条界限：profile patch 是
+HMR 监视的文件，而第三方插件自己的配置文件在 DSH 之外 —— 记忆插件按工作区 `root` 缓存一棵 client，
+`/root` 早已在「无配置」状态下缓存过，只写文件不重启它永远对着云端 URL 401。所以
+`ensureServing({ force: true })` 的条件里多了一条 `configWritten.changed`。
+
+**结果里永不出现值。** `provision.config.written[]` 只报路径、mode 与**键名**；`describe()` 与手机
+都读这个字段，与 `rnh-control` 的既有口径一致（「结果里永远不能带认证材料」）。
+
+`offline/applicability` 用磁盘上现写的合成插件守住这条：带盘符路径的插件在 Linux 上被拒并指到
+`cordis.patch.yml:5`、同一插件在 Windows 上放行、`os: ["!win32"]` 被尊重、POSIX 路径不是信号、
+本机没配置时报 `unavailable` 而不是空文件、白名单之外的键不出现在产出里、`writeNodeFile` 的内容
+不进 argv、越出 home 的路径与 `777` 模式被拒。真节点上另有实测：同一段 shell 连写三次
+（新建 → 同字节 → 改字节），mode 全程 `600`、第二次报 `unchanged`、临时文件不残留。
+
 ## 六之六、加工作区：先选机器，再选目录
 
 目标体验是「操作远程大脑和操作本地大脑一样，只有设置工作区这一步不同」，所以加工作区的流程是
@@ -1253,7 +1286,7 @@ provision 白名单、bundle 名。
 
 ## 七、测试
 
-共 54 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 34 个（纯逻辑 + 组合
+共 55 个套件（`run-all.mjs --list` 是唯一权威清单），分三层：**offline** 35 个（纯逻辑 + 组合
 检查 + 真 POSIX shell 跑安装脚本与目录列举脚本）、**contract** 3 个（读 `app.asar` 里的上游包）、**e2e** 17 个
 （运行中的 Host + 连上的节点）。下表按「守哪条设计」分组，同一层内的顺序不代表执行顺序。
 
@@ -1271,6 +1304,7 @@ provision 白名单、bundle 名。
 | `tool-git-image.mjs` | `git` 打真仓库、`read_image` 开真 PNG、`grep` 搜真文件 —— 三个在"工具在本地跑、只是对着镜像"时必然坏掉的工具 | 同上 |
 | `multipart-unit.mjs` | Gateway 的 `multipart/form-data` 应答能解：字节附件在正确的 JSON 路径上还原成 `Uint8Array`，畸形分片被拒绝而不是静默读成 `null` | 无 |
 | `provision-unit.mjs` | 下发给节点的东西是对的：provider 行复制而账号行不复制、行里没写 `apiKeyEnv` 时也能推断出 key ref、配置能过真 YAML 解析器 | Electron Node（解析器在 `app.asar` 里） |
+| `plugin-applicability-unit.mjs` | 插件开关是一句主张，主张被核对：盘符路径的插件在 Linux 上被拒且指到 `cordis.patch.yml:5`、Windows 上放行、`os: ["!win32"]` 被尊重、POSIX 路径不是平台信号、本机缺配置报 `unavailable` 而非空文件、白名单外的键不外泄、`writeNodeFile` 内容不进 argv、越界路径与 `777` 被拒 | 无（合成插件写在临时目录） |
 | `rnh-brain/scripts/check-composition.mjs` | 节点组合仍然是个**大脑**：7 个 Remote 控制器行在、4 个传输行在（`webserver` / `connection` / `api-remotes` / `web-startup`）、`web-runtime` 不在、没有任何 `dsh-client-ui-*`、6 条 agent-plane disable 在、preset 文件齐全且已声明、YAML 可解析 | Electron Node（借用安装里的 YAML 解析器） |
 | `rnh-brain/scripts/sync-from-upstream.mjs` | **生成器，不是套件**（不在 `run-all` 的调度表里，因为它会写 `cordis.patch.yml`）。它把组合从已安装的 release 重新派生；「生成后与已提交版本一致」这条由 `generated` 套件间接证明 —— 它断言内嵌副本与磁盘上的源逐字节一致（按行尾归一），所以手改生成物会立刻红。`check-composition` 是另一件事：断言组合仍然是个大脑 | 已安装的 DSH release（只在升级时手动跑） |
 | `client-bundle.mjs` | 桌面端真的 serve 了这份客户端代码；三个槽位注册且能渲染 | 运行中的 Host |
@@ -1289,7 +1323,7 @@ provision 白名单、bundle 名。
 | `recovery-ladder-unit.mjs` | 假时钟上跑真阶梯：2 s → 4 s → 8 s → 2 min，漏掉的一级保持 `recovering` 而不报 `failed`，主动断开重置它，`dispose` 取消它 | 无 |
 | `registry-unit.mjs` | `nodes.json` 只坏一个字段时不整表清零：改名式备份、逐条跳过、`normalizeNode` 抛 `node-invalid` → HTTP 400 | 无 |
 | `capabilities-unit.mjs` | 能力注册表**自己**的逻辑：每条记录结构完整、三个 verdict 分支都真的会走（含 `optional`）、`*` 模式边界、保留集派生、凭据需求与推送的对照 | 无 |
-| `gate-mutation-unit.mjs` | 闸门**自己的**测试：五种真实漂移各让 `check-capabilities --strict` 非零退出并说出是哪一处（在临时副本上做，不动工作区） | 无 |
+| `gate-mutation-unit.mjs` | 闸门**自己的**测试：七种真实漂移各让 `check-capabilities --strict` 非零退出并说出是哪一处（含「第三方配置路径越出 home」「凭据文件被声明成 0644」两条；在临时副本上做，不动工作区） | 无 |
 | `browse-protocol-unit.mjs` | 目录列举的 `type\0value\0` 记录协议，在**真 POSIX shell** 上跑真脚本：marker 形状的目录名、含换行的名字、非 UTF-8 名字、缺 `find`、越界路径、`mkdir` 的单段校验 | 真 shell（WSL 或 `/bin/bash`），无则 SKIP |
 | `merge-stream-unit.mjs` | 合并流的**生命周期**（载荷策略各自不同，只测共用那层）：抛错以 rejection 到达消费者、`return()`/abort 恰好释放订阅一次、`prelude` 在首帧之前 | 无 |
 | `node-stream-set-unit.mjs` | 四个 `Remote*` 共用的 per-node 簿记：`plan()` 只分类不改任何东西（`left`/`arrived`/`staying`）、同一节点只创建一次、`drop()` 在出路关流且只关一次、`disposeAll()` 全关 | 无 |
@@ -1300,8 +1334,8 @@ provision 白名单、bundle 名。
 | `packet-unit.mjs` | 一次 exec 请求就是一个 SSH 包：命令行超 128 KiB 在本地拒绝，不发出去让服务器损坏连接 | 无 |
 | `errors-unit.mjs` | 失败分类的顺序（显式 code → ssh 类别 → ssh2 字面量 → 阶段）、每个 code 的 `action`/`retryable`、节点日志脱敏与长度上限 | 无 |
 | `rnh-lifecycle-unit.mjs` | 节点生命周期：掉线变 `idle` 带时间戳、重连阶梯布防、主动断开取消它、首次主机密钥记录并回放、失败保留 phase、不可达节点保留工区行 | 无（假 connection/gateway） |
-| `generated-sync-unit.mjs` | 生成物 `brain-bundle.generated.js` 与磁盘上的源**逐字节**一致，且它派生的凭据清单等于 `capabilities.mjs` 派生的那份 | 无 |
-| `check-capabilities.mjs` | 能力单一真源的对账：组合行、预设行、保留包、删除包、provision 白名单、bundle 名，八个小节 | 无（`--strict` 是闸门） |
+| `generated-sync-unit.mjs` | 生成物 `brain-bundle.generated.js` 与磁盘上的源**逐字节**一致，且它派生的凭据清单与三方插件配置清单等于 `capabilities.mjs` 派生的那两份 | 无 |
+| `check-capabilities.mjs` | 能力单一真源的对账：组合行、预设行、保留包、删除包、provision 白名单、bundle 名、第三方插件配置记录，九个小节 | 无（`--strict` 是闸门） |
 | `fork-base-unit.mjs` | fork 出来的节点基座与上游发布版一致：版本、bundle 名、profile 模板 | 已安装的 DSH release |
 | `fork-runtime-unit.mjs` | 裁剪规则的两条载重规则：`@deepseek-ai/dsh-web-app` 的 manifest 必须留着；staging 清单只把 `@deepseek-ai/dsh` 列为依赖、其余进 `overrides` | 无 |
 | `node-patches-unit.mjs` | 台账完整：每个改过的上游文件都有对应 patch，每个 patch 都能单独读、单独弃用 | 无 |

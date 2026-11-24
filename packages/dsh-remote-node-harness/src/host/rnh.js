@@ -39,8 +39,10 @@ import { classifyFailure } from '../core/errors.js'
 import { GATE, decideGate } from '../core/version.js'
 import { SshConnection } from '../ssh/connection.js'
 import { RemoteHost, remoteLayout, MINIMUM_NODE_MAJOR } from '../remote/daemon.js'
-import { BRAIN_CREDENTIAL_REFS, BRAIN_FILES, BRAIN_PACKAGE } from './brain-bundle.generated.js'
+import { BRAIN_CREDENTIAL_REFS, BRAIN_FILES, BRAIN_PACKAGE, BRAIN_THIRD_PARTY_CONFIG } from './brain-bundle.generated.js'
 import { NODE_BASE_BUNDLES } from '../core/plugin-sync.js'
+import { nodeApplies } from '../core/plugin-applicability.js'
+import { assembleConfig, configDiffers } from './plugin-config.js'
 import { NodeLog } from './node-log.js'
 import { Provisioner } from './provision.js'
 import { RemoteGateway } from './remote-gateway.js'
@@ -639,20 +641,34 @@ export class Rnh {
         // brain package itself, so a change to the composition left a stale exception behind
         // that would quietly install `dsh-base` as if it were a plugin.
         const extras = wanted.filter(name => !NODE_BASE_BUNDLES.includes(name))
+        // **A switch is a claim, and the claim is checked before anything is installed.** A
+        // bundle whose composition names a Windows-only path cannot run on this node, and one
+        // whose configuration this desktop cannot supply would load and then fail every call.
+        // Both are refused here, with the reason, rather than composed and left broken — see
+        // `docs/adr-0009`.
+        const applicability = await this.#applicable(runtime, extras)
+        const applicable = applicability.compose
         // A bundle only composes when the Loader can resolve it from the profile, so the
         // switched-on plugins have to exist on the node before the list names them. Doing
         // it here (not in the settings handler) keeps "the node is connected" and "the node
         // composes what the page says" the same fact.
         /** @type {Array<{ bundle: string, reason: string }>} */
         const unmet = []
-        if (extras.length > 0) {
-          const install = await this.#installPlugins(runtime, extras)
+        if (applicable.length > 0) {
+          const install = await this.#installPlugins(runtime, applicable)
           runtime.provision ??= {}
-          runtime.provision.plugins = { wanted: extras, ...install }
+          runtime.provision.plugins = {
+            wanted: applicable,
+            ...install,
+            skipped: applicability.plugins.skipped,
+          }
           unmet.push(...install.failed)
           for (const failure of install.failed) {
             this.log(`[${runtime.record.name}] ${failure.bundle} was not installed: ${failure.reason}`)
           }
+        } else {
+          runtime.provision ??= {}
+          runtime.provision.plugins = { wanted: [], installed: [], copied: [], failed: [], skipped: applicability.plugins.skipped }
         }
         // **After** npm, not before: `npm install` prunes anything the profile's
         // `dependencies` does not list, and the brain bundle is copied in rather than
@@ -663,7 +679,15 @@ export class Rnh {
         // Only the bundles that really resolved are named: listing a package the node does
         // not have would compose nothing and hide the install failure behind a warning the
         // settings page never shows.
-        const composed = wanted.filter(name => !unmet.some(failure => failure.bundle === name))
+        const composed = wanted
+          .filter(name => !extras.includes(name) || applicable.includes(name))
+          .filter(name => !unmet.some(failure => failure.bundle === name))
+        // The configuration files come **after** the packages and before the host starts:
+        // the plugin reads them on its first session, so a host started without them caches
+        // "no configuration" for that workspace (ADR-0009 §三).
+        const configWritten = await this.#writePluginConfig(runtime, applicability.config)
+        // The report carries paths, modes and key names; never the contents (see `#applicable`).
+        const configReport = { ...applicability.config, files: undefined, written: configWritten.written }
         const bundles = await runtime.host.writeProfileBundles(composed)
         const provisioner = this.#provisionerFor(runtime)
         const plan = provisioner.plan()
@@ -673,8 +697,11 @@ export class Rnh {
           force: options.force === true,
           // Only the bundle's *code* needs a restart (modules re-import). A config
           // change reaches a running host through its profile patch, which the host
-          // hot-reloads — see docs/adr-0001.
-          bundleChanged: composition.changed || bundles.changed || bundles.revertedPrevious,
+          // hot-reloads — see docs/adr-0001. The one exception is a third-party bundle's
+          // own config file: that is outside DSH, so it is read once per workspace, and a
+          // changed file therefore needs a fresh host.
+          bundleChanged: composition.changed || bundles.changed || bundles.revertedPrevious
+            || configWritten.changed,
         })
         // The endpoint is known but unproven: `pendingService` keeps the gateway able to mint
         // a cookie, while `serving` still means "connected" and nothing else.
@@ -688,9 +715,17 @@ export class Rnh {
         }
         // Credentials last: they can only be pushed once the host answers, and a
         // failure here must be reported without discarding a working connection.
+        //
+        // **Merged, not replaced.** This assignment used to be a fresh object literal, which
+        // silently dropped the `plugins` report written a few lines above it — so the settings
+        // card could never say "this plugin was refused, here is why" on a *first* connect,
+        // only on a later sync. The one fact a person needs most is the one from the connect
+        // that just happened.
         runtime.provision = {
+          ...(runtime.provision ?? {}),
           rows: plan.rows.length,
           refs: [],
+          config: configReport,
           composition: {
             bundle: BRAIN_PACKAGE,
             files: composition.files,
@@ -993,20 +1028,45 @@ export class Rnh {
           // Same exception as the connect path, and now the same expression: the fixed
           // composition is asked, not re-spelled.
           const extras = wanted.filter(name => !NODE_BASE_BUNDLES.includes(name))
+          // The same fit check as the connect path, for the same reason: a plugin can be
+          // switched on *after* a node is connected, and a platform refusal or a missing
+          // configuration that only applied at connect time would be a switch that looks
+          // applied on second use and does nothing. One decision, both entry points.
+          const applicability = await this.#applicable(runtime, extras)
+          const applicable = applicability.compose
           let composed = wanted
-          if (extras.length > 0) {
-            const install = await this.#installPlugins(runtime, extras)
-            report.plugins = { wanted: extras, ...install }
+          if (applicable.length > 0) {
+            const install = await this.#installPlugins(runtime, applicable)
+            report.plugins = { wanted: applicable, ...install, skipped: applicability.plugins.skipped }
             runtime.provision ??= {}
             runtime.provision.plugins = report.plugins
             for (const failure of install.failed) {
               this.log(`[${runtime.record.name}] ${failure.bundle} was not installed: ${failure.reason}`)
             }
-            composed = wanted.filter(name => !install.failed.some(failure => failure.bundle === name))
+            composed = wanted
+              .filter(name => !extras.includes(name) || applicable.includes(name))
+              .filter(name => !install.failed.some(failure => failure.bundle === name))
+          } else {
+            report.plugins = { wanted: [], installed: [], copied: [], failed: [], skipped: applicability.plugins.skipped }
+            runtime.provision ??= {}
+            runtime.provision.plugins = report.plugins
+            composed = wanted.filter(name => !extras.includes(name))
           }
           // Re-copy the brain bundle after npm: an install prunes the packages the profile
           // manifest does not depend on, and this one is copied in rather than installed.
           const composition = await runtime.host.writeBrainBundle(BRAIN_FILES, BRAIN_PACKAGE)
+          // Configuration before the host decision below: a changed config file is one of the
+          // two reasons the resident host has to be restarted (the other is a changed bundle
+          // list). `optional` plugins whose configuration this desktop cannot supply were
+          // already dropped from `composed` by `#applicable`.
+          const configWritten = await this.#writePluginConfig(runtime, applicability.config)
+          if (runtime.provision !== undefined) {
+            runtime.provision.config = {
+              ...applicability.config,
+              files: undefined,
+              written: configWritten.written,
+            }
+          }
           const bundles = await runtime.host.writeProfileBundles(composed)
           // A changed bundle list is module code: the resident host has to be restarted for
           // it to compose the new set, exactly as at connect time. The restart leaves this
@@ -1016,7 +1076,7 @@ export class Rnh {
           // turn that had already completed on the node, and `event-relay` saw no
           // `api-session/*` events. `reset()` invalidates the carrier and every logical
           // stream; each relay's `onEnd` reopens on the new host (see `gateway.revive`).
-          if (bundles.changed || bundles.revertedPrevious || composition.changed) {
+          if (bundles.changed || bundles.revertedPrevious || composition.changed || configWritten.changed) {
             report.bundles = { changed: true, restarted: true }
             const serving = await runtime.host.ensureServing({ force: true })
             // The endpoint moved; the status machine owns it, so the gateway's serving
@@ -1127,6 +1187,119 @@ export class Rnh {
       }
     }
     return { installed, copied, failed }
+  }
+
+  /**
+   * Decide which of the switched-on bundles may actually be composed onto this node.
+   *
+   * The switch says "this plugin also runs there". Two facts can make that false, and both are
+   * answered **before** anything is installed, because installing a plugin the node cannot use
+   * leaves a package on that disk forever and a switch that looks applied:
+   *
+   * 1. **Platform fit** — derived from the bundle's own bytes (`core/plugin-applicability.js`).
+   *    A composition that names `C:\…\rhinomcp.exe` cannot be composed on Linux. This is also
+   *    the answer for a real user of this project: they wrote a Windows-only plugin, they set
+   *    up a Linux node, and the program refuses it **with the file and line** instead of
+   *    silently composing a mode whose every tool call fails.
+   * 2. **Configuration this desktop cannot supply** — declared in `capabilities.mjs` and
+   *    applied by `host/plugin-config.js`. A plugin whose settings live outside DSH (memory is
+   *    the measured case: `~/.hindsight/coding-agent.json`) loads and activates without them,
+   *    then fails every call with 401. Composing it would be "declared, then broken", which is
+   *    what the `optional` verdict exists to forbid.
+   *
+   * @param {NodeRuntime} runtime
+   * @param {readonly string[]} extras - third-party bundle names from the switches.
+   * @returns {{ compose: string[], plugins: object, config: object }}
+   */
+  async #applicable(runtime, extras) {
+    const specs = this.pluginSpecs()
+    const skipped = []
+    const fitting = []
+    for (const bundle of extras) {
+      // No plugin source at all (a Host composed before the switches existed, a test double):
+      // the fit question cannot be asked, and `#installPlugins` already answers it with "no
+      // plugin source is available". Reporting a platform refusal here would be a guess.
+      if (specs === undefined) {
+        fitting.push(bundle)
+        continue
+      }
+      const dir = specs.dirOf?.(bundle)
+      if (dir === undefined) {
+        // The package is listed by the switch but not on this disk any more (a person removed
+        // it, or a profile was edited). Not a platform question: report it as unreadable.
+        skipped.push({ bundle, reason: 'this desktop no longer has the package installed' })
+        continue
+      }
+      const fit = nodeApplies({ bundle, dir, facts: runtime.facts })
+      if (fit.fits) fitting.push(bundle)
+      else {
+        skipped.push({ bundle, reason: fit.reason, detail: fit.detail })
+        this.log(`[${runtime.record.name}] ${bundle} was not sent: ${fit.reason}`)
+      }
+    }
+    const { files, unavailable } = assembleConfig({ bundles: fitting, registry: BRAIN_THIRD_PARTY_CONFIG })
+    const unusable = new Set(unavailable.map(gap => gap.bundle))
+    for (const gap of unavailable) {
+      this.log(
+        `[${runtime.record.name}] ${gap.bundle} was not sent: ${gap.reason} — it would compose and `
+        + 'fail every call, so it is left out of this node',
+      )
+    }
+    const composable = fitting.filter(bundle => !unusable.has(bundle))
+    return {
+      compose: composable,
+      plugins: { skipped },
+      // **`content` never leaves this function's caller.** `config` is spread into
+      // `describe()`, which the settings page and the phone both read, and these files hold
+      // credentials: the report carries the path, the mode and the key *names* only — the same
+      // rule `rnh-control` follows for tool results ("no authentication material").
+      config: {
+        files,
+        unavailable,
+        written: [],
+        error: undefined,
+        report: files.map(file => ({ path: file.path, mode: file.mode, keys: file.keys })),
+      },
+    }
+  }
+
+  /**
+   * Write the configured files onto the node, and say whether that changed anything.
+   *
+   * Written **before** the resident host is confirmed serving: the plugin reads its settings on
+   * the first session in each workspace, and a host that was already running one has that read
+   * cached — which is why the caller restarts when `changed` is true. See ADR-0009.
+   * @param {NodeRuntime} runtime
+   * @param {object} config - from `#applicable`.
+   * @returns {Promise<{ changed: boolean, written: string[], error?: string }>}
+   */
+  async #writePluginConfig(runtime, config) {
+    const written = []
+    let changed = false
+    for (const file of config.files) {
+      try {
+        // Read-before-write for one reason only: a connect that changes nothing must not
+        // restart the resident host. The mode is checked too — a file with the right bytes and
+        // the wrong permissions is re-chmodded by the write without rewriting the content.
+        const existing = await runtime.host.readNodeFile(file.path)
+        const sameBytes = existing.exists && !configDiffers(file, existing.content)
+        if (sameBytes && existing.mode === file.mode) {
+          written.push({ path: file.path, mode: file.mode, keys: file.keys, changed: false })
+          continue
+        }
+        const result = await runtime.host.writeNodeFile(file.path, file.content, { mode: file.mode })
+        written.push({ path: file.path, mode: result.mode, keys: file.keys, changed: result.changed })
+        if (result.changed || !sameBytes) changed = true
+      } catch (error) {
+        // Reported, never swallowed: the bundle stays composed (its best chance is a working
+        // file from an earlier connect) but the node's status carries the failure.
+        config.error = messageOf(error)
+        this.log(`[${runtime.record.name}] could not write ${file.path}: ${config.error}`)
+        break
+      }
+    }
+    config.written = written
+    return { changed, written }
   }
 
   /** A provisioner bound to one node's logging and this Host's live config. */
